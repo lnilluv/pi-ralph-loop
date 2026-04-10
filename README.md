@@ -104,3 +104,4 @@ In the `tool_result` hook, bash outputs are scanned for failure patterns. After 
 ## License
 
 MIT
+# CI provenance test
