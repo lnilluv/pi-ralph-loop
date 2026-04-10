@@ -41,6 +41,8 @@ commands:
     run: npm run lint
     timeout: 60
 max_iterations: 25
+timeout: 300
+completion_promise: "DONE"
 guardrails:
   block_commands:
     - "rm\\s+-rf\\s+/"
@@ -51,12 +53,15 @@ guardrails:
 ---
 You are fixing flaky tests in the auth module.
 
+<!-- This comment is stripped before sending to the agent -->
+
 Latest test output:
 {{ commands.tests }}
 
 Latest lint output:
 {{ commands.lint }}
 
+Iteration {{ ralph.iteration }} of {{ ralph.name }}.
 Apply the smallest safe fix and explain why it works.
 ```
 
@@ -67,8 +72,20 @@ Apply the smallest safe fix and explain why it works.
 | `commands[].run` | string | required | Shell command |
 | `commands[].timeout` | number | `60` | Seconds before kill |
 | `max_iterations` | number | `50` | Stop after N iterations |
+| `timeout` | number | `300` | Per-iteration timeout in seconds; stops the loop if the agent is stuck |
+| `completion_promise` | string | — | Agent signals completion by sending `<promise>DONE</promise>`; loop breaks on match |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns to block in bash |
 | `guardrails.protected_files` | string[] | `[]` | Glob patterns to block writes |
+
+### Placeholders
+
+| Placeholder | Description |
+|-------------|-------------|
+| `{{ commands.<name> }}` | Output from the named command |
+| `{{ ralph.iteration }}` | Current 1-based iteration number |
+| `{{ ralph.name }}` | Directory name containing the RALPH.md |
+
+HTML comments (`<!-- ... -->`) are stripped from the prompt body after placeholder resolution, so you can annotate your RALPH.md freely.
 
 ## Commands
 
@@ -79,7 +96,7 @@ Apply the smallest safe fix and explain why it works.
 
 ### Guardrails
 
-`guardrails.block_commands` and `guardrails.protected_files` come from RALPH frontmatter. The extension enforces them in the `tool_call` hook. Matching bash commands are blocked, and writes/edits to protected file globs are denied.
+`guardrails.block_commands` and `guardrails.protected_files` come from RALPH frontmatter. The extension enforces them in the `tool_call` hook — but only for sessions created by the loop, so they don't leak into unrelated conversations. Matching bash commands are blocked, and writes/edits to protected file globs are denied.
 
 ### Cross-iteration memory
 
@@ -88,6 +105,18 @@ After each iteration, the extension stores a short summary with iteration number
 ### Mid-turn steering
 
 In the `tool_result` hook, bash outputs are scanned for failure patterns. After three or more failures in the same iteration, the extension appends a stop-and-think warning to push root-cause analysis before another retry.
+
+### Completion promise
+
+When `completion_promise` is set (e.g., `"DONE"`), the loop scans the agent's messages for `<promise>DONE</promise>` after each iteration. If found, the loop stops early — the agent signals it's finished rather than relying solely on `max_iterations`.
+
+### Iteration timeout
+
+Each iteration has a configurable timeout (default 300 seconds). If the agent is stuck and doesn't become idle within the timeout, the loop stops with a warning. This prevents runaway iterations from running forever.
+
+### Input validation
+
+The extension validates `RALPH.md` frontmatter before starting and on each re-parse: `max_iterations` must be a positive integer, `timeout` must be positive, `block_commands` regexes must compile, and commands must have non-empty names and run strings with positive timeouts.
 
 ## Comparison table
 
@@ -99,6 +128,10 @@ In the `tool_result` hook, bash outputs are scanned for failure patterns. After 
 | Cross-iteration memory | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Mid-turn steering | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Live prompt editing | ✓ | ✗ | ✗ | ✗ | ✓ |
+| Completion promise | ✓ | ✗ | ✗ | ✗ | ✓ |
+| Iteration timeout | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Session-scoped hooks | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Input validation | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Setup required | RALPH.md | config | RALPH.md | PRD pipeline | RALPH.md |
 
 ## License
