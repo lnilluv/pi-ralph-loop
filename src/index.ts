@@ -22,12 +22,23 @@ type LoopState = {
   timeout: number;
   completionPromise?: string;
   stopRequested: boolean;
-  failCount: number;
   iterationSummaries: Array<{ iteration: number; duration: number }>;
-  guardrails: { blockCommands: RegExp[]; protectedFiles: string[] };
+  guardrails: { blockCommands: string[]; protectedFiles: string[] };
   loopSessionFile?: string;
 };
-function defaultFrontmatter(): Frontmatter { return { commands: [], maxIterations: 50, timeout: 300, guardrails: { blockCommands: [], protectedFiles: [] } }; }
+type PersistedLoopState = {
+  active: boolean;
+  sessionFile?: string;
+  iteration?: number;
+  maxIterations?: number;
+  iterationSummaries?: Array<{ iteration: number; duration: number }>;
+  guardrails?: { blockCommands: string[]; protectedFiles: string[] };
+  stopRequested?: boolean;
+};
+
+function defaultFrontmatter(): Frontmatter {
+  return { commands: [], maxIterations: 50, timeout: 300, guardrails: { blockCommands: [], protectedFiles: [] } };
+}
 
 function parseRalphMd(filePath: string): ParsedRalph {
   let raw = readFileSync(filePath, "utf8");
@@ -37,29 +48,20 @@ function parseRalphMd(filePath: string): ParsedRalph {
 
   const yaml = (parseYaml(match[1]) ?? {}) as Record<string, any>;
   const commands: CommandDef[] = Array.isArray(yaml.commands)
-    ? yaml.commands.map((c: Record<string, any>) => ({
-        name: String(c.name ?? ""),
-        run: String(c.run ?? ""),
-        timeout: Number(c.timeout ?? 60),
-      }))
+    ? yaml.commands.map((c: Record<string, any>) => ({ name: String(c.name ?? ""), run: String(c.run ?? ""), timeout: Number(c.timeout ?? 60) }))
     : [];
   const guardrails = (yaml.guardrails ?? {}) as Record<string, any>;
+
   return {
     frontmatter: {
       commands,
       maxIterations: Number(yaml.max_iterations ?? 50),
       timeout: Number(yaml.timeout ?? 300),
       completionPromise:
-        typeof yaml.completion_promise === "string" && yaml.completion_promise.trim()
-          ? yaml.completion_promise
-          : undefined,
+        typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
       guardrails: {
-        blockCommands: Array.isArray(guardrails.block_commands)
-          ? guardrails.block_commands.map((p: unknown) => String(p))
-          : [],
-        protectedFiles: Array.isArray(guardrails.protected_files)
-          ? guardrails.protected_files.map((p: unknown) => String(p))
-          : [],
+        blockCommands: Array.isArray(guardrails.block_commands) ? guardrails.block_commands.map((p: unknown) => String(p)) : [],
+        protectedFiles: Array.isArray(guardrails.protected_files) ? guardrails.protected_files.map((p: unknown) => String(p)) : [],
       },
     },
     body: match[2] ?? "",
@@ -76,9 +78,7 @@ function validateFrontmatter(fm: Frontmatter, ctx: any): boolean {
     return false;
   }
   for (const pattern of fm.guardrails.blockCommands) {
-    try {
-      new RegExp(pattern);
-    } catch {
+    try { new RegExp(pattern); } catch {
       ctx.ui.notify(`Invalid block_commands regex: ${pattern}`, "error");
       return false;
     }
@@ -116,19 +116,14 @@ function resolvePlaceholders(body: string, outputs: CommandOutput[], ralph: { it
     .replace(/\{\{\s*ralph\.name\s*\}\}/g, ralph.name);
 }
 
-function parseGuardrails(fm: Frontmatter): LoopState["guardrails"] {
-  return { blockCommands: fm.guardrails.blockCommands.map((p) => new RegExp(p)), protectedFiles: fm.guardrails.protectedFiles };
-}
 async function runCommands(commands: CommandDef[], pi: ExtensionAPI): Promise<CommandOutput[]> {
   const results: CommandOutput[] = [];
   for (const cmd of commands) {
     try {
       const result = await pi.exec("bash", ["-c", cmd.run], { timeout: cmd.timeout * 1000 });
-      results.push(
-        result.killed
-          ? { name: cmd.name, output: `[timed out after ${cmd.timeout}s]` }
-          : { name: cmd.name, output: (result.stdout + result.stderr).trim() },
-      );
+      results.push(result.killed
+        ? { name: cmd.name, output: `[timed out after ${cmd.timeout}s]` }
+        : { name: cmd.name, output: (result.stdout + result.stderr).trim() });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       results.push({ name: cmd.name, output: `[error: ${message}]` });
@@ -138,100 +133,87 @@ async function runCommands(commands: CommandDef[], pi: ExtensionAPI): Promise<Co
 }
 
 function defaultLoopState(): LoopState {
-  return { active: false, ralphPath: "", iteration: 0, maxIterations: 50, timeout: 300, completionPromise: undefined, stopRequested: false, failCount: 0, iterationSummaries: [], guardrails: { blockCommands: [], protectedFiles: [] }, loopSessionFile: undefined };
+  return { active: false, ralphPath: "", iteration: 0, maxIterations: 50, timeout: 300, completionPromise: undefined, stopRequested: false, iterationSummaries: [], guardrails: { blockCommands: [], protectedFiles: [] }, loopSessionFile: undefined };
 }
+
+function readPersistedLoopState(ctx: any): PersistedLoopState | undefined {
+  const entries = ctx.sessionManager.getEntries();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "custom" && entry.customType === "ralph-loop-state") {
+      return typeof entry.data === "object" && entry.data ? (entry.data as PersistedLoopState) : undefined;
+    }
+  }
+  return undefined;
+}
+
+function persistLoopState(pi: ExtensionAPI, data: PersistedLoopState) {
+  pi.appendEntry("ralph-loop-state", data);
+}
+
 let loopState: LoopState = defaultLoopState();
 
 export default function (pi: ExtensionAPI) {
+  const failCounts = new Map<string, number>();
   const isLoopSession = (ctx: any): boolean => {
-    if (!loopState.active || !loopState.loopSessionFile) return false;
-    return ctx.sessionManager.getSessionFile() === loopState.loopSessionFile;
+    const state = readPersistedLoopState(ctx);
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    return state?.active === true && state.sessionFile === sessionFile;
   };
-  const restoreLoopState = (data: any) => {
-    if (!data?.active) { loopState = defaultLoopState(); return; }
-    loopState = {
-      active: true,
-      ralphPath: String(data.ralphPath ?? ""),
-      iteration: Number(data.iteration ?? 0),
-      maxIterations: Number(data.maxIterations ?? 50),
-      timeout: Number(data.timeout ?? 300),
-      completionPromise: typeof data.completionPromise === "string" ? data.completionPromise : undefined,
-      stopRequested: Boolean(data.stopRequested),
-      failCount: Number(data.failCount ?? 0),
-      iterationSummaries: Array.isArray(data.iterationSummaries) ? data.iterationSummaries : [],
-      guardrails: {
-        blockCommands: (Array.isArray(data.guardrails?.blockCommands) ? data.guardrails.blockCommands : []).flatMap((pattern: string) => {
-          try { return [new RegExp(pattern)]; } catch { return []; }
-        }),
-        protectedFiles: Array.isArray(data.guardrails?.protectedFiles) ? data.guardrails.protectedFiles : [],
-      },
-      loopSessionFile: undefined, // will be set by context after session_start
-    };
-  };
-
-  pi.on("session_start", async (_event: any, ctx: any) => {
-    const entries = ctx.sessionManager.getEntries();
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const entry = entries[i];
-      const isCustomEntry = entry.type === "custom" && entry.customType === "ralph-loop-state";
-      const isCustomMessage = entry.type === "message" && entry.message?.role === "custom" && entry.message?.customType === "ralph-loop-state";
-      if (!isCustomEntry && !isCustomMessage) continue;
-      try {
-        const data = isCustomEntry
-          ? entry.data ?? {}
-          : typeof entry.message.content === "string"
-            ? JSON.parse(entry.message.content)
-            : entry.message.content;
-        restoreLoopState(data);
-        loopState.loopSessionFile = ctx.sessionManager.getSessionFile() ?? (isCustomEntry ? (entry.data as any)?.sessionFile : undefined);
-        if (!loopState.active) ctx.ui.setStatus("ralph", undefined);
-      } catch { /* ignore malformed state */ }
-      return;
-    }
-  });
 
   pi.on("tool_call", async (event: any, ctx: any) => {
     if (!isLoopSession(ctx)) return;
+    const persisted = readPersistedLoopState(ctx);
+    if (!persisted) return;
+
     if (event.toolName === "bash") {
       const cmd = (event.input as { command?: string }).command ?? "";
-      for (const pattern of loopState.guardrails.blockCommands) {
-        if (pattern.test(cmd)) return { block: true, reason: `ralph: blocked (${pattern.source})` };
+      for (const pattern of persisted.guardrails?.blockCommands ?? []) {
+        try {
+          if (new RegExp(pattern).test(cmd)) return { block: true, reason: `ralph: blocked (${pattern})` };
+        } catch {
+          // ignore malformed persisted regex
+        }
       }
     }
+
     if (event.toolName === "write" || event.toolName === "edit") {
       const filePath = (event.input as { path?: string }).path ?? "";
-      for (const glob of loopState.guardrails.protectedFiles) {
-        if (minimatch(filePath, glob, { matchBase: true })) {
-          return { block: true, reason: `ralph: ${filePath} is protected` };
-        }
+      for (const glob of persisted.guardrails?.protectedFiles ?? []) {
+        if (minimatch(filePath, glob, { matchBase: true })) return { block: true, reason: `ralph: ${filePath} is protected` };
       }
     }
   });
 
   pi.on("before_agent_start", async (event: any, ctx: any) => {
-    if (!isLoopSession(ctx) || loopState.iterationSummaries.length === 0) return;
-    const history = loopState.iterationSummaries.map((s) => `- Iteration ${s.iteration}: ${s.duration}s`).join("\n");
+    if (!isLoopSession(ctx)) return;
+    const persisted = readPersistedLoopState(ctx);
+    const summaries = persisted?.iterationSummaries ?? [];
+    if (summaries.length === 0) return;
+
+    const history = summaries.map((s) => `- Iteration ${s.iteration}: ${s.duration}s`).join("\n");
     return {
       systemPrompt:
         event.systemPrompt +
-        `\n\n## Ralph Loop Context\nIteration ${loopState.iteration}/${loopState.maxIterations}\n\nPrevious iterations:\n${history}\n\nDo not repeat completed work. Check git log for recent changes.`,
+        `\n\n## Ralph Loop Context\nIteration ${persisted?.iteration ?? 0}/${persisted?.maxIterations ?? 0}\n\nPrevious iterations:\n${history}\n\nDo not repeat completed work. Check git log for recent changes.`,
     };
   });
 
   pi.on("tool_result", async (event: any, ctx: any) => {
     if (!isLoopSession(ctx) || event.toolName !== "bash") return;
-    const output = event.content
-      .map((c: { type: string; text?: string }) => (c.type === "text" ? c.text ?? "" : ""))
-      .join("");
-    if (/FAIL|ERROR|error:|failed/i.test(output)) loopState.failCount++;
-    if (loopState.failCount >= 3) {
+    const output = event.content.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text ?? "" : "")).join("");
+    if (!/FAIL|ERROR|error:|failed/i.test(output)) return;
+
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (!sessionFile) return;
+
+    const next = (failCounts.get(sessionFile) ?? 0) + 1;
+    failCounts.set(sessionFile, next);
+    if (next >= 3) {
       return {
         content: [
           ...event.content,
-          {
-            type: "text" as const,
-            text: "\n\n⚠️ ralph: 3+ failures this iteration. Stop and describe the root cause before retrying.",
-          },
+          { type: "text" as const, text: "\n\n⚠️ ralph: 3+ failures this iteration. Stop and describe the root cause before retrying." },
         ],
       };
     }
@@ -259,9 +241,8 @@ export default function (pi: ExtensionAPI) {
           timeout: frontmatter.timeout,
           completionPromise: frontmatter.completionPromise,
           stopRequested: false,
-          failCount: 0,
           iterationSummaries: [],
-          guardrails: parseGuardrails(frontmatter),
+          guardrails: { blockCommands: frontmatter.guardrails.blockCommands, protectedFiles: frontmatter.guardrails.protectedFiles },
           loopSessionFile: undefined,
         };
       } catch (err) {
@@ -273,10 +254,15 @@ export default function (pi: ExtensionAPI) {
       try {
         iterationLoop: for (let i = 1; i <= loopState.maxIterations; i++) {
           if (loopState.stopRequested) break;
-          loopState.iteration = i;
-          loopState.failCount = 0;
-          const iterStart = Date.now();
+          const persistedBefore = readPersistedLoopState(ctx);
+          if (persistedBefore?.active && persistedBefore.stopRequested) {
+            loopState.stopRequested = true;
+            ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
+            break;
+          }
 
+          loopState.iteration = i;
+          const iterStart = Date.now();
           const { frontmatter: fm, body: rawBody } = parseRalphMd(loopState.ralphPath);
           if (!validateFrontmatter(fm, ctx)) {
             ctx.ui.notify(`Invalid RALPH.md on iteration ${i}, stopping loop`, "error");
@@ -286,33 +272,35 @@ export default function (pi: ExtensionAPI) {
           loopState.maxIterations = fm.maxIterations;
           loopState.timeout = fm.timeout;
           loopState.completionPromise = fm.completionPromise;
-          loopState.guardrails = parseGuardrails(fm);
+          loopState.guardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
 
           const outputs = await runCommands(fm.commands, pi);
           let body = resolvePlaceholders(rawBody, outputs, { iteration: i, name });
           body = body.replace(/<!--[\s\S]*?-->/g, "");
           const prompt = `[ralph: iteration ${i}/${loopState.maxIterations}]\n\n${body}`;
 
+          const prevPersisted = readPersistedLoopState(ctx);
+          if (prevPersisted?.active && prevPersisted.sessionFile === ctx.sessionManager.getSessionFile()) persistLoopState(pi, { ...prevPersisted, active: false });
           ctx.ui.setStatus("ralph", `🔁 ${name}: iteration ${i}/${loopState.maxIterations}`);
-          // Persist loop state into new session via setup so it survives extension reload
-          const loopStateData = { active: true, ralphPath: loopState.ralphPath, iteration: loopState.iteration, maxIterations: loopState.maxIterations, timeout: loopState.timeout, completionPromise: loopState.completionPromise, stopRequested: loopState.stopRequested, failCount: loopState.failCount, iterationSummaries: loopState.iterationSummaries, guardrails: { blockCommands: loopState.guardrails.blockCommands.map((r) => r.source), protectedFiles: loopState.guardrails.protectedFiles } };
-          const { cancelled } = await ctx.newSession({
-            setup: async (sm: any) => {
-              // Write loop state as a custom message so session_start can restore it
-              sm.appendMessage({
-                role: "custom",
-                customType: "ralph-loop-state",
-                content: JSON.stringify(loopStateData),
-                display: false,
-                timestamp: Date.now(),
-              });
-            },
-          });
+          const prevSessionFile = loopState.loopSessionFile;
+          const { cancelled } = await ctx.newSession();
           if (cancelled) {
             ctx.ui.notify("Session switch cancelled, stopping loop", "warning");
             break;
           }
+
           loopState.loopSessionFile = ctx.sessionManager.getSessionFile();
+          if (prevSessionFile && prevSessionFile !== loopState.loopSessionFile) failCounts.delete(prevSessionFile);
+          if (loopState.loopSessionFile) failCounts.set(loopState.loopSessionFile, 0);
+          persistLoopState(pi, {
+            active: true,
+            sessionFile: loopState.loopSessionFile,
+            iteration: loopState.iteration,
+            maxIterations: loopState.maxIterations,
+            iterationSummaries: loopState.iterationSummaries,
+            guardrails: { blockCommands: loopState.guardrails.blockCommands, protectedFiles: loopState.guardrails.protectedFiles },
+            stopRequested: false,
+          });
 
           pi.sendUserMessage(prompt);
           const timeoutMs = fm.timeout * 1000;
@@ -321,7 +309,10 @@ export default function (pi: ExtensionAPI) {
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
             await Promise.race([
-              ctx.waitForIdle().catch((e: any) => { idleError = e instanceof Error ? e : new Error(String(e)); throw e; }),
+              ctx.waitForIdle().catch((e: any) => {
+                idleError = e instanceof Error ? e : new Error(String(e));
+                throw e;
+              }),
               new Promise<never>((_, reject) => {
                 timer = setTimeout(() => {
                   timedOut = true;
@@ -330,7 +321,7 @@ export default function (pi: ExtensionAPI) {
               }),
             ]);
           } catch {
-            // timedOut is set by the timer; idleError means waitForIdle itself failed
+            // timedOut is set by timer; idleError means waitForIdle failed
           }
           if (timer) clearTimeout(timer);
           if (timedOut) {
@@ -346,15 +337,18 @@ export default function (pi: ExtensionAPI) {
           loopState.iterationSummaries.push({ iteration: i, duration: elapsed });
           pi.appendEntry("ralph-iteration", { iteration: i, duration: elapsed, ralphPath: loopState.ralphPath });
 
+          const persistedAfter = readPersistedLoopState(ctx);
+          if (persistedAfter?.active && persistedAfter.stopRequested) {
+            loopState.stopRequested = true;
+            ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
+            break;
+          }
+
           if (fm.completionPromise) {
             const entries = ctx.sessionManager.getEntries();
             for (const entry of entries) {
               if (entry.type === "message" && entry.message?.role === "assistant") {
-                const text =
-                  entry.message.content
-                    ?.filter((b: any) => b.type === "text")
-                    ?.map((b: any) => b.text)
-                    ?.join("") ?? "";
+                const text = entry.message.content?.filter((b: any) => b.type === "text")?.map((b: any) => b.text)?.join("") ?? "";
                 const match = text.match(/<promise>([^<]+)<\/promise>/);
                 if (match && fm.completionPromise && match[1].trim() === fm.completionPromise.trim()) {
                   ctx.ui.notify(`Completion promise matched on iteration ${i}`, "info");
@@ -373,10 +367,12 @@ export default function (pi: ExtensionAPI) {
         const message = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`Ralph loop failed: ${message}`, "error");
       } finally {
+        failCounts.clear();
         loopState.active = false;
+        loopState.stopRequested = false;
         loopState.loopSessionFile = undefined;
         ctx.ui.setStatus("ralph", undefined);
-        pi.appendEntry("ralph-loop-state", { active: false });
+        persistLoopState(pi, { active: false });
       }
     },
   });
@@ -384,11 +380,18 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("ralph-stop", {
     description: "Stop the ralph loop after the current iteration",
     handler: async (_args: string, ctx: any) => {
-      if (!loopState.active) {
-        ctx.ui.notify("No active ralph loop", "warning");
+      const persisted = readPersistedLoopState(ctx);
+      if (!persisted?.active) {
+        if (!loopState.active) {
+          ctx.ui.notify("No active ralph loop", "warning");
+          return;
+        }
+        loopState.stopRequested = true;
+        ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
         return;
       }
       loopState.stopRequested = true;
+      persistLoopState(pi, { ...persisted, stopRequested: true });
       ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
     },
   });
