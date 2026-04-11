@@ -21,6 +21,7 @@ import {
   renderRalphBody,
   resolvePlaceholders,
   slugifyTask,
+  shouldValidateExistingDraft,
   validateDraftContent,
   validateFrontmatter,
 } from "../src/ralph.ts";
@@ -82,6 +83,17 @@ test("validateFrontmatter accepts valid input and rejects invalid values", () =>
     validateFrontmatter(parseRalphMarkdown("---\ncommands:\n  - nope\n  - null\n---\nbody").frontmatter),
     "Invalid command entry at index 0",
   );
+});
+
+test("legacy RALPH.md drafts bypass the generated-draft validation gate", () => {
+  assert.equal(shouldValidateExistingDraft("Task body"), false);
+
+  const draft = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", hasGit: false, topLevelDirs: [], topLevelFiles: [] },
+  );
+  assert.equal(shouldValidateExistingDraft(draft.content), true);
 });
 
 test("render helpers expand placeholders and strip comments", () => {
@@ -172,20 +184,32 @@ test("buildMissionBrief fails closed when the current draft content is invalid",
   assert.doesNotMatch(brief, /Stop after 25 iterations or \/ralph-stop/);
 });
 
-test("slug helpers provide fallback and deterministic sibling names", (t) => {
+test("slug helpers skip occupied directories when planning siblings", (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
 
   mkdirSync(join(cwd, "reverse-engineer-this-app"), { recursive: true });
-  writeFileSync(join(cwd, "reverse-engineer-this-app", "RALPH.md"), "existing", "utf8");
   mkdirSync(join(cwd, "reverse-engineer-this-app-2"), { recursive: true });
-  writeFileSync(join(cwd, "reverse-engineer-this-app-2", "RALPH.md"), "existing", "utf8");
+  mkdirSync(join(cwd, "reverse-engineer-this-app-3"), { recursive: true });
 
   assert.equal(slugifyTask("Reverse engineer this app!"), "reverse-engineer-this-app");
   assert.equal(slugifyTask("!!!"), "ralph-task");
-  assert.equal(nextSiblingSlug("reverse-engineer-this-app", (slug) => slug === "reverse-engineer-this-app-2" || slug === "reverse-engineer-this-app-3"), "reverse-engineer-this-app-4");
-  assert.deepEqual(planTaskDraftTarget(cwd, "Reverse engineer this app").kind, "conflict");
-  assert.equal(createSiblingTarget(cwd, "reverse-engineer-this-app").slug, "reverse-engineer-this-app-3");
+  assert.equal(
+    nextSiblingSlug(
+      "reverse-engineer-this-app",
+      (slug) => slug === "reverse-engineer-this-app-2" || slug === "reverse-engineer-this-app-3",
+    ),
+    "reverse-engineer-this-app-4",
+  );
+  assert.deepEqual(planTaskDraftTarget(cwd, "Reverse engineer this app"), {
+    kind: "conflict",
+    target: {
+      slug: "reverse-engineer-this-app",
+      dirPath: join(cwd, "reverse-engineer-this-app"),
+      ralphPath: join(cwd, "reverse-engineer-this-app", "RALPH.md"),
+    },
+  });
+  assert.equal(createSiblingTarget(cwd, "reverse-engineer-this-app").slug, "reverse-engineer-this-app-4");
 });
 
 test("task classification identifies analysis, fix, migration, and general modes", () => {
@@ -281,13 +305,15 @@ test("buildMissionBrief refreshes after draft edits", () => {
   const editedPlan = {
     ...plan,
     content: plan.content
+      .replace("Task: Fix flaky auth tests", "Task: Fix flaky auth regressions")
       .replace("name: tests\n    run: npm test\n    timeout: 120", "name: smoke\n    run: npm run smoke\n    timeout: 45")
       .replace("max_iterations: 25", "max_iterations: 7"),
   };
 
   const brief = buildMissionBrief(editedPlan);
   assert.match(brief, /Mission Brief/);
-  assert.match(brief, /Fix flaky auth tests/);
+  assert.match(brief, /Fix flaky auth regressions/);
+  assert.doesNotMatch(brief, /Fix flaky auth tests/);
   assert.match(brief, /smoke: npm run smoke/);
   assert.match(brief, /Stop after 7 iterations or \/ralph-stop/);
   assert.doesNotMatch(brief, /tests: npm test/);

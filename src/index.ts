@@ -5,7 +5,6 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   buildMissionBrief,
   classifyIdleState,
-  extractDraftMetadata,
   generateDraft,
   inspectExistingTarget,
   inspectRepo,
@@ -17,6 +16,7 @@ import {
   shouldResetFailCount,
   shouldStopForCompletionPromise,
   shouldWarnForBashFailure,
+  shouldValidateExistingDraft,
   validateDraftContent,
   validateFrontmatter as validateFrontmatterMessage,
   createSiblingTarget,
@@ -162,15 +162,18 @@ async function editExistingDraft(ralphPath: string, ctx: any, saveMessage = "Sav
   }
 
   let content = readFileSync(ralphPath, "utf8");
+  const strictValidation = shouldValidateExistingDraft(content);
   while (true) {
     const edited = await ctx.ui.editor("Edit RALPH.md", content);
     if (typeof edited !== "string") return;
 
-    const error = validateDraftContent(edited);
-    if (error) {
-      ctx.ui.notify(`Invalid RALPH.md: ${error}`, "error");
-      content = edited;
-      continue;
+    if (strictValidation) {
+      const error = validateDraftContent(edited);
+      if (error) {
+        ctx.ui.notify(`Invalid RALPH.md: ${error}`, "error");
+        content = edited;
+        continue;
+      }
     }
 
     if (edited !== content) {
@@ -189,11 +192,18 @@ async function chooseRecoveryMode(input: string, dirPath: string, ctx: any): Pro
 }
 
 async function chooseConflictTarget(commandName: "ralph" | "ralph-draft", task: string, target: DraftTarget, ctx: any): Promise<{ action: "run-existing" | "open-existing" | "draft-target" | "cancel"; target?: DraftTarget }> {
-  const title = `Found an existing RALPH at ${displayPath(ctx.cwd, target.ralphPath)} for “${task}”.`;
+  const hasExistingDraft = existsSync(target.ralphPath);
+  const title = hasExistingDraft
+    ? `Found an existing RALPH at ${displayPath(ctx.cwd, target.ralphPath)} for “${task}”.`
+    : `Found an occupied draft directory at ${displayPath(ctx.cwd, target.dirPath)} for “${task}”.`;
   const options =
     commandName === "ralph"
-      ? ["Run existing", "Open existing RALPH.md", "Create sibling", "Cancel"]
-      : ["Open existing RALPH.md", "Create sibling", "Cancel"];
+      ? hasExistingDraft
+        ? ["Run existing", "Open existing RALPH.md", "Create sibling", "Cancel"]
+        : ["Create sibling", "Cancel"]
+      : hasExistingDraft
+        ? ["Open existing RALPH.md", "Create sibling", "Cancel"]
+        : ["Create sibling", "Cancel"];
   const choice = await ctx.ui.select(title, options);
 
   if (!choice || choice === "Cancel") return { action: "cancel" };

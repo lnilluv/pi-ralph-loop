@@ -370,11 +370,11 @@ export function planTaskDraftTarget(cwd: string, task: string): PlannedTaskTarge
     dirPath: join(cwd, slug),
     ralphPath: join(cwd, slug, "RALPH.md"),
   };
-  return existsSync(target.ralphPath) ? { kind: "conflict", target } : { kind: "draft", target };
+  return existsSync(target.dirPath) ? { kind: "conflict", target } : { kind: "draft", target };
 }
 
 export function createSiblingTarget(cwd: string, baseSlug: string): DraftTarget {
-  const siblingSlug = nextSiblingSlug(baseSlug, (candidate) => existsSync(join(cwd, candidate, "RALPH.md")));
+  const siblingSlug = nextSiblingSlug(baseSlug, (candidate) => existsSync(join(cwd, candidate)));
   return {
     slug: siblingSlug,
     dirPath: join(cwd, siblingSlug),
@@ -423,6 +423,11 @@ export function suggestedCommandsForMode(mode: DraftMode, signals: RepoSignals):
 
 function formatCommandLabel(command: CommandDef): string {
   return `${command.name}: ${command.run}`;
+}
+
+function extractVisibleTask(body: string): string | undefined {
+  const match = body.match(/^Task:\s*(.+)$/m);
+  return match?.[1]?.trim() || undefined;
 }
 
 export function generateDraft(task: string, target: DraftTarget, signals: RepoSignals): DraftPlan {
@@ -492,6 +497,10 @@ export function extractDraftMetadata(raw: string): DraftMetadata | undefined {
   }
 }
 
+export function shouldValidateExistingDraft(raw: string): boolean {
+  return extractDraftMetadata(raw) !== undefined;
+}
+
 export type DraftContentInspection = {
   metadata?: DraftMetadata;
   parsed?: ParsedRalph;
@@ -522,7 +531,7 @@ export function validateDraftContent(raw: string): string | null {
 
 export function buildMissionBrief(plan: DraftPlan): string {
   const inspection = inspectDraftContent(plan.content);
-  const task = inspection.metadata?.task ?? "Task metadata missing from current draft";
+  const task = extractVisibleTask(inspection.parsed?.body ?? "") ?? inspection.metadata?.task ?? "Task metadata missing from current draft";
 
   if (inspection.error) {
     return [
