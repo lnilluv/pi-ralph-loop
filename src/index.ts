@@ -1,15 +1,26 @@
 import { minimatch } from "minimatch";
-import { readFileSync, existsSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
+  buildMissionBrief,
+  classifyIdleState,
+  extractDraftMetadata,
+  generateDraft,
+  inspectExistingTarget,
+  inspectRepo,
+  parseCommandArgs,
   parseRalphMarkdown,
+  planTaskDraftTarget,
   renderIterationPrompt,
   renderRalphBody,
-  resolveRalphTargetResolution,
+  shouldResetFailCount,
+  shouldStopForCompletionPromise,
+  shouldWarnForBashFailure,
   validateFrontmatter as validateFrontmatterMessage,
+  createSiblingTarget,
 } from "./ralph.ts";
-import type { CommandDef, CommandOutput, Frontmatter } from "./ralph.ts";
+import type { CommandDef, CommandOutput, DraftTarget, Frontmatter } from "./ralph.ts";
 
 type LoopState = {
   active: boolean;
@@ -46,13 +57,6 @@ function validateFrontmatter(fm: Frontmatter, ctx: any): boolean {
   return true;
 }
 
-function resolveRalphPath(args: string, cwd: string): string {
-  const { absoluteTarget, markdownPath } = resolveRalphTargetResolution(args, cwd);
-  if (existsSync(absoluteTarget) && absoluteTarget.endsWith(".md")) return absoluteTarget;
-  if (existsSync(markdownPath)) return markdownPath;
-  throw new Error(`No RALPH.md found at ${absoluteTarget}`);
-}
-
 async function runCommands(commands: CommandDef[], pi: ExtensionAPI): Promise<CommandOutput[]> {
   const results: CommandOutput[] = [];
   for (const cmd of commands) {
@@ -72,7 +76,18 @@ async function runCommands(commands: CommandDef[], pi: ExtensionAPI): Promise<Co
 }
 
 function defaultLoopState(): LoopState {
-  return { active: false, ralphPath: "", iteration: 0, maxIterations: 50, timeout: 300, completionPromise: undefined, stopRequested: false, iterationSummaries: [], guardrails: { blockCommands: [], protectedFiles: [] }, loopSessionFile: undefined };
+  return {
+    active: false,
+    ralphPath: "",
+    iteration: 0,
+    maxIterations: 50,
+    timeout: 300,
+    completionPromise: undefined,
+    stopRequested: false,
+    iterationSummaries: [],
+    guardrails: { blockCommands: [], protectedFiles: [] },
+    loopSessionFile: undefined,
+  };
 }
 
 function readPersistedLoopState(ctx: any): PersistedLoopState | undefined {
@@ -90,6 +105,96 @@ function persistLoopState(pi: ExtensionAPI, data: PersistedLoopState) {
   pi.appendEntry("ralph-loop-state", data);
 }
 
+function writeDraftFile(ralphPath: string, content: string) {
+  mkdirSync(dirname(ralphPath), { recursive: true });
+  writeFileSync(ralphPath, content, "utf8");
+}
+
+function displayPath(cwd: string, filePath: string): string {
+  const rel = relative(cwd, filePath);
+  return rel && !rel.startsWith("..") ? `./${rel}` : filePath;
+}
+
+async function promptForTask(ctx: any, title: string, placeholder: string): Promise<string | undefined> {
+  if (!ctx.hasUI) return undefined;
+  const value = await ctx.ui.input(title, placeholder);
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+async function reviewDraft(plan: ReturnType<typeof generateDraft>, mode: "run" | "draft", ctx: any): Promise<{ action: "start" | "save" | "cancel"; content: string }> {
+  let content = plan.content;
+
+  while (true) {
+    const nextPlan = { ...plan, content };
+    const options =
+      mode === "run"
+        ? ["Start", "Open RALPH.md", "Cancel"]
+        : ["Save draft", "Open RALPH.md", "Cancel"];
+    const choice = await ctx.ui.select(buildMissionBrief(nextPlan), options);
+
+    if (!choice || choice === "Cancel") {
+      return { action: "cancel", content };
+    }
+    if (choice === "Open RALPH.md") {
+      const edited = await ctx.ui.editor("Edit RALPH.md", content);
+      if (typeof edited === "string") content = edited;
+      continue;
+    }
+    if (choice === "Save draft") {
+      return { action: "save", content };
+    }
+    return { action: "start", content };
+  }
+}
+
+async function editExistingDraft(ralphPath: string, ctx: any, saveMessage = "Saved RALPH.md") {
+  if (!ctx.hasUI) {
+    ctx.ui.notify(`Use ${displayPath(ctx.cwd, ralphPath)} in an interactive session to edit the draft.`, "warning");
+    return;
+  }
+  const original = readFileSync(ralphPath, "utf8");
+  const edited = await ctx.ui.editor("Edit RALPH.md", original);
+  if (typeof edited === "string" && edited !== original) {
+    writeDraftFile(ralphPath, edited);
+    ctx.ui.notify(saveMessage, "info");
+  }
+}
+
+async function chooseRecoveryMode(input: string, dirPath: string, ctx: any): Promise<"draft-path" | "task" | "cancel"> {
+  const choice = await ctx.ui.select(`No RALPH.md in ${displayPath(ctx.cwd, dirPath)}.`, ["Draft in that folder", "Treat as task text", "Cancel"]);
+  if (choice === "Draft in that folder") return "draft-path";
+  if (choice === "Treat as task text") return "task";
+  return "cancel";
+}
+
+async function chooseConflictTarget(commandName: "ralph" | "ralph-draft", task: string, target: DraftTarget, ctx: any): Promise<{ action: "run-existing" | "open-existing" | "draft-target" | "cancel"; target?: DraftTarget }> {
+  const title = `Found an existing RALPH at ${displayPath(ctx.cwd, target.ralphPath)} for “${task}”.`;
+  const options =
+    commandName === "ralph"
+      ? ["Run existing", "Open existing RALPH.md", "Create sibling", "Cancel"]
+      : ["Open existing RALPH.md", "Create sibling", "Cancel"];
+  const choice = await ctx.ui.select(title, options);
+
+  if (!choice || choice === "Cancel") return { action: "cancel" };
+  if (choice === "Run existing") return { action: "run-existing" };
+  if (choice === "Open existing RALPH.md") return { action: "open-existing" };
+  return { action: "draft-target", target: createSiblingTarget(ctx.cwd, target.slug) };
+}
+
+async function draftFromTask(commandName: "ralph" | "ralph-draft", task: string, target: DraftTarget, ctx: any): Promise<string | undefined> {
+  const plan = generateDraft(task, target, inspectRepo(ctx.cwd));
+  const review = await reviewDraft(plan, commandName === "ralph" ? "run" : "draft", ctx);
+  if (review.action === "cancel") return undefined;
+
+  writeDraftFile(target.ralphPath, review.content);
+  if (review.action === "save") {
+    ctx.ui.notify(`Draft saved to ${displayPath(ctx.cwd, target.ralphPath)}`, "info");
+    return undefined;
+  }
+  return target.ralphPath;
+}
+
 let loopState: LoopState = defaultLoopState();
 
 export default function (pi: ExtensionAPI) {
@@ -99,6 +204,238 @@ export default function (pi: ExtensionAPI) {
     const sessionFile = ctx.sessionManager.getSessionFile();
     return state?.active === true && state.sessionFile === sessionFile;
   };
+
+  async function startRalphLoop(ralphPath: string, ctx: any) {
+    let name: string;
+    try {
+      const { frontmatter } = parseRalphMd(ralphPath);
+      if (!validateFrontmatter(frontmatter, ctx)) return;
+      name = basename(dirname(ralphPath));
+      loopState = {
+        active: true,
+        ralphPath,
+        iteration: 0,
+        maxIterations: frontmatter.maxIterations,
+        timeout: frontmatter.timeout,
+        completionPromise: frontmatter.completionPromise,
+        stopRequested: false,
+        iterationSummaries: [],
+        guardrails: { blockCommands: frontmatter.guardrails.blockCommands, protectedFiles: frontmatter.guardrails.protectedFiles },
+        loopSessionFile: undefined,
+      };
+    } catch (err) {
+      ctx.ui.notify(String(err), "error");
+      return;
+    }
+    ctx.ui.notify(`Ralph loop started: ${name} (max ${loopState.maxIterations} iterations)`, "info");
+
+    try {
+      iterationLoop: for (let i = 1; i <= loopState.maxIterations; i++) {
+        if (loopState.stopRequested) break;
+        const persistedBefore = readPersistedLoopState(ctx);
+        if (persistedBefore?.active && persistedBefore.stopRequested) {
+          loopState.stopRequested = true;
+          ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
+          break;
+        }
+
+        loopState.iteration = i;
+        const iterStart = Date.now();
+        const { frontmatter: fm, body: rawBody } = parseRalphMd(loopState.ralphPath);
+        if (!validateFrontmatter(fm, ctx)) {
+          ctx.ui.notify(`Invalid RALPH.md on iteration ${i}, stopping loop`, "error");
+          break;
+        }
+
+        loopState.maxIterations = fm.maxIterations;
+        loopState.timeout = fm.timeout;
+        loopState.completionPromise = fm.completionPromise;
+        loopState.guardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
+
+        const outputs = await runCommands(fm.commands, pi);
+        const body = renderRalphBody(rawBody, outputs, { iteration: i, name });
+        const prompt = renderIterationPrompt(body, i, loopState.maxIterations);
+
+        const prevPersisted = readPersistedLoopState(ctx);
+        if (prevPersisted?.active && prevPersisted.sessionFile === ctx.sessionManager.getSessionFile()) {
+          persistLoopState(pi, { ...prevPersisted, active: false });
+        }
+        ctx.ui.setStatus("ralph", `🔁 ${name}: iteration ${i}/${loopState.maxIterations}`);
+        const prevSessionFile = loopState.loopSessionFile;
+        const { cancelled } = await ctx.newSession();
+        if (cancelled) {
+          ctx.ui.notify("Session switch cancelled, stopping loop", "warning");
+          break;
+        }
+
+        loopState.loopSessionFile = ctx.sessionManager.getSessionFile();
+        if (shouldResetFailCount(prevSessionFile, loopState.loopSessionFile)) failCounts.delete(prevSessionFile!);
+        if (loopState.loopSessionFile) failCounts.set(loopState.loopSessionFile, 0);
+        persistLoopState(pi, {
+          active: true,
+          sessionFile: loopState.loopSessionFile,
+          iteration: loopState.iteration,
+          maxIterations: loopState.maxIterations,
+          iterationSummaries: loopState.iterationSummaries,
+          guardrails: { blockCommands: loopState.guardrails.blockCommands, protectedFiles: loopState.guardrails.protectedFiles },
+          stopRequested: false,
+        });
+
+        pi.sendUserMessage(prompt);
+        const timeoutMs = fm.timeout * 1000;
+        let timedOut = false;
+        let idleError: Error | undefined;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            ctx.waitForIdle().catch((e: any) => {
+              idleError = e instanceof Error ? e : new Error(String(e));
+              throw e;
+            }),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                timedOut = true;
+                reject(new Error("timeout"));
+              }, timeoutMs);
+            }),
+          ]);
+        } catch {
+          // handled below
+        }
+        if (timer) clearTimeout(timer);
+
+        const idleState = classifyIdleState(timedOut, idleError);
+        if (idleState === "timeout") {
+          ctx.ui.notify(`Iteration ${i} timed out after ${fm.timeout}s, stopping loop`, "warning");
+          break;
+        }
+        if (idleState === "error") {
+          ctx.ui.notify(`Iteration ${i} agent error: ${idleError!.message}, stopping loop`, "error");
+          break;
+        }
+
+        const elapsed = Math.round((Date.now() - iterStart) / 1000);
+        loopState.iterationSummaries.push({ iteration: i, duration: elapsed });
+        pi.appendEntry("ralph-iteration", { iteration: i, duration: elapsed, ralphPath: loopState.ralphPath });
+
+        const persistedAfter = readPersistedLoopState(ctx);
+        if (persistedAfter?.active && persistedAfter.stopRequested) {
+          loopState.stopRequested = true;
+          ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
+          break;
+        }
+
+        if (fm.completionPromise) {
+          const entries = ctx.sessionManager.getEntries();
+          for (const entry of entries) {
+            if (entry.type === "message" && entry.message?.role === "assistant") {
+              const text = entry.message.content?.filter((b: any) => b.type === "text")?.map((b: any) => b.text)?.join("") ?? "";
+              if (shouldStopForCompletionPromise(text, fm.completionPromise)) {
+                ctx.ui.notify(`Completion promise matched on iteration ${i}`, "info");
+                break iterationLoop;
+              }
+            }
+          }
+        }
+
+        ctx.ui.notify(`Iteration ${i} complete (${elapsed}s)`, "info");
+      }
+
+      const total = loopState.iterationSummaries.reduce((a, s) => a + s.duration, 0);
+      ctx.ui.notify(`Ralph loop done: ${loopState.iteration} iterations, ${total}s total`, "info");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.ui.notify(`Ralph loop failed: ${message}`, "error");
+    } finally {
+      failCounts.clear();
+      loopState.active = false;
+      loopState.stopRequested = false;
+      loopState.loopSessionFile = undefined;
+      ctx.ui.setStatus("ralph", undefined);
+      persistLoopState(pi, { active: false });
+    }
+  }
+
+  async function handleDraftCommand(commandName: "ralph" | "ralph-draft", args: string, ctx: any): Promise<string | undefined> {
+    const parsed = parseCommandArgs(args);
+
+    const resolveTaskForFolder = async (target: DraftTarget): Promise<string | undefined> => {
+      const task = await promptForTask(ctx, "What should Ralph work on in this folder?", "reverse engineer this app");
+      if (!task) return undefined;
+      return draftFromTask(commandName, task, target, ctx);
+    };
+
+    const handleExistingInspection = async (input: string): Promise<string | undefined> => {
+      const inspection = inspectExistingTarget(input, ctx.cwd);
+      switch (inspection.kind) {
+        case "run":
+          if (commandName === "ralph") return inspection.ralphPath;
+          await editExistingDraft(inspection.ralphPath, ctx, `Saved ${displayPath(ctx.cwd, inspection.ralphPath)}`);
+          return undefined;
+        case "invalid-markdown":
+          ctx.ui.notify(`Only task folders or RALPH.md can be run directly. ${displayPath(ctx.cwd, inspection.path)} is not runnable.`, "error");
+          return undefined;
+        case "dir-without-ralph":
+        case "missing-path": {
+          if (!ctx.hasUI) {
+            ctx.ui.notify("Draft review requires an interactive session. Pass a task folder or RALPH.md path instead.", "warning");
+            return undefined;
+          }
+          const recovery = await chooseRecoveryMode(input, inspection.dirPath, ctx);
+          if (recovery === "cancel") return undefined;
+          if (recovery === "task") {
+            return handleTaskFlow(input);
+          }
+          return resolveTaskForFolder({ slug: basename(inspection.dirPath), dirPath: inspection.dirPath, ralphPath: inspection.ralphPath });
+        }
+        case "not-path":
+          return handleTaskFlow(input);
+      }
+    };
+
+    const handleTaskFlow = async (taskInput: string): Promise<string | undefined> => {
+      const task = taskInput.trim();
+      if (!task) return undefined;
+      if (!ctx.hasUI) {
+        ctx.ui.notify("Draft review requires an interactive session. Use /ralph with a task folder or RALPH.md path instead.", "warning");
+        return undefined;
+      }
+
+      let planned = planTaskDraftTarget(ctx.cwd, task);
+      if (planned.kind === "conflict") {
+        const decision = await chooseConflictTarget(commandName, task, planned.target, ctx);
+        if (decision.action === "cancel") return undefined;
+        if (decision.action === "run-existing") return planned.target.ralphPath;
+        if (decision.action === "open-existing") {
+          await editExistingDraft(planned.target.ralphPath, ctx, `Saved ${displayPath(ctx.cwd, planned.target.ralphPath)}`);
+          return undefined;
+        }
+        planned = { kind: "draft", target: decision.target! };
+      }
+      return draftFromTask(commandName, task, planned.target, ctx);
+    };
+
+    if (parsed.mode === "task") {
+      return handleTaskFlow(parsed.value);
+    }
+    if (parsed.mode === "path") {
+      return handleExistingInspection(parsed.value || ".");
+    }
+    if (!parsed.value) {
+      const inspection = inspectExistingTarget(".", ctx.cwd);
+      if (inspection.kind === "run") {
+        if (commandName === "ralph") return inspection.ralphPath;
+        await editExistingDraft(inspection.ralphPath, ctx, `Saved ${displayPath(ctx.cwd, inspection.ralphPath)}`);
+        return undefined;
+      }
+      if (!ctx.hasUI) {
+        ctx.ui.notify("Draft review requires an interactive session. Pass a task folder or RALPH.md path instead.", "warning");
+        return undefined;
+      }
+      return resolveTaskForFolder({ slug: basename(ctx.cwd), dirPath: ctx.cwd, ralphPath: join(ctx.cwd, "RALPH.md") });
+    }
+    return handleExistingInspection(parsed.value);
+  }
 
   pi.on("tool_call", async (event: any, ctx: any) => {
     if (!isLoopSession(ctx)) return;
@@ -141,7 +478,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_result", async (event: any, ctx: any) => {
     if (!isLoopSession(ctx) || event.toolName !== "bash") return;
     const output = event.content.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text ?? "" : "")).join("");
-    if (!/FAIL|ERROR|error:|failed/i.test(output)) return;
+    if (!shouldWarnForBashFailure(output)) return;
 
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile) return;
@@ -159,159 +496,23 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("ralph", {
-    description: "Start an autonomous ralph loop from a RALPH.md file",
+    description: "Start Ralph from a task folder or RALPH.md",
     handler: async (args: string, ctx: any) => {
       if (loopState.active) {
         ctx.ui.notify("A ralph loop is already running. Use /ralph-stop first.", "warning");
         return;
       }
 
-      let name: string;
-      try {
-        const ralphPath = resolveRalphPath(args ?? "", ctx.cwd);
-        const { frontmatter } = parseRalphMd(ralphPath);
-        if (!validateFrontmatter(frontmatter, ctx)) return;
-        name = basename(dirname(ralphPath));
-        loopState = {
-          active: true,
-          ralphPath,
-          iteration: 0,
-          maxIterations: frontmatter.maxIterations,
-          timeout: frontmatter.timeout,
-          completionPromise: frontmatter.completionPromise,
-          stopRequested: false,
-          iterationSummaries: [],
-          guardrails: { blockCommands: frontmatter.guardrails.blockCommands, protectedFiles: frontmatter.guardrails.protectedFiles },
-          loopSessionFile: undefined,
-        };
-      } catch (err) {
-        ctx.ui.notify(String(err), "error");
-        return;
-      }
-      ctx.ui.notify(`Ralph loop started: ${name} (max ${loopState.maxIterations} iterations)`, "info");
+      const ralphPath = await handleDraftCommand("ralph", args ?? "", ctx);
+      if (!ralphPath) return;
+      await startRalphLoop(ralphPath, ctx);
+    },
+  });
 
-      try {
-        iterationLoop: for (let i = 1; i <= loopState.maxIterations; i++) {
-          if (loopState.stopRequested) break;
-          const persistedBefore = readPersistedLoopState(ctx);
-          if (persistedBefore?.active && persistedBefore.stopRequested) {
-            loopState.stopRequested = true;
-            ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
-            break;
-          }
-
-          loopState.iteration = i;
-          const iterStart = Date.now();
-          const { frontmatter: fm, body: rawBody } = parseRalphMd(loopState.ralphPath);
-          if (!validateFrontmatter(fm, ctx)) {
-            ctx.ui.notify(`Invalid RALPH.md on iteration ${i}, stopping loop`, "error");
-            break;
-          }
-
-          loopState.maxIterations = fm.maxIterations;
-          loopState.timeout = fm.timeout;
-          loopState.completionPromise = fm.completionPromise;
-          loopState.guardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
-
-          const outputs = await runCommands(fm.commands, pi);
-          const body = renderRalphBody(rawBody, outputs, { iteration: i, name });
-          const prompt = renderIterationPrompt(body, i, loopState.maxIterations);
-
-          const prevPersisted = readPersistedLoopState(ctx);
-          if (prevPersisted?.active && prevPersisted.sessionFile === ctx.sessionManager.getSessionFile()) persistLoopState(pi, { ...prevPersisted, active: false });
-          ctx.ui.setStatus("ralph", `🔁 ${name}: iteration ${i}/${loopState.maxIterations}`);
-          const prevSessionFile = loopState.loopSessionFile;
-          const { cancelled } = await ctx.newSession();
-          if (cancelled) {
-            ctx.ui.notify("Session switch cancelled, stopping loop", "warning");
-            break;
-          }
-
-          loopState.loopSessionFile = ctx.sessionManager.getSessionFile();
-          if (prevSessionFile && prevSessionFile !== loopState.loopSessionFile) failCounts.delete(prevSessionFile);
-          if (loopState.loopSessionFile) failCounts.set(loopState.loopSessionFile, 0);
-          persistLoopState(pi, {
-            active: true,
-            sessionFile: loopState.loopSessionFile,
-            iteration: loopState.iteration,
-            maxIterations: loopState.maxIterations,
-            iterationSummaries: loopState.iterationSummaries,
-            guardrails: { blockCommands: loopState.guardrails.blockCommands, protectedFiles: loopState.guardrails.protectedFiles },
-            stopRequested: false,
-          });
-
-          pi.sendUserMessage(prompt);
-          const timeoutMs = fm.timeout * 1000;
-          let timedOut = false;
-          let idleError: Error | undefined;
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          try {
-            await Promise.race([
-              ctx.waitForIdle().catch((e: any) => {
-                idleError = e instanceof Error ? e : new Error(String(e));
-                throw e;
-              }),
-              new Promise<never>((_, reject) => {
-                timer = setTimeout(() => {
-                  timedOut = true;
-                  reject(new Error("timeout"));
-                }, timeoutMs);
-              }),
-            ]);
-          } catch {
-            // timedOut is set by timer; idleError means waitForIdle failed
-          }
-          if (timer) clearTimeout(timer);
-          if (timedOut) {
-            ctx.ui.notify(`Iteration ${i} timed out after ${fm.timeout}s, stopping loop`, "warning");
-            break;
-          }
-          if (idleError) {
-            ctx.ui.notify(`Iteration ${i} agent error: ${idleError.message}, stopping loop`, "error");
-            break;
-          }
-
-          const elapsed = Math.round((Date.now() - iterStart) / 1000);
-          loopState.iterationSummaries.push({ iteration: i, duration: elapsed });
-          pi.appendEntry("ralph-iteration", { iteration: i, duration: elapsed, ralphPath: loopState.ralphPath });
-
-          const persistedAfter = readPersistedLoopState(ctx);
-          if (persistedAfter?.active && persistedAfter.stopRequested) {
-            loopState.stopRequested = true;
-            ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
-            break;
-          }
-
-          if (fm.completionPromise) {
-            const entries = ctx.sessionManager.getEntries();
-            for (const entry of entries) {
-              if (entry.type === "message" && entry.message?.role === "assistant") {
-                const text = entry.message.content?.filter((b: any) => b.type === "text")?.map((b: any) => b.text)?.join("") ?? "";
-                const match = text.match(/<promise>([^<]+)<\/promise>/);
-                if (match && fm.completionPromise && match[1].trim() === fm.completionPromise.trim()) {
-                  ctx.ui.notify(`Completion promise matched on iteration ${i}`, "info");
-                  break iterationLoop;
-                }
-              }
-            }
-          }
-
-          ctx.ui.notify(`Iteration ${i} complete (${elapsed}s)`, "info");
-        }
-
-        const total = loopState.iterationSummaries.reduce((a, s) => a + s.duration, 0);
-        ctx.ui.notify(`Ralph loop done: ${loopState.iteration} iterations, ${total}s total`, "info");
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        ctx.ui.notify(`Ralph loop failed: ${message}`, "error");
-      } finally {
-        failCounts.clear();
-        loopState.active = false;
-        loopState.stopRequested = false;
-        loopState.loopSessionFile = undefined;
-        ctx.ui.setStatus("ralph", undefined);
-        persistLoopState(pi, { active: false });
-      }
+  pi.registerCommand("ralph-draft", {
+    description: "Draft a Ralph task without starting it",
+    handler: async (args: string, ctx: any) => {
+      await handleDraftCommand("ralph-draft", args ?? "", ctx);
     },
   });
 

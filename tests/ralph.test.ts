@@ -1,16 +1,32 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
+  buildMissionBrief,
+  classifyTaskMode,
+  createSiblingTarget,
   defaultFrontmatter,
+  extractDraftMetadata,
+  generateDraft,
+  inspectExistingTarget,
+  inspectRepo,
+  looksLikePath,
+  nextSiblingSlug,
+  parseCommandArgs,
   parseRalphMarkdown,
+  planTaskDraftTarget,
   renderIterationPrompt,
   renderRalphBody,
-  resolveRalphTarget,
-  resolveRalphTargetResolution,
   resolvePlaceholders,
+  slugifyTask,
   validateFrontmatter,
 } from "../src/ralph.ts";
+
+function createTempDir(): string {
+  return mkdtempSync(join(tmpdir(), "pi-ralph-loop-"));
+}
 
 test("parseRalphMarkdown falls back to default frontmatter when no frontmatter is present", () => {
   const parsed = parseRalphMarkdown("hello\nworld");
@@ -38,10 +54,6 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
 test("validateFrontmatter accepts valid input and rejects invalid values", () => {
   assert.equal(validateFrontmatter(defaultFrontmatter()), null);
   assert.equal(
-    validateFrontmatter({ ...defaultFrontmatter(), invalidCommandEntries: [0] }),
-    "Invalid command entry at index 0",
-  );
-  assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), maxIterations: 0 }),
     "Invalid max_iterations: must be a positive finite integer",
   );
@@ -50,7 +62,7 @@ test("validateFrontmatter accepts valid input and rejects invalid values", () =>
     "Invalid timeout: must be a positive finite number",
   );
   assert.equal(
-    validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: ["["] , protectedFiles: [] } }),
+    validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: ["["], protectedFiles: [] } }),
     "Invalid block_commands regex: [",
   );
   assert.equal(
@@ -65,9 +77,13 @@ test("validateFrontmatter accepts valid input and rejects invalid values", () =>
     validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "build", run: "echo ok", timeout: 0 }] }),
     "Invalid command build: timeout must be positive",
   );
+  assert.equal(
+    validateFrontmatter(parseRalphMarkdown("---\ncommands:\n  - nope\n  - null\n---\nbody").frontmatter),
+    "Invalid command entry at index 0",
+  );
 });
 
-test("resolvePlaceholders and rendering helpers expand placeholders and strip comments", () => {
+test("render helpers expand placeholders and strip comments", () => {
   const outputs = [{ name: "build", output: "done" }];
 
   assert.equal(
@@ -81,28 +97,122 @@ test("resolvePlaceholders and rendering helpers expand placeholders and strip co
   assert.equal(renderIterationPrompt("Body", 2, 5), "[ralph: iteration 2/5]\n\nBody");
 });
 
-test("parseRalphMarkdown tracks malformed command entries for validation", () => {
-  const parsed = parseRalphMarkdown("---\ncommands:\n  - nope\n  - null\n---\nBody\n");
-
-  assert.deepEqual(parsed.frontmatter.commands, []);
-  assert.deepEqual(parsed.frontmatter.invalidCommandEntries, [0, 1]);
-  assert.equal(validateFrontmatter(parsed.frontmatter), "Invalid command entry at index 0");
+test("parseCommandArgs handles explicit task/path flags and auto mode", () => {
+  assert.deepEqual(parseCommandArgs("--task reverse engineer auth"), { mode: "task", value: "reverse engineer auth" });
+  assert.deepEqual(parseCommandArgs("--path my-task"), { mode: "path", value: "my-task" });
+  assert.deepEqual(parseCommandArgs("--task=fix flaky tests"), { mode: "task", value: "fix flaky tests" });
+  assert.deepEqual(parseCommandArgs("  reverse engineer this app  "), { mode: "auto", value: "reverse engineer this app" });
 });
 
-test("resolveRalphTarget logic normalizes args and resolves markdown candidates", () => {
-  const cwd = "/workspace/project";
+test("path detection and existing-target inspection distinguish runnable Ralph targets from arbitrary markdown", (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
 
-  assert.equal(resolveRalphTarget("  "), ".");
-  assert.equal(resolveRalphTarget("docs"), "docs");
+  mkdirSync(join(cwd, "task"), { recursive: true });
+  mkdirSync(join(cwd, "empty"), { recursive: true });
+  writeFileSync(join(cwd, "task", "RALPH.md"), "Task body", "utf8");
+  writeFileSync(join(cwd, "README.md"), "not runnable", "utf8");
 
-  const directoryResolution = resolveRalphTargetResolution("docs", cwd);
-  assert.deepEqual(directoryResolution, {
-    target: "docs",
-    absoluteTarget: resolve(cwd, "docs"),
-    markdownPath: resolve(cwd, "docs", "RALPH.md"),
+  assert.equal(looksLikePath("reverse engineer auth"), false);
+  assert.equal(looksLikePath("auth-audit"), true);
+  assert.equal(looksLikePath("README.md"), true);
+
+  assert.deepEqual(inspectExistingTarget("task", cwd), { kind: "run", ralphPath: join(cwd, "task", "RALPH.md") });
+  assert.deepEqual(inspectExistingTarget("README.md", cwd), { kind: "invalid-markdown", path: join(cwd, "README.md") });
+  assert.deepEqual(inspectExistingTarget("empty", cwd), {
+    kind: "dir-without-ralph",
+    dirPath: join(cwd, "empty"),
+    ralphPath: join(cwd, "empty", "RALPH.md"),
   });
+  assert.deepEqual(inspectExistingTarget("missing-path", cwd), {
+    kind: "missing-path",
+    dirPath: join(cwd, "missing-path"),
+    ralphPath: join(cwd, "missing-path", "RALPH.md"),
+  });
+  assert.deepEqual(inspectExistingTarget("reverse engineer auth", cwd), { kind: "not-path" });
+});
 
-  const fileResolution = resolveRalphTargetResolution("guide/RALPH.md", cwd);
-  assert.equal(fileResolution.absoluteTarget, resolve(cwd, "guide/RALPH.md"));
-  assert.equal(fileResolution.markdownPath, fileResolution.absoluteTarget);
+test("slug helpers provide fallback and deterministic sibling names", (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  mkdirSync(join(cwd, "reverse-engineer-this-app"), { recursive: true });
+  writeFileSync(join(cwd, "reverse-engineer-this-app", "RALPH.md"), "existing", "utf8");
+  mkdirSync(join(cwd, "reverse-engineer-this-app-2"), { recursive: true });
+  writeFileSync(join(cwd, "reverse-engineer-this-app-2", "RALPH.md"), "existing", "utf8");
+
+  assert.equal(slugifyTask("Reverse engineer this app!"), "reverse-engineer-this-app");
+  assert.equal(slugifyTask("!!!"), "ralph-task");
+  assert.equal(nextSiblingSlug("reverse-engineer-this-app", (slug) => slug === "reverse-engineer-this-app-2" || slug === "reverse-engineer-this-app-3"), "reverse-engineer-this-app-4");
+  assert.deepEqual(planTaskDraftTarget(cwd, "Reverse engineer this app").kind, "conflict");
+  assert.equal(createSiblingTarget(cwd, "reverse-engineer-this-app").slug, "reverse-engineer-this-app-3");
+});
+
+test("task classification identifies analysis, fix, migration, and general modes", () => {
+  assert.equal(classifyTaskMode("Reverse engineer the billing flow"), "analysis");
+  assert.equal(classifyTaskMode("Fix flaky auth tests"), "fix");
+  assert.equal(classifyTaskMode("Migrate this package to ESM"), "migration");
+  assert.equal(classifyTaskMode("Improve the login page"), "general");
+});
+
+test("inspectRepo detects bounded package signals", (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  mkdirSync(join(cwd, ".git"));
+  mkdirSync(join(cwd, "src"));
+  writeFileSync(join(cwd, "package-lock.json"), "{}", "utf8");
+  writeFileSync(
+    join(cwd, "package.json"),
+    JSON.stringify({ name: "demo", scripts: { test: "vitest", lint: "eslint ." } }, null, 2),
+    "utf8",
+  );
+
+  assert.deepEqual(inspectRepo(cwd), {
+    packageManager: "npm",
+    testCommand: "npm test",
+    lintCommand: "npm run lint",
+    hasGit: true,
+    topLevelDirs: [".git", "src"],
+    topLevelFiles: ["package-lock.json", "package.json"],
+  });
+});
+
+test("generateDraft creates metadata-rich analysis and fix drafts", () => {
+  const analysisDraft = generateDraft(
+    "Reverse engineer this app",
+    { slug: "reverse-engineer-this-app", dirPath: "/repo/reverse-engineer-this-app", ralphPath: "/repo/reverse-engineer-this-app/RALPH.md" },
+    { packageManager: "npm", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+  assert.equal(analysisDraft.mode, "analysis");
+  assert.equal(extractDraftMetadata(analysisDraft.content)?.mode, "analysis");
+  assert.match(analysisDraft.content, /Work read-only/);
+  assert.match(analysisDraft.content, /\{\{ commands.repo-map \}\}/);
+  assert.match(analysisDraft.content, /\*\*\/\*/);
+
+  const fixDraft = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+  assert.equal(fixDraft.mode, "fix");
+  assert.match(fixDraft.content, /If tests or lint are failing/);
+  assert.match(fixDraft.content, /\{\{ commands.tests \}\}/);
+  assert.match(fixDraft.content, /\{\{ commands.lint \}\}/);
+  assert.equal(extractDraftMetadata(fixDraft.content)?.task, "Fix flaky auth tests");
+});
+
+test("buildMissionBrief summarizes the generated draft", () => {
+  const plan = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: false, topLevelDirs: [], topLevelFiles: [] },
+  );
+
+  const brief = buildMissionBrief(plan);
+  assert.match(brief, /Mission Brief/);
+  assert.match(brief, /Review what Ralph will do before it starts/);
+  assert.match(brief, /Fix flaky auth tests/);
+  assert.match(brief, /npm test/);
+  assert.match(brief, /Blocks git push and protects secret files/);
 });
