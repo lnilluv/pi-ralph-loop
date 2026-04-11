@@ -59,7 +59,7 @@ On each iteration, pi-ralph reads `RALPH.md`, runs the configured commands, inje
 - direct `RALPH.md` path -> runs it
 - no args in a folder without `RALPH.md` -> asks what the loop should work on, drafts `./RALPH.md`, then asks before starting
 - natural-language task -> drafts `./<slug>/RALPH.md`, then asks before starting
-- unresolved path-like input -> offers recovery choices
+- unresolved path-like input like `foo/bar` or `notes.md` -> offers recovery choices and normalizes missing markdown targets to `./<folder>/RALPH.md`
 - arbitrary markdown files like `README.md` -> rejected instead of auto-run
 
 ### Explicit flags

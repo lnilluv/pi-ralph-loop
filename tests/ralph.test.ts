@@ -116,6 +116,7 @@ test("path detection and existing-target inspection distinguish runnable Ralph t
   assert.equal(looksLikePath("reverse engineer auth"), false);
   assert.equal(looksLikePath("auth-audit"), true);
   assert.equal(looksLikePath("README.md"), true);
+  assert.equal(looksLikePath("foo/bar"), true);
 
   assert.deepEqual(inspectExistingTarget("task", cwd), { kind: "run", ralphPath: join(cwd, "task", "RALPH.md") });
   assert.deepEqual(inspectExistingTarget("README.md", cwd), { kind: "invalid-markdown", path: join(cwd, "README.md") });
@@ -128,6 +129,16 @@ test("path detection and existing-target inspection distinguish runnable Ralph t
     kind: "missing-path",
     dirPath: join(cwd, "missing-path"),
     ralphPath: join(cwd, "missing-path", "RALPH.md"),
+  });
+  assert.deepEqual(inspectExistingTarget("foo/bar", cwd), {
+    kind: "missing-path",
+    dirPath: join(cwd, "foo/bar"),
+    ralphPath: join(cwd, "foo/bar", "RALPH.md"),
+  });
+  assert.deepEqual(inspectExistingTarget("notes.md", cwd), {
+    kind: "missing-path",
+    dirPath: join(cwd, "notes"),
+    ralphPath: join(cwd, "notes", "RALPH.md"),
   });
   assert.deepEqual(inspectExistingTarget("reverse engineer auth", cwd), { kind: "not-path" });
 });
@@ -178,6 +189,36 @@ test("inspectRepo detects bounded package signals", (t) => {
   });
 });
 
+test("generated drafts reparse as valid RALPH files", () => {
+  const draft = generateDraft(
+    "Reverse engineer this app",
+    { slug: "reverse-engineer-this-app", dirPath: "/repo/reverse-engineer-this-app", ralphPath: "/repo/reverse-engineer-this-app/RALPH.md" },
+    { packageManager: "npm", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+
+  const reparsed = parseRalphMarkdown(draft.content);
+  assert.equal(validateFrontmatter(reparsed.frontmatter), null);
+  assert.deepEqual(reparsed.frontmatter.commands, [
+    { name: "git-log", run: "git log --oneline -10", timeout: 20 },
+    { name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20 },
+  ]);
+  assert.deepEqual(reparsed.frontmatter, {
+    commands: [
+      { name: "git-log", run: "git log --oneline -10", timeout: 20 },
+      { name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20 },
+    ],
+    maxIterations: 12,
+    timeout: 300,
+    completionPromise: undefined,
+    guardrails: { blockCommands: ["git\\s+push"], protectedFiles: ["**/*"] },
+    invalidCommandEntries: undefined,
+  });
+  assert.match(reparsed.body, /Task: Reverse engineer this app/);
+  assert.match(reparsed.body, /\{\{ commands.git-log \}\}/);
+  assert.match(reparsed.body, /\{\{ ralph.iteration \}\}/);
+  assert.equal(extractDraftMetadata(draft.content)?.mode, "analysis");
+});
+
 test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   const analysisDraft = generateDraft(
     "Reverse engineer this app",
@@ -186,7 +227,7 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   );
   assert.equal(analysisDraft.mode, "analysis");
   assert.equal(extractDraftMetadata(analysisDraft.content)?.mode, "analysis");
-  assert.match(analysisDraft.content, /Work read-only/);
+  assert.match(analysisDraft.content, /Start with read-only inspection/);
   assert.match(analysisDraft.content, /\{\{ commands.repo-map \}\}/);
   assert.match(analysisDraft.content, /\*\*\/\*/);
 
@@ -202,17 +243,23 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   assert.equal(extractDraftMetadata(fixDraft.content)?.task, "Fix flaky auth tests");
 });
 
-test("buildMissionBrief summarizes the generated draft", () => {
+test("buildMissionBrief refreshes after draft edits", () => {
   const plan = generateDraft(
     "Fix flaky auth tests",
     { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
     { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: false, topLevelDirs: [], topLevelFiles: [] },
   );
+  const editedPlan = {
+    ...plan,
+    content: plan.content
+      .replace("name: tests\n    run: npm test\n    timeout: 120", "name: smoke\n    run: npm run smoke\n    timeout: 45")
+      .replace("max_iterations: 25", "max_iterations: 7"),
+  };
 
-  const brief = buildMissionBrief(plan);
+  const brief = buildMissionBrief(editedPlan);
   assert.match(brief, /Mission Brief/);
-  assert.match(brief, /Review what Ralph will do before it starts/);
   assert.match(brief, /Fix flaky auth tests/);
-  assert.match(brief, /npm test/);
-  assert.match(brief, /Blocks git push and protects secret files/);
+  assert.match(brief, /smoke: npm run smoke/);
+  assert.match(brief, /Stop after 7 iterations or \/ralph-stop/);
+  assert.doesNotMatch(brief, /tests: npm test/);
 });

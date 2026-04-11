@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 export type CommandDef = { name: string; run: string; timeout: number };
@@ -92,6 +92,51 @@ function normalizeRawRalph(raw: string): string {
   return raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
 }
 
+function matchRalphMarkdown(raw: string): RegExpMatchArray | null {
+  return normalizeRawRalph(raw).match(/^(?:\s*<!--[\s\S]*?-->\s*)*---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+}
+
+function hasRalphFrontmatter(raw: string): boolean {
+  return matchRalphMarkdown(raw) !== null;
+}
+
+function safeParseRalphMarkdown(raw: string): ParsedRalph | undefined {
+  try {
+    return parseRalphMarkdown(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeMissingMarkdownTarget(absoluteTarget: string): { dirPath: string; ralphPath: string } {
+  if (basename(absoluteTarget) === "RALPH.md") {
+    return { dirPath: dirname(absoluteTarget), ralphPath: absoluteTarget };
+  }
+
+  const dirPath = absoluteTarget.slice(0, -3);
+  return { dirPath, ralphPath: join(dirPath, "RALPH.md") };
+}
+
+function summarizeSafetyLabel(mode: DraftMode, guardrails: Frontmatter["guardrails"]): string {
+  const labels: string[] = [];
+  if (mode === "analysis") labels.push("Prefer read-only inspection");
+  if (guardrails.blockCommands.some((pattern) => pattern.includes("git") && pattern.includes("push"))) {
+    labels.push("blocks git push");
+  } else if (guardrails.blockCommands.length > 0) {
+    labels.push(`blocks ${guardrails.blockCommands.length} command pattern${guardrails.blockCommands.length === 1 ? "" : "s"}`);
+  }
+  if (guardrails.protectedFiles.some((pattern) => pattern.includes(".env") || pattern.includes("secret"))) {
+    labels.push("protects secret files");
+  } else if (guardrails.protectedFiles.length > 0) {
+    labels.push(`protects ${guardrails.protectedFiles.length} file glob${guardrails.protectedFiles.length === 1 ? "" : "s"}`);
+  }
+  return labels.length > 0 ? labels.join(" and ") : "No extra safety rules";
+}
+
+function summarizeFinishLabel(maxIterations: number): string {
+  return `Stop after ${maxIterations} iterations or /ralph-stop`;
+}
+
 function isRalphMarkdownPath(path: string): boolean {
   return basename(path) === "RALPH.md";
 }
@@ -138,6 +183,10 @@ function yamlBlock(lines: string[]): string {
   return `---\n${lines.join("\n")}\n---`;
 }
 
+function yamlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 function renderCommandsYaml(commands: CommandDef[]): string[] {
   if (commands.length === 0) return ["commands: []"];
   return [
@@ -160,7 +209,7 @@ export function defaultFrontmatter(): Frontmatter {
 
 export function parseRalphMarkdown(raw: string): ParsedRalph {
   const normalized = normalizeRawRalph(raw);
-  const match = normalized.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const match = matchRalphMarkdown(normalized);
   if (!match) return { frontmatter: defaultFrontmatter(), body: normalized };
 
   const yaml = parseRalphFrontmatter(match[1]);
@@ -241,6 +290,7 @@ export function looksLikePath(value: string): boolean {
     trimmed.startsWith("/") ||
     trimmed.startsWith("~") ||
     trimmed.includes("\\") ||
+    trimmed.includes("/") ||
     trimmed.endsWith(".md") ||
     trimmed.includes("-")
   );
@@ -276,9 +326,15 @@ export function inspectExistingTarget(input: string, cwd: string): ExistingTarge
       : { kind: "dir-without-ralph", dirPath: absoluteTarget, ralphPath: markdownPath };
   }
 
-  return looksLikePath(input)
-    ? { kind: "missing-path", dirPath: absoluteTarget, ralphPath: markdownPath }
-    : { kind: "not-path" };
+  if (!looksLikePath(input)) {
+    return { kind: "not-path" };
+  }
+
+  if (absoluteTarget.endsWith(".md")) {
+    return { kind: "missing-path", ...normalizeMissingMarkdownTarget(absoluteTarget) };
+  }
+
+  return { kind: "missing-path", dirPath: absoluteTarget, ralphPath: markdownPath };
 }
 
 export function slugifyTask(task: string): string {
@@ -375,15 +431,20 @@ export function generateDraft(task: string, target: DraftTarget, signals: RepoSi
   const mode = classifyTaskMode(task);
   const commands = suggestedCommandsForMode(mode, signals);
   const metadata: DraftMetadata = { generator: "pi-ralph-loop", version: 1, task, mode };
+  const guardrails = {
+    blockCommands: ["git\\s+push"],
+    protectedFiles: mode === "analysis" ? ["**/*"] : [".env*", "**/secrets/**"],
+  };
+  const maxIterations = mode === "analysis" ? 12 : mode === "migration" ? 30 : 25;
   const frontmatterLines = [
     ...renderCommandsYaml(commands),
-    `max_iterations: ${mode === "analysis" ? 12 : mode === "migration" ? 30 : 25}`,
+    `max_iterations: ${maxIterations}`,
     "timeout: 300",
     "guardrails:",
     "  block_commands:",
-    '    - "git\\s+push"',
+    ...guardrails.blockCommands.map((pattern) => `    - ${yamlQuote(pattern)}`),
     "  protected_files:",
-    ...(mode === "analysis" ? ['    - "**/*"'] : ['    - ".env*"', '    - "**/secrets/**"']),
+    ...guardrails.protectedFiles.map((pattern) => `    - ${yamlQuote(pattern)}`),
   ];
 
   const commandSections = commands.map((command) => bodySection(command.name === "git-log" ? "Recent git history" : `Latest ${command.name} output`, `{{ commands.${command.name} }}`));
@@ -394,7 +455,7 @@ export function generateDraft(task: string, target: DraftTarget, signals: RepoSi
           "",
           ...commandSections,
           "",
-          "Work read-only. Do not edit files or make commits.",
+          "Start with read-only inspection. Avoid edits and commits until you have a clear plan.",
           "Map the architecture, identify entry points, and summarize the important moving parts.",
           "End each iteration with concrete findings, open questions, and the next files to inspect.",
           "Iteration {{ ralph.iteration }} of {{ ralph.name }}.",
@@ -417,8 +478,8 @@ export function generateDraft(task: string, target: DraftTarget, signals: RepoSi
     target,
     content: `${metadataComment(metadata)}\n${yamlBlock(frontmatterLines)}\n\n${body}`,
     commandLabels: commands.map(formatCommandLabel),
-    safetyLabel: mode === "analysis" ? "Read-only by default" : "Blocks git push and protects secret files",
-    finishLabel: mode === "analysis" ? "Stop after 12 iterations or /ralph-stop" : "Stop after 25 iterations or /ralph-stop",
+    safetyLabel: summarizeSafetyLabel(mode, guardrails),
+    finishLabel: summarizeFinishLabel(maxIterations),
   };
 }
 
@@ -434,24 +495,32 @@ export function extractDraftMetadata(raw: string): DraftMetadata | undefined {
 }
 
 export function buildMissionBrief(plan: DraftPlan): string {
+  const parsed = hasRalphFrontmatter(plan.content) ? safeParseRalphMarkdown(plan.content) : undefined;
+  const metadata = extractDraftMetadata(plan.content);
+  const task = metadata?.task ?? plan.task;
+  const mode = metadata?.mode ?? plan.mode;
+  const commandLabels = parsed ? parsed.frontmatter.commands.map(formatCommandLabel) : plan.commandLabels;
+  const finishLabel = parsed ? summarizeFinishLabel(parsed.frontmatter.maxIterations) : plan.finishLabel;
+  const safetyLabel = parsed ? summarizeSafetyLabel(mode, parsed.frontmatter.guardrails) : plan.safetyLabel;
+
   return [
     "Mission Brief",
     "Review what Ralph will do before it starts.",
     "",
     "Task",
-    plan.task,
+    task,
     "",
     "File",
     plan.target.ralphPath,
     "",
     "Suggested checks",
-    ...plan.commandLabels.map((label) => `- ${label}`),
+    ...commandLabels.map((label) => `- ${label}`),
     "",
     "Finish behavior",
-    `- ${plan.finishLabel}`,
+    `- ${finishLabel}`,
     "",
     "Safety",
-    `- ${plan.safetyLabel}`,
+    `- ${safetyLabel}`,
   ].join("\n");
 }
 
