@@ -24,10 +24,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js 24
+      - name: Setup Node.js 24.14.1
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
         with:
-          node-version: 24
+          node-version: 24.14.1
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
@@ -122,11 +122,11 @@ jobs:
 
       - name: Publish (main)
         if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main'
-        run: npx npm@11 publish --access public --provenance
+        run: npx -y npm@11.12.1 publish --access public --provenance
 
       - name: Publish (dev prerelease)
         if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev'
-        run: npx npm@11 publish --access public --provenance --tag dev
+        run: npx -y npm@11.12.1 publish --access public --provenance --tag dev
 
       - name: Commit version bump and tag
         if: steps.bump.outputs.should_release == 'true'
