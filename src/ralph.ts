@@ -21,6 +21,34 @@ export function defaultFrontmatter(): Frontmatter {
   return { commands: [], maxIterations: 50, timeout: 300, guardrails: { blockCommands: [], protectedFiles: [] } };
 }
 
+type UnknownRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseRalphFrontmatter(raw: string): UnknownRecord {
+  const parsed: unknown = parseYaml(raw);
+  return isRecord(parsed) ? parsed : {};
+}
+
+function parseCommandDef(value: unknown): CommandDef | null {
+  if (!isRecord(value)) return null;
+  return {
+    name: String(value.name ?? ""),
+    run: String(value.run ?? ""),
+    timeout: Number(value.timeout ?? 60),
+  };
+}
+
+function toUnknownArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item)) : [];
+}
+
 function normalizeRawRalph(raw: string): string {
   return raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
 }
@@ -30,11 +58,11 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
   const match = normalized.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) return { frontmatter: defaultFrontmatter(), body: normalized };
 
-  const yaml = (parseYaml(match[1]) ?? {}) as Record<string, any>;
-  const commands: CommandDef[] = Array.isArray(yaml.commands)
-    ? yaml.commands.map((c: Record<string, any>) => ({ name: String(c.name ?? ""), run: String(c.run ?? ""), timeout: Number(c.timeout ?? 60) }))
-    : [];
-  const guardrails = (yaml.guardrails ?? {}) as Record<string, any>;
+  const yaml = parseRalphFrontmatter(match[1]);
+  const commands = toUnknownArray(yaml.commands)
+    .map((command) => parseCommandDef(command))
+    .filter((command): command is CommandDef => command !== null);
+  const guardrails = isRecord(yaml.guardrails) ? yaml.guardrails : {};
 
   return {
     frontmatter: {
@@ -44,8 +72,8 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
       completionPromise:
         typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
       guardrails: {
-        blockCommands: Array.isArray(guardrails.block_commands) ? guardrails.block_commands.map((p: unknown) => String(p)) : [],
-        protectedFiles: Array.isArray(guardrails.protected_files) ? guardrails.protected_files.map((p: unknown) => String(p)) : [],
+        blockCommands: toStringArray(guardrails.block_commands),
+        protectedFiles: toStringArray(guardrails.protected_files),
       },
     },
     body: match[2] ?? "",
