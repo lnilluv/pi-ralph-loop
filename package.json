@@ -8,7 +8,11 @@
       "./src/index.ts"
     ]
   },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
+    "test": "node --test --experimental-strip-types tests/ralph.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "repository": {

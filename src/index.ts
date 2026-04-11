@@ -1,19 +1,16 @@
-import { parse as parseYaml } from "yaml";
 import { minimatch } from "minimatch";
 import { readFileSync, existsSync } from "node:fs";
-import { resolve, join, dirname, basename } from "node:path";
+import { basename, dirname } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import {
+  parseRalphMarkdown,
+  renderIterationPrompt,
+  renderRalphBody,
+  resolveRalphTargetResolution,
+  validateFrontmatter as validateFrontmatterMessage,
+} from "./ralph.ts";
+import type { CommandDef, CommandOutput, Frontmatter } from "./ralph.ts";
 
-type CommandDef = { name: string; run: string; timeout: number };
-type Frontmatter = {
-  commands: CommandDef[];
-  maxIterations: number;
-  timeout: number;
-  completionPromise?: string;
-  guardrails: { blockCommands: string[]; protectedFiles: string[] };
-};
-type ParsedRalph = { frontmatter: Frontmatter; body: string };
-type CommandOutput = { name: string; output: string };
 type LoopState = {
   active: boolean;
   ralphPath: string;
@@ -36,84 +33,24 @@ type PersistedLoopState = {
   stopRequested?: boolean;
 };
 
-function defaultFrontmatter(): Frontmatter {
-  return { commands: [], maxIterations: 50, timeout: 300, guardrails: { blockCommands: [], protectedFiles: [] } };
-}
-
-function parseRalphMd(filePath: string): ParsedRalph {
-  let raw = readFileSync(filePath, "utf8");
-  raw = raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
-  const match = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
-  if (!match) return { frontmatter: defaultFrontmatter(), body: raw };
-
-  const yaml = (parseYaml(match[1]) ?? {}) as Record<string, any>;
-  const commands: CommandDef[] = Array.isArray(yaml.commands)
-    ? yaml.commands.map((c: Record<string, any>) => ({ name: String(c.name ?? ""), run: String(c.run ?? ""), timeout: Number(c.timeout ?? 60) }))
-    : [];
-  const guardrails = (yaml.guardrails ?? {}) as Record<string, any>;
-
-  return {
-    frontmatter: {
-      commands,
-      maxIterations: Number(yaml.max_iterations ?? 50),
-      timeout: Number(yaml.timeout ?? 300),
-      completionPromise:
-        typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
-      guardrails: {
-        blockCommands: Array.isArray(guardrails.block_commands) ? guardrails.block_commands.map((p: unknown) => String(p)) : [],
-        protectedFiles: Array.isArray(guardrails.protected_files) ? guardrails.protected_files.map((p: unknown) => String(p)) : [],
-      },
-    },
-    body: match[2] ?? "",
-  };
+function parseRalphMd(filePath: string) {
+  return parseRalphMarkdown(readFileSync(filePath, "utf8"));
 }
 
 function validateFrontmatter(fm: Frontmatter, ctx: any): boolean {
-  if (!Number.isFinite(fm.maxIterations) || !Number.isInteger(fm.maxIterations) || fm.maxIterations <= 0) {
-    ctx.ui.notify("Invalid max_iterations: must be a positive finite integer", "error");
+  const error = validateFrontmatterMessage(fm);
+  if (error) {
+    ctx.ui.notify(error, "error");
     return false;
-  }
-  if (!Number.isFinite(fm.timeout) || fm.timeout <= 0) {
-    ctx.ui.notify("Invalid timeout: must be a positive finite number", "error");
-    return false;
-  }
-  for (const pattern of fm.guardrails.blockCommands) {
-    try { new RegExp(pattern); } catch {
-      ctx.ui.notify(`Invalid block_commands regex: ${pattern}`, "error");
-      return false;
-    }
-  }
-  for (const cmd of fm.commands) {
-    if (!cmd.name.trim()) {
-      ctx.ui.notify("Invalid command: name is required", "error");
-      return false;
-    }
-    if (!cmd.run.trim()) {
-      ctx.ui.notify(`Invalid command ${cmd.name}: run is required`, "error");
-      return false;
-    }
-    if (!Number.isFinite(cmd.timeout) || cmd.timeout <= 0) {
-      ctx.ui.notify(`Invalid command ${cmd.name}: timeout must be positive`, "error");
-      return false;
-    }
   }
   return true;
 }
 
 function resolveRalphPath(args: string, cwd: string): string {
-  const target = args.trim() || ".";
-  const abs = resolve(cwd, target);
-  if (existsSync(abs) && abs.endsWith(".md")) return abs;
-  if (existsSync(join(abs, "RALPH.md"))) return join(abs, "RALPH.md");
-  throw new Error(`No RALPH.md found at ${abs}`);
-}
-
-function resolvePlaceholders(body: string, outputs: CommandOutput[], ralph: { iteration: number; name: string }): string {
-  const map = new Map(outputs.map((o) => [o.name, o.output]));
-  return body
-    .replace(/\{\{\s*commands\.(\w[\w-]*)\s*\}\}/g, (_, name) => map.get(name) ?? "")
-    .replace(/\{\{\s*ralph\.iteration\s*\}\}/g, String(ralph.iteration))
-    .replace(/\{\{\s*ralph\.name\s*\}\}/g, ralph.name);
+  const { absoluteTarget, markdownPath } = resolveRalphTargetResolution(args, cwd);
+  if (existsSync(absoluteTarget) && absoluteTarget.endsWith(".md")) return absoluteTarget;
+  if (existsSync(markdownPath)) return markdownPath;
+  throw new Error(`No RALPH.md found at ${absoluteTarget}`);
 }
 
 async function runCommands(commands: CommandDef[], pi: ExtensionAPI): Promise<CommandOutput[]> {
@@ -121,9 +58,11 @@ async function runCommands(commands: CommandDef[], pi: ExtensionAPI): Promise<Co
   for (const cmd of commands) {
     try {
       const result = await pi.exec("bash", ["-c", cmd.run], { timeout: cmd.timeout * 1000 });
-      results.push(result.killed
-        ? { name: cmd.name, output: `[timed out after ${cmd.timeout}s]` }
-        : { name: cmd.name, output: (result.stdout + result.stderr).trim() });
+      results.push(
+        result.killed
+          ? { name: cmd.name, output: `[timed out after ${cmd.timeout}s]` }
+          : { name: cmd.name, output: (result.stdout + result.stderr).trim() },
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       results.push({ name: cmd.name, output: `[error: ${message}]` });
@@ -275,9 +214,8 @@ export default function (pi: ExtensionAPI) {
           loopState.guardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
 
           const outputs = await runCommands(fm.commands, pi);
-          let body = resolvePlaceholders(rawBody, outputs, { iteration: i, name });
-          body = body.replace(/<!--[\s\S]*?-->/g, "");
-          const prompt = `[ralph: iteration ${i}/${loopState.maxIterations}]\n\n${body}`;
+          const body = renderRalphBody(rawBody, outputs, { iteration: i, name });
+          const prompt = renderIterationPrompt(body, i, loopState.maxIterations);
 
           const prevPersisted = readPersistedLoopState(ctx);
           if (prevPersisted?.active && prevPersisted.sessionFile === ctx.sessionManager.getSessionFile()) persistLoopState(pi, { ...prevPersisted, active: false });
