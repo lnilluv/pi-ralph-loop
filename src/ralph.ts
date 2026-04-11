@@ -8,6 +8,7 @@ export type Frontmatter = {
   timeout: number;
   completionPromise?: string;
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
+  invalidCommandEntries?: number[];
 };
 export type ParsedRalph = { frontmatter: Frontmatter; body: string };
 export type CommandOutput = { name: string; output: string };
@@ -59,9 +60,15 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
   if (!match) return { frontmatter: defaultFrontmatter(), body: normalized };
 
   const yaml = parseRalphFrontmatter(match[1]);
-  const commands = toUnknownArray(yaml.commands)
-    .map((command) => parseCommandDef(command))
-    .filter((command): command is CommandDef => command !== null);
+  const invalidCommandEntries: number[] = [];
+  const commands = toUnknownArray(yaml.commands).flatMap((command, index) => {
+    const parsed = parseCommandDef(command);
+    if (!parsed) {
+      invalidCommandEntries.push(index);
+      return [];
+    }
+    return [parsed];
+  });
   const guardrails = isRecord(yaml.guardrails) ? yaml.guardrails : {};
 
   return {
@@ -75,12 +82,16 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
         blockCommands: toStringArray(guardrails.block_commands),
         protectedFiles: toStringArray(guardrails.protected_files),
       },
+      invalidCommandEntries: invalidCommandEntries.length > 0 ? invalidCommandEntries : undefined,
     },
     body: match[2] ?? "",
   };
 }
 
 export function validateFrontmatter(fm: Frontmatter): string | null {
+  if ((fm.invalidCommandEntries?.length ?? 0) > 0) {
+    return `Invalid command entry at index ${fm.invalidCommandEntries![0]}`;
+  }
   if (!Number.isFinite(fm.maxIterations) || !Number.isInteger(fm.maxIterations) || fm.maxIterations <= 0) {
     return "Invalid max_iterations: must be a positive finite integer";
   }

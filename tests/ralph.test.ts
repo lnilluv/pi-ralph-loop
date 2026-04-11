@@ -30,12 +30,17 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
     timeout: 12.5,
     completionPromise: "done",
     guardrails: { blockCommands: ["rm .*"], protectedFiles: ["src/**"] },
+    invalidCommandEntries: undefined,
   });
   assert.equal(parsed.body, "Body\n");
 });
 
 test("validateFrontmatter accepts valid input and rejects invalid values", () => {
   assert.equal(validateFrontmatter(defaultFrontmatter()), null);
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), invalidCommandEntries: [0] }),
+    "Invalid command entry at index 0",
+  );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), maxIterations: 0 }),
     "Invalid max_iterations: must be a positive finite integer",
@@ -74,6 +79,14 @@ test("resolvePlaceholders and rendering helpers expand placeholders and strip co
   );
   assert.equal(renderRalphBody("keep<!-- hidden -->{{ ralph.name }}", [], { iteration: 1, name: "ralph" }), "keepralph");
   assert.equal(renderIterationPrompt("Body", 2, 5), "[ralph: iteration 2/5]\n\nBody");
+});
+
+test("parseRalphMarkdown tracks malformed command entries for validation", () => {
+  const parsed = parseRalphMarkdown("---\ncommands:\n  - nope\n  - null\n---\nBody\n");
+
+  assert.deepEqual(parsed.frontmatter.commands, []);
+  assert.deepEqual(parsed.frontmatter.invalidCommandEntries, [0, 1]);
+  assert.equal(validateFrontmatter(parsed.frontmatter), "Invalid command entry at index 0");
 });
 
 test("resolveRalphTarget logic normalizes args and resolves markdown candidates", () => {
