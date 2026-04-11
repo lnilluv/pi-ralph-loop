@@ -17,6 +17,7 @@ import {
   shouldResetFailCount,
   shouldStopForCompletionPromise,
   shouldWarnForBashFailure,
+  validateDraftContent,
   validateFrontmatter as validateFrontmatterMessage,
   createSiblingTarget,
 } from "./ralph.ts";
@@ -127,8 +128,10 @@ async function reviewDraft(plan: ReturnType<typeof generateDraft>, mode: "run" |
 
   while (true) {
     const nextPlan = { ...plan, content };
-    const options =
-      mode === "run"
+    const contentError = validateDraftContent(content);
+    const options = contentError
+      ? ["Open RALPH.md", "Cancel"]
+      : mode === "run"
         ? ["Start", "Open RALPH.md", "Cancel"]
         : ["Save draft", "Open RALPH.md", "Cancel"];
     const choice = await ctx.ui.select(buildMissionBrief(nextPlan), options);
@@ -139,6 +142,10 @@ async function reviewDraft(plan: ReturnType<typeof generateDraft>, mode: "run" |
     if (choice === "Open RALPH.md") {
       const edited = await ctx.ui.editor("Edit RALPH.md", content);
       if (typeof edited === "string") content = edited;
+      continue;
+    }
+    if (contentError) {
+      ctx.ui.notify(`Invalid RALPH.md: ${contentError}`, "error");
       continue;
     }
     if (choice === "Save draft") {
@@ -153,11 +160,24 @@ async function editExistingDraft(ralphPath: string, ctx: any, saveMessage = "Sav
     ctx.ui.notify(`Use ${displayPath(ctx.cwd, ralphPath)} in an interactive session to edit the draft.`, "warning");
     return;
   }
-  const original = readFileSync(ralphPath, "utf8");
-  const edited = await ctx.ui.editor("Edit RALPH.md", original);
-  if (typeof edited === "string" && edited !== original) {
-    writeDraftFile(ralphPath, edited);
-    ctx.ui.notify(saveMessage, "info");
+
+  let content = readFileSync(ralphPath, "utf8");
+  while (true) {
+    const edited = await ctx.ui.editor("Edit RALPH.md", content);
+    if (typeof edited !== "string") return;
+
+    const error = validateDraftContent(edited);
+    if (error) {
+      ctx.ui.notify(`Invalid RALPH.md: ${error}`, "error");
+      content = edited;
+      continue;
+    }
+
+    if (edited !== content) {
+      writeDraftFile(ralphPath, edited);
+      ctx.ui.notify(saveMessage, "info");
+    }
+    return;
   }
 }
 
@@ -374,6 +394,9 @@ export default function (pi: ExtensionAPI) {
           return undefined;
         case "invalid-markdown":
           ctx.ui.notify(`Only task folders or RALPH.md can be run directly. ${displayPath(ctx.cwd, inspection.path)} is not runnable.`, "error");
+          return undefined;
+        case "invalid-target":
+          ctx.ui.notify(`Only task folders or RALPH.md can be run directly. ${displayPath(ctx.cwd, inspection.path)} is a file, not a task folder.`, "error");
           return undefined;
         case "dir-without-ralph":
         case "missing-path": {

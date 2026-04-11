@@ -21,6 +21,7 @@ import {
   renderRalphBody,
   resolvePlaceholders,
   slugifyTask,
+  validateDraftContent,
   validateFrontmatter,
 } from "../src/ralph.ts";
 
@@ -112,6 +113,7 @@ test("path detection and existing-target inspection distinguish runnable Ralph t
   mkdirSync(join(cwd, "empty"), { recursive: true });
   writeFileSync(join(cwd, "task", "RALPH.md"), "Task body", "utf8");
   writeFileSync(join(cwd, "README.md"), "not runnable", "utf8");
+  writeFileSync(join(cwd, "package.json"), "{}", "utf8");
 
   assert.equal(looksLikePath("reverse engineer auth"), false);
   assert.equal(looksLikePath("auth-audit"), true);
@@ -120,6 +122,7 @@ test("path detection and existing-target inspection distinguish runnable Ralph t
 
   assert.deepEqual(inspectExistingTarget("task", cwd), { kind: "run", ralphPath: join(cwd, "task", "RALPH.md") });
   assert.deepEqual(inspectExistingTarget("README.md", cwd), { kind: "invalid-markdown", path: join(cwd, "README.md") });
+  assert.deepEqual(inspectExistingTarget("package.json", cwd), { kind: "invalid-target", path: join(cwd, "package.json") });
   assert.deepEqual(inspectExistingTarget("empty", cwd), {
     kind: "dir-without-ralph",
     dirPath: join(cwd, "empty"),
@@ -141,6 +144,32 @@ test("path detection and existing-target inspection distinguish runnable Ralph t
     ralphPath: join(cwd, "notes", "RALPH.md"),
   });
   assert.deepEqual(inspectExistingTarget("reverse engineer auth", cwd), { kind: "not-path" });
+});
+
+test("validateDraftContent rejects missing and malformed frontmatter", () => {
+  assert.equal(validateDraftContent("Task body"), "Missing RALPH frontmatter");
+  assert.equal(
+    validateDraftContent("---\nmax_iterations: 0\n---\nBody"),
+    "Invalid max_iterations: must be a positive finite integer",
+  );
+});
+
+test("buildMissionBrief fails closed when the current draft content is invalid", () => {
+  const plan = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+
+  const brief = buildMissionBrief({ ...plan, content: "Task: Fix flaky auth tests\n\nThis draft no longer has frontmatter." });
+
+  assert.match(brief, /Invalid RALPH\.md: Missing RALPH frontmatter/);
+  assert.match(brief, /Task metadata missing from current draft|Fix flaky auth tests/);
+  assert.doesNotMatch(brief, /Suggested checks/);
+  assert.doesNotMatch(brief, /Finish behavior/);
+  assert.doesNotMatch(brief, /Safety/);
+  assert.doesNotMatch(brief, /tests: npm test/);
+  assert.doesNotMatch(brief, /Stop after 25 iterations or \/ralph-stop/);
 });
 
 test("slug helpers provide fallback and deterministic sibling names", (t) => {

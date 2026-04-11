@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
@@ -24,6 +24,7 @@ export type CommandArgs =
 export type ExistingTargetInspection =
   | { kind: "run"; ralphPath: string }
   | { kind: "invalid-markdown"; path: string }
+  | { kind: "invalid-target"; path: string }
   | { kind: "dir-without-ralph"; dirPath: string; ralphPath: string }
   | { kind: "missing-path"; dirPath: string; ralphPath: string }
   | { kind: "not-path" };
@@ -98,14 +99,6 @@ function matchRalphMarkdown(raw: string): RegExpMatchArray | null {
 
 function hasRalphFrontmatter(raw: string): boolean {
   return matchRalphMarkdown(raw) !== null;
-}
-
-function safeParseRalphMarkdown(raw: string): ParsedRalph | undefined {
-  try {
-    return parseRalphMarkdown(raw);
-  } catch {
-    return undefined;
-  }
 }
 
 function normalizeMissingMarkdownTarget(absoluteTarget: string): { dirPath: string; ralphPath: string } {
@@ -316,14 +309,19 @@ export function inspectExistingTarget(input: string, cwd: string): ExistingTarge
   const markdownPath = resolution.markdownPath;
 
   if (existsSync(absoluteTarget)) {
-    if (absoluteTarget.endsWith(".md")) {
-      return isRalphMarkdownPath(absoluteTarget)
-        ? { kind: "run", ralphPath: absoluteTarget }
-        : { kind: "invalid-markdown", path: absoluteTarget };
+    const stats = statSync(absoluteTarget);
+    if (stats.isDirectory()) {
+      return existsSync(markdownPath)
+        ? { kind: "run", ralphPath: markdownPath }
+        : { kind: "dir-without-ralph", dirPath: absoluteTarget, ralphPath: markdownPath };
     }
-    return existsSync(markdownPath)
-      ? { kind: "run", ralphPath: markdownPath }
-      : { kind: "dir-without-ralph", dirPath: absoluteTarget, ralphPath: markdownPath };
+    if (isRalphMarkdownPath(absoluteTarget)) {
+      return { kind: "run", ralphPath: absoluteTarget };
+    }
+    if (absoluteTarget.endsWith(".md")) {
+      return { kind: "invalid-markdown", path: absoluteTarget };
+    }
+    return { kind: "invalid-target", path: absoluteTarget };
   }
 
   if (!looksLikePath(input)) {
@@ -494,14 +492,60 @@ export function extractDraftMetadata(raw: string): DraftMetadata | undefined {
   }
 }
 
+export type DraftContentInspection = {
+  metadata?: DraftMetadata;
+  parsed?: ParsedRalph;
+  error?: string;
+};
+
+export function inspectDraftContent(raw: string): DraftContentInspection {
+  const metadata = extractDraftMetadata(raw);
+  const normalized = normalizeRawRalph(raw);
+
+  if (!hasRalphFrontmatter(normalized)) {
+    return { metadata, error: "Missing RALPH frontmatter" };
+  }
+
+  try {
+    const parsed = parseRalphMarkdown(normalized);
+    const error = validateFrontmatter(parsed.frontmatter);
+    return error ? { metadata, parsed, error } : { metadata, parsed };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { metadata, error: `Invalid RALPH frontmatter: ${message}` };
+  }
+}
+
+export function validateDraftContent(raw: string): string | null {
+  return inspectDraftContent(raw).error ?? null;
+}
+
 export function buildMissionBrief(plan: DraftPlan): string {
-  const parsed = hasRalphFrontmatter(plan.content) ? safeParseRalphMarkdown(plan.content) : undefined;
-  const metadata = extractDraftMetadata(plan.content);
-  const task = metadata?.task ?? plan.task;
-  const mode = metadata?.mode ?? plan.mode;
-  const commandLabels = parsed ? parsed.frontmatter.commands.map(formatCommandLabel) : plan.commandLabels;
-  const finishLabel = parsed ? summarizeFinishLabel(parsed.frontmatter.maxIterations) : plan.finishLabel;
-  const safetyLabel = parsed ? summarizeSafetyLabel(mode, parsed.frontmatter.guardrails) : plan.safetyLabel;
+  const inspection = inspectDraftContent(plan.content);
+  const task = inspection.metadata?.task ?? "Task metadata missing from current draft";
+
+  if (inspection.error) {
+    return [
+      "Mission Brief",
+      "Review what Ralph will do before it starts.",
+      "",
+      "Task",
+      task,
+      "",
+      "File",
+      plan.target.ralphPath,
+      "",
+      "Draft status",
+      `- Invalid RALPH.md: ${inspection.error}`,
+      "- Reopen RALPH.md to fix it or cancel",
+    ].join("\n");
+  }
+
+  const parsed = inspection.parsed!;
+  const mode = inspection.metadata?.mode ?? "general";
+  const commandLabels = parsed.frontmatter.commands.map(formatCommandLabel);
+  const finishLabel = summarizeFinishLabel(parsed.frontmatter.maxIterations);
+  const safetyLabel = summarizeSafetyLabel(mode, parsed.frontmatter.guardrails);
 
   return [
     "Mission Brief",
