@@ -263,7 +263,7 @@ test("generated drafts reparse as valid RALPH files", () => {
     maxIterations: 12,
     timeout: 300,
     completionPromise: undefined,
-    guardrails: { blockCommands: ["git\\s+push"], protectedFiles: ["**/*"] },
+    guardrails: { blockCommands: ["git\\s+push"], protectedFiles: [] },
     invalidCommandEntries: undefined,
   });
   assert.match(reparsed.body, /Task: Reverse engineer this app/);
@@ -282,7 +282,11 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   assert.equal(extractDraftMetadata(analysisDraft.content)?.mode, "analysis");
   assert.match(analysisDraft.content, /Start with read-only inspection/);
   assert.match(analysisDraft.content, /\{\{ commands.repo-map \}\}/);
-  assert.match(analysisDraft.content, /\*\*\/\*/);
+  assert.equal(analysisDraft.safetyLabel, "blocks git push");
+  assert.doesNotMatch(analysisDraft.content, /\*\*\/\*/);
+  const analysisBrief = buildMissionBrief(analysisDraft);
+  assert.match(analysisBrief, /- blocks git push/);
+  assert.doesNotMatch(analysisBrief, /read-only/);
 
   const fixDraft = generateDraft(
     "Fix flaky auth tests",
@@ -294,6 +298,23 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   assert.match(fixDraft.content, /\{\{ commands.tests \}\}/);
   assert.match(fixDraft.content, /\{\{ commands.lint \}\}/);
   assert.equal(extractDraftMetadata(fixDraft.content)?.task, "Fix flaky auth tests");
+});
+
+test("generated draft metadata survives task text containing comment-breaking content", () => {
+  const task = "Reverse engineer the parser --> and document the edge case";
+  const draft = generateDraft(
+    task,
+    {
+      slug: "reverse-engineer-the-parser-and-document-the-edge-case",
+      dirPath: "/repo/reverse-engineer-the-parser-and-document-the-edge-case",
+      ralphPath: "/repo/reverse-engineer-the-parser-and-document-the-edge-case/RALPH.md",
+    },
+    { packageManager: "npm", hasGit: false, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+
+  assert.equal(extractDraftMetadata(draft.content)?.task, task);
+  assert.equal(validateDraftContent(draft.content), null);
+  assert.match(draft.content, /Task: Reverse engineer the parser --> and document the edge case/);
 });
 
 test("buildMissionBrief refreshes after draft edits", () => {

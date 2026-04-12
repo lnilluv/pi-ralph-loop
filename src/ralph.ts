@@ -110,9 +110,8 @@ function normalizeMissingMarkdownTarget(absoluteTarget: string): { dirPath: stri
   return { dirPath, ralphPath: join(dirPath, "RALPH.md") };
 }
 
-function summarizeSafetyLabel(mode: DraftMode, guardrails: Frontmatter["guardrails"]): string {
+function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
   const labels: string[] = [];
-  if (mode === "analysis") labels.push("Prefer read-only inspection");
   if (guardrails.blockCommands.some((pattern) => pattern.includes("git") && pattern.includes("push"))) {
     labels.push("blocks git push");
   } else if (guardrails.blockCommands.length > 0) {
@@ -168,8 +167,20 @@ function detectPackageScripts(cwd: string, packageManager: RepoSignals["packageM
   }
 }
 
+function encodeDraftMetadata(metadata: DraftMetadata): string {
+  return encodeURIComponent(JSON.stringify(metadata));
+}
+
+function decodeDraftMetadata(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function metadataComment(metadata: DraftMetadata): string {
-  return `<!-- pi-ralph-loop: ${JSON.stringify(metadata)} -->`;
+  return `<!-- pi-ralph-loop: ${encodeDraftMetadata(metadata)} -->`;
 }
 
 function yamlBlock(lines: string[]): string {
@@ -436,7 +447,7 @@ export function generateDraft(task: string, target: DraftTarget, signals: RepoSi
   const metadata: DraftMetadata = { generator: "pi-ralph-loop", version: 1, task, mode };
   const guardrails = {
     blockCommands: ["git\\s+push"],
-    protectedFiles: mode === "analysis" ? ["**/*"] : [".env*", "**/secrets/**"],
+    protectedFiles: mode === "analysis" ? [] : [".env*", "**/secrets/**"],
   };
   const maxIterations = mode === "analysis" ? 12 : mode === "migration" ? 30 : 25;
   const frontmatterLines = [
@@ -481,7 +492,7 @@ export function generateDraft(task: string, target: DraftTarget, signals: RepoSi
     target,
     content: `${metadataComment(metadata)}\n${yamlBlock(frontmatterLines)}\n\n${body}`,
     commandLabels: commands.map(formatCommandLabel),
-    safetyLabel: summarizeSafetyLabel(mode, guardrails),
+    safetyLabel: summarizeSafetyLabel(guardrails),
     finishLabel: summarizeFinishLabel(maxIterations),
   };
 }
@@ -490,7 +501,7 @@ export function extractDraftMetadata(raw: string): DraftMetadata | undefined {
   const match = raw.match(/^<!-- pi-ralph-loop: (.+?) -->/);
   if (!match) return undefined;
   try {
-    const parsed = JSON.parse(match[1]) as DraftMetadata;
+    const parsed = JSON.parse(decodeDraftMetadata(match[1])) as DraftMetadata;
     return parsed?.generator === "pi-ralph-loop" ? parsed : undefined;
   } catch {
     return undefined;
@@ -554,7 +565,7 @@ export function buildMissionBrief(plan: DraftPlan): string {
   const mode = inspection.metadata?.mode ?? "general";
   const commandLabels = parsed.frontmatter.commands.map(formatCommandLabel);
   const finishLabel = summarizeFinishLabel(parsed.frontmatter.maxIterations);
-  const safetyLabel = summarizeSafetyLabel(mode, parsed.frontmatter.guardrails);
+  const safetyLabel = summarizeSafetyLabel(parsed.frontmatter.guardrails);
 
   return [
     "Mission Brief",
