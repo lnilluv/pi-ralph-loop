@@ -1,5 +1,6 @@
 import { closeSync, openSync, opendirSync, readSync, readFileSync, statSync } from "node:fs";
 import { basename, join, relative, sep } from "node:path";
+import { isSecretBearingPath } from "./secret-paths.ts";
 import { slugifyTask, type DraftMode, type RepoContext, type RepoContextSelectedFile, type RepoSignals } from "./ralph.ts";
 
 export const MAX_SCAN_DEPTH = 3;
@@ -9,9 +10,6 @@ export const MAX_FILE_BYTES = 8_000;
 export const MAX_TOTAL_BYTES = 40_000;
 
 const EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next"]);
-const SECRET_PATH_SEGMENTS = new Set(["secret", "secrets", "credential", "credentials", ".aws", ".ssh"]);
-const SECRET_BASENAMES = new Set([".npmrc", ".pypirc", ".netrc", "authorized_keys", "known_hosts", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]);
-const SECRET_SUFFIXES = [".pem", ".key", ".crt", ".cer", ".der", ".p12", ".pfx", ".jks", ".keystore"];
 const STOPWORDS = new Set(["fix", "reverse", "engineer", "this", "app", "tests", "the", "and", "to"]);
 
 const TOP_LEVEL_PRIORITY = new Map<string, { score: number; reason: string }>([
@@ -98,27 +96,6 @@ function toPosixPath(value: string): string {
 
 function isExcludedDir(name: string): boolean {
   return EXCLUDED_DIRS.has(name);
-}
-
-function isSecretBearingPath(relativePath: string): boolean {
-  const normalizedPath = toPosixPath(relativePath).toLowerCase();
-  if (!normalizedPath || normalizedPath.startsWith("..")) return false;
-
-  const segments = normalizedPath.split("/").filter(Boolean);
-  if (segments.some((segment) => SECRET_PATH_SEGMENTS.has(segment) || segment.includes("secret") || segment.includes("credential"))) return true;
-
-  const normalizedName = basename(normalizedPath);
-  return (
-    normalizedName.startsWith(".env") ||
-    SECRET_BASENAMES.has(normalizedName) ||
-    SECRET_SUFFIXES.some((suffix) => normalizedName.endsWith(suffix)) ||
-    normalizedName.includes("secret") ||
-    normalizedName.includes("credential")
-  );
-}
-
-function isSecretBearingFile(relativePath: string): boolean {
-  return isSecretBearingPath(relativePath);
 }
 
 function isPriorityEntrypointFile(relativePath: string): boolean {
@@ -215,7 +192,7 @@ function directoryPriority(
     const childAbsolutePath = join(absolutePath, entry.name);
     const childRelativePath = toPosixPath(relative(cwd, childAbsolutePath));
     if (!childRelativePath || childRelativePath.startsWith("..")) continue;
-    if (isSecretBearingFile(childRelativePath)) continue;
+    if (isSecretBearingPath(childRelativePath)) continue;
 
     const childScore = scoreCandidate(childRelativePath, mode, keywords);
     if (childScore.score > best.score) {
@@ -260,7 +237,7 @@ function collectCandidates(cwd: string, mode: DraftMode, keywords: string[], sig
     }
 
     if (!stats.isFile()) return;
-    if (isSecretBearingFile(relativePath)) return;
+    if (isSecretBearingPath(relativePath)) return;
 
     const { score, reason, matchedKeywords, category } = scoreCandidate(relativePath, mode, keywords);
     rootFileCandidates.set(relativePath, {
@@ -284,7 +261,7 @@ function collectCandidates(cwd: string, mode: DraftMode, keywords: string[], sig
       const childAbsolutePath = join(absolutePath, entry.name);
       const childRelativePath = toPosixPath(relative(cwd, childAbsolutePath));
       if (!childRelativePath || childRelativePath.startsWith("..")) continue;
-      if (isSecretBearingFile(childRelativePath)) continue;
+      if (isSecretBearingPath(childRelativePath)) continue;
       if (!matcher(childRelativePath)) continue;
 
       probeRootFile(childRelativePath);
@@ -391,7 +368,7 @@ function collectCandidates(cwd: string, mode: DraftMode, keywords: string[], sig
     const addFileCandidate = (fileEntry: (typeof fileEntries)[number], candidate: ReturnType<typeof scoreCandidate>): void => {
       if (candidates.length >= MAX_CANDIDATE_PATHS) return;
       if (!fileEntry.relativePath || fileEntry.relativePath.startsWith("..")) return;
-      if (isSecretBearingFile(fileEntry.relativePath)) return;
+      if (isSecretBearingPath(fileEntry.relativePath)) return;
 
       const size = (() => {
         try {

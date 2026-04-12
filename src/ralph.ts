@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { filterSecretBearingTopLevelNames, isSecretBearingTopLevelName } from "./secret-paths.ts";
 
 export type CommandDef = { name: string; run: string; timeout: number };
 export type DraftSource = "deterministic" | "llm-strengthened" | "fallback";
@@ -446,34 +447,6 @@ export function createSiblingTarget(cwd: string, baseSlug: string): DraftTarget 
     dirPath: join(cwd, siblingSlug),
     ralphPath: join(cwd, siblingSlug, "RALPH.md"),
   };
-}
-
-function isSecretBearingTopLevelName(name: string): boolean {
-  const normalizedName = name.toLowerCase();
-  return (
-    normalizedName.startsWith(".env") ||
-    normalizedName === ".npmrc" ||
-    normalizedName === ".pypirc" ||
-    normalizedName === ".netrc" ||
-    normalizedName === ".aws" ||
-    normalizedName === ".ssh" ||
-    normalizedName === "authorized_keys" ||
-    normalizedName === "known_hosts" ||
-    normalizedName.includes("secret") ||
-    normalizedName.includes("credential") ||
-    normalizedName.endsWith(".pem") ||
-    normalizedName.endsWith(".key") ||
-    normalizedName.endsWith(".crt") ||
-    normalizedName.endsWith(".cer") ||
-    normalizedName.endsWith(".der") ||
-    normalizedName.endsWith(".p12") ||
-    normalizedName.endsWith(".pfx") ||
-    normalizedName.endsWith(".asc")
-  );
-}
-
-export function filterSecretBearingTopLevelNames(names: string[]): string[] {
-  return names.filter((name) => !isSecretBearingTopLevelName(name));
 }
 
 export function inspectRepo(cwd: string): RepoSignals {

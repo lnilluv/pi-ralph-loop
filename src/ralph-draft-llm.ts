@@ -1,7 +1,7 @@
 import { complete, type AssistantMessage, type Context, type Model } from "@mariozechner/pi-ai";
 import { basename } from "node:path";
+import { filterSecretBearingTopLevelNames } from "./secret-paths.ts";
 import {
-  filterSecretBearingTopLevelNames,
   normalizeStrengthenedDraft,
   parseRalphMarkdown,
   validateFrontmatter,
