@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import registerRalphCommands from "../src/index.ts";
 import { SECRET_PATH_POLICY_TOKEN } from "../src/secret-paths.ts";
-import { generateDraft, slugifyTask, type DraftPlan, type DraftTarget } from "../src/ralph.ts";
+import { generateDraft, parseRalphMarkdown, slugifyTask, type DraftPlan, type DraftTarget } from "../src/ralph.ts";
 import type { StrengthenDraftRuntime } from "../src/ralph-draft-llm.ts";
 
 function createTempDir(): string {
@@ -39,7 +39,7 @@ function makeDraftPlan(task: string, target: DraftTarget, source: DraftPlan["sou
   };
 }
 
-function createHarness(options?: { createDraftPlan?: (...args: Array<any>) => Promise<DraftPlan> }) {
+function createHarness(options?: { createDraftPlan?: (...args: Array<any>) => Promise<DraftPlan>; exec?: (...args: Array<any>) => Promise<any> }) {
   const handlers = new Map<string, (args: string, ctx: any) => Promise<string | undefined>>();
   const eventHandlers = new Map<string, (...args: Array<any>) => Promise<any> | any>();
   const pi = {
@@ -51,6 +51,13 @@ function createHarness(options?: { createDraftPlan?: (...args: Array<any>) => Pr
     },
     appendEntry: () => undefined,
     sendUserMessage: () => undefined,
+    exec:
+      options?.exec ??
+      (async () => ({
+        killed: false,
+        stdout: "",
+        stderr: "",
+      })),
   } as any;
 
   registerRalphCommands(pi, options as any);
@@ -186,6 +193,9 @@ test("Mission Brief surface stays limited to the visible fields", async (t) => {
   const task = "reverse engineer this app";
   const target = createTarget(cwd, task);
   const draftPlan = makeDraftPlan(task, target, "llm-strengthened", cwd);
+  draftPlan.content = draftPlan.content
+    .replace("max_iterations: 12", "max_iterations: 8")
+    .replace("timeout: 300\n", "timeout: 45\ncompletion_promise: ready\n");
   const harness = createHarness({
     createDraftPlan: async () => draftPlan,
   });
@@ -217,6 +227,9 @@ test("Mission Brief surface stays limited to the visible fields", async (t) => {
   assert.match(brief, /^File$/m);
   assert.match(brief, /^Suggested checks$/m);
   assert.match(brief, /^Finish behavior$/m);
+  assert.match(brief, /- Stop after 8 iterations or \/ralph-stop/);
+  assert.match(brief, /- Stop if an iteration exceeds 45s/);
+  assert.match(brief, /- Stop early on <promise>ready<\/promise>/);
   assert.match(brief, /^Safety$/m);
   assert.doesNotMatch(brief, /source|fallback|provenance|model failure/i);
   assert.doesNotMatch(brief, /Draft status/);
@@ -311,6 +324,287 @@ test("/ralph --path existing-task/RALPH.md bypasses the drafting pipeline", asyn
   await handler(`--path ${existingRalphPath}`, ctx);
 
   assert.equal(draftCalls.length, 0);
+});
+
+test("/ralph rejects raw invalid completion_promise values before parsing loop state", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const targetDir = join(cwd, "raw-invalid-completion-promise");
+  const ralphPath = join(targetDir, "RALPH.md");
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(
+    ralphPath,
+    [
+      "---",
+      "commands:",
+      "  - name: tests",
+      "    run: npm test",
+      "    timeout: 20",
+      "max_iterations: 2",
+      "timeout: 300",
+      "completion_promise: |",
+      "  DONE",
+      "guardrails:",
+      "  block_commands: []",
+      "  protected_files: []",
+      "---",
+      "Task: Fix flaky auth tests",
+      "",
+      "Keep the change small.",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  let newSessionCalls = 0;
+  let execCalls = 0;
+  const harness = createHarness({
+    exec: async () => {
+      execCalls += 1;
+      return { killed: false, stdout: "ok", stderr: "" };
+    },
+  });
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => {
+        throw new Error("should not prompt");
+      },
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+    newSession: async () => {
+      newSessionCalls += 1;
+      return { cancelled: true };
+    },
+    waitForIdle: async () => {
+      throw new Error("should not reach the loop");
+    },
+  };
+
+  await handler(`--path ${ralphPath}`, ctx);
+
+  assert.equal(newSessionCalls, 0);
+  assert.equal(execCalls, 0);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.level, "error");
+  assert.match(notifications[0]?.message ?? "", /Invalid completion_promise/);
+});
+
+test("/ralph rejects raw malformed guardrails shapes before starting the loop", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const targetDir = join(cwd, "raw-invalid-guardrails");
+  const ralphPath = join(targetDir, "RALPH.md");
+  mkdirSync(targetDir, { recursive: true });
+
+  let newSessionCalls = 0;
+  let execCalls = 0;
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness({
+    exec: async () => {
+      execCalls += 1;
+      return { killed: false, stdout: "", stderr: "" };
+    },
+  });
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => {
+        throw new Error("should not prompt");
+      },
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+    newSession: async () => {
+      newSessionCalls += 1;
+      return { cancelled: false };
+    },
+    waitForIdle: async () => {
+      throw new Error("should not reach the loop");
+    },
+  };
+
+  for (const [label, raw] of [
+    [
+      "block_commands scalar",
+      [
+        "---",
+        "commands:",
+        "  - name: tests",
+        "    run: npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: 'git\\s+push'",
+        "  protected_files: []",
+        "---",
+        "Task: Fix flaky auth tests",
+        "",
+        "Keep the change small.",
+      ].join("\n"),
+    ],
+    [
+      "block_commands null",
+      [
+        "---",
+        "commands:",
+        "  - name: tests",
+        "    run: npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: null",
+        "  protected_files: []",
+        "---",
+        "Task: Fix flaky auth tests",
+        "",
+        "Keep the change small.",
+      ].join("\n"),
+    ],
+    [
+      "protected_files scalar",
+      [
+        "---",
+        "commands:",
+        "  - name: tests",
+        "    run: npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: []",
+        "  protected_files: 'src/generated/**'",
+        "---",
+        "Task: Fix flaky auth tests",
+        "",
+        "Keep the change small.",
+      ].join("\n"),
+    ],
+    [
+      "protected_files null",
+      [
+        "---",
+        "commands:",
+        "  - name: tests",
+        "    run: npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: []",
+        "  protected_files: null",
+        "---",
+        "Task: Fix flaky auth tests",
+        "",
+        "Keep the change small.",
+      ].join("\n"),
+    ],
+  ] as const) {
+    writeFileSync(ralphPath, raw, "utf8");
+    notifications.length = 0;
+    newSessionCalls = 0;
+    execCalls = 0;
+
+    await handler(`--path ${ralphPath}`, ctx);
+
+    assert.equal(newSessionCalls, 0, label);
+    assert.equal(execCalls, 0, label);
+    assert.equal(notifications.length, 1, label);
+    assert.equal(notifications[0]?.level, "error", label);
+    assert.match(notifications[0]?.message ?? "", /Invalid RALPH\.md: Invalid RALPH frontmatter: guardrails\.(block_commands|protected_files) must be a YAML sequence/, label);
+  }
+});
+
+test("/ralph re-validates raw draft content before each loop iteration", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const task = "Fix flaky auth tests";
+  const target = createTarget(cwd, task);
+  const targetDir = target.dirPath;
+  mkdirSync(targetDir, { recursive: true });
+  const draft = generateDraft(task, target, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    lintCommand: "npm run lint",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  const validContent = draft.content.replace("max_iterations: 25", "max_iterations: 2");
+  writeFileSync(target.ralphPath, validContent, "utf8");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  let newSessionCalls = 0;
+  let mutated = false;
+  const expectedExecCalls = parseRalphMarkdown(validContent).frontmatter.commands.length;
+  let execCalls = 0;
+  const harness = createHarness({
+    exec: async () => {
+      execCalls += 1;
+      return { killed: false, stdout: "ok", stderr: "" };
+    },
+  });
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => {
+        throw new Error("should not prompt");
+      },
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+    newSession: async () => {
+      newSessionCalls += 1;
+      return { cancelled: false };
+    },
+    waitForIdle: async () => {
+      if (!mutated) {
+        mutated = true;
+        const invalidContent = validContent.replace(
+          /commands:\n(?:  - name: .+\n    run: .+\n    timeout: .+\n)+max_iterations: 2/,
+          "commands:\n  name: tests\n  run: npm test\n  timeout: 20\nmax_iterations: 2",
+        );
+        writeFileSync(target.ralphPath, invalidContent, "utf8");
+      }
+    },
+  };
+
+  await handler(`--path ${target.ralphPath}`, ctx);
+
+  assert.equal(execCalls, expectedExecCalls);
+  assert.equal(newSessionCalls, 1);
+  assert.ok(
+    notifications.some(
+      ({ level, message }) => level === "error" && message.includes("Invalid RALPH.md on iteration 2"),
+    ),
+  );
 });
 
 test("/ralph-draft passes the active model runtime to the draft planner", async (t) => {

@@ -12,6 +12,7 @@ import {
   parseRalphMarkdown,
   type DraftRequest,
 } from "../src/ralph.ts";
+import { SECRET_PATH_POLICY_TOKEN } from "../src/secret-paths.ts";
 import {
   buildStrengtheningPrompt,
   strengthenDraftWithLlm,
@@ -136,6 +137,23 @@ test("buildStrengtheningPrompt includes the full prompt contract and repo signal
   assert.match(text, /export function login\(\) \{ return true; \}/);
   assert.match(text, /deterministic baseline draft/i);
   assert.match(text, /return only a complete RALPH\.md/i);
+});
+
+test("buildStrengtheningPrompt states the body-and-commands compatibility contract", () => {
+  const request = makeRequest();
+  const prompt = buildStrengtheningPrompt(request, "body-and-commands");
+  const text = promptText(prompt);
+
+  assert.match(text, /strengthening scope: body-and-commands/i);
+  assert.match(text, /body-and-commands scope/i);
+  assert.match(text, /command names and run strings must match the deterministic baseline exactly/i);
+  assert.match(text, /max_iterations may stay the same or decrease from the deterministic baseline, never increase/i);
+  assert.match(text, /top-level timeout may stay the same or decrease from the deterministic baseline, never increase/i);
+  assert.match(text, /per-command timeout may stay the same or decrease from that command's baseline timeout, and must still be <= timeout/i);
+  assert.match(text, /completion_promise must remain unchanged, including remaining absent when absent from the baseline/i);
+  assert.match(text, /every \{\{\s*commands\.<name>\s*\}\} must refer to an accepted command/i);
+  assert.match(text, /baseline guardrails remain fixed in this phase/i);
+  assert.match(text, /unsupported frontmatter changes are rejected and fall back automatically/i);
 });
 
 test("buildStrengtheningPrompt omits secret-bearing top-level repo names", (t) => {
@@ -319,11 +337,31 @@ test("strengthenDraftWithLlm normalizes a stronger full draft while preserving d
   });
 });
 
-test("strengthenDraftWithLlm accepts improved frontmatter and commands in body-and-commands scope", async () => {
+test("strengthenDraftWithLlm accepts only compatible body-and-commands changes", async () => {
   const request = makeRequest();
   const runtime = makeRuntime();
   const baseline = parseRalphMarkdown(request.baselineDraft);
-  const rawDraft = `---\ncommands:\n  - name: smoke\n    run: npm run smoke\n    timeout: 45\nmax_iterations: 7\ntimeout: 120\nguardrails:\n  block_commands:\n    - git\\s+push\n  protected_files:\n    - .env*\n---\n${baseline.body}`;
+  const [testsCommand, , gitLogCommand] = baseline.frontmatter.commands;
+  const rawDraft = `---
+commands:
+  - name: ${gitLogCommand.name}
+    run: ${gitLogCommand.run}
+    timeout: ${Math.max(1, gitLogCommand.timeout - 5)}
+  - name: ${testsCommand.name}
+    run: ${testsCommand.run}
+    timeout: ${Math.max(1, testsCommand.timeout - 15)}
+max_iterations: ${Math.max(1, baseline.frontmatter.maxIterations - 5)}
+timeout: ${Math.max(1, Math.min(baseline.frontmatter.timeout, 120))}
+guardrails:
+  block_commands:
+    - 'git\\s+push'
+  protected_files:
+    - '${SECRET_PATH_POLICY_TOKEN}'
+---
+${baseline.body.replace(/\{\{ commands\.lint \}\}/g, "")}
+
+Use {{ commands.${testsCommand.name} }} and {{ commands.${gitLogCommand.name} }}.
+`;
 
   const result = await strengthenDraftWithLlm(request, runtime, {
     scope: "body-and-commands",
@@ -334,13 +372,14 @@ test("strengthenDraftWithLlm accepts improved frontmatter and commands in body-a
   const parsed = parseRalphMarkdown(result.draft.content);
 
   assert.deepEqual(result.draft.target, request.target);
-  assert.deepEqual(parsed.frontmatter.commands, [{ name: "smoke", run: "npm run smoke", timeout: 45 }]);
-  assert.equal(parsed.frontmatter.maxIterations, 7);
-  assert.deepEqual(parsed.frontmatter.guardrails, {
-    blockCommands: ["git\\s+push"],
-    protectedFiles: [".env*"],
-  });
-  assert.equal(parsed.body.trim(), baseline.body.trim());
+  assert.deepEqual(parsed.frontmatter.commands, [
+    { name: gitLogCommand.name, run: gitLogCommand.run, timeout: Math.max(1, gitLogCommand.timeout - 5) },
+    { name: testsCommand.name, run: testsCommand.run, timeout: Math.max(1, testsCommand.timeout - 15) },
+  ]);
+  assert.equal(parsed.frontmatter.maxIterations, Math.max(1, baseline.frontmatter.maxIterations - 5));
+  assert.equal(parsed.frontmatter.timeout, Math.max(1, Math.min(baseline.frontmatter.timeout, 120)));
+  assert.deepEqual(parsed.frontmatter.guardrails, baseline.frontmatter.guardrails);
+  assert.equal(parsed.body.trim(), `${baseline.body.replace(/\{\{ commands\.lint \}\}/g, "").trim()}\n\nUse {{ commands.${testsCommand.name} }} and {{ commands.${gitLogCommand.name} }}.`.trim());
   assert.deepEqual(extractDraftMetadata(result.draft.content), {
     generator: "pi-ralph-loop",
     version: 2,
@@ -348,6 +387,40 @@ test("strengthenDraftWithLlm accepts improved frontmatter and commands in body-a
     task: "Fix flaky auth tests",
     mode: "fix",
   });
+});
+
+test("strengthenDraftWithLlm falls back when unsupported frontmatter changes are requested in body-and-commands scope", async () => {
+  const request = makeRequest();
+  const runtime = makeRuntime();
+  const baseline = parseRalphMarkdown(request.baselineDraft);
+  const [testsCommand, , gitLogCommand] = baseline.frontmatter.commands;
+  const rawDraft = `---
+commands:
+  - name: ${gitLogCommand.name}
+    run: ${gitLogCommand.run}
+    timeout: ${gitLogCommand.timeout}
+  - name: ${testsCommand.name}
+    run: ${testsCommand.run}
+    timeout: ${testsCommand.timeout}
+max_iterations: ${baseline.frontmatter.maxIterations}
+timeout: ${baseline.frontmatter.timeout}
+guardrails:
+  block_commands:
+    - 'git\\s+push'
+    - 'rm\\s+-rf'
+  protected_files: []
+---
+${baseline.body}
+
+Use {{ commands.${testsCommand.name} }} and {{ commands.${gitLogCommand.name} }}.
+`;
+
+  const result = await strengthenDraftWithLlm(request, runtime, {
+    scope: "body-and-commands",
+    completeImpl: async () => makeAssistantMessage([{ type: "text", text: rawDraft }]),
+  });
+
+  assert.deepEqual(result, { kind: "fallback" });
 });
 
 test("strengthenDraftWithLlm falls back on invalid model output", async () => {

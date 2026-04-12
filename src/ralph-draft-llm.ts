@@ -2,6 +2,8 @@ import { complete, type AssistantMessage, type Context, type Model } from "@mari
 import { basename } from "node:path";
 import { filterSecretBearingTopLevelNames } from "./secret-paths.ts";
 import {
+  acceptStrengthenedDraft,
+  hasFakeRuntimeEnforcementClaim,
   normalizeStrengthenedDraft,
   parseRalphMarkdown,
   validateFrontmatter,
@@ -81,9 +83,6 @@ function areFrontmattersEquivalent(
   return JSON.stringify(baseline) === JSON.stringify(strengthened);
 }
 
-function hasFakeRuntimeEnforcementClaim(text: string): boolean {
-  return /read[-\s]?only enforced|write protection is enforced/i.test(text);
-}
 
 function isWeakStrengthenedDraftForScope(
   baseline: ParsedRalph,
@@ -143,6 +142,31 @@ function renderSelectedFilesSection(request: DraftRequest): string {
     .join("\n\n");
 }
 
+function buildCompatibilityContractSection(scope: DraftStrengtheningScope): string {
+  if (scope !== "body-and-commands") {
+    return [
+      "Compatibility contract:",
+      "- body-only scope",
+      "- keep deterministic frontmatter unchanged",
+      "- edit the body only",
+    ].join("\n");
+  }
+
+  return [
+    "Compatibility contract:",
+    "- body-and-commands scope",
+    "- commands may only be reordered, dropped, or have timeouts reduced/kept within limits",
+    "- command names and run strings must match the deterministic baseline exactly",
+    "- max_iterations may stay the same or decrease from the deterministic baseline, never increase",
+    "- top-level timeout may stay the same or decrease from the deterministic baseline, never increase",
+    "- per-command timeout may stay the same or decrease from that command's baseline timeout, and must still be <= timeout",
+    "- completion_promise must remain unchanged, including remaining absent when absent from the baseline",
+    "- every {{ commands.<name> }} must refer to an accepted command",
+    "- baseline guardrails remain fixed in this phase",
+    "- unsupported frontmatter changes are rejected and fall back automatically",
+  ].join("\n");
+}
+
 function buildStrengtheningPromptText(request: DraftRequest, scope: DraftStrengtheningScope): string {
   const repoSignals = summarizeRepoSignals(request).map((line) => `- ${line}`).join("\n");
   const selectedFiles = renderSelectedFilesSection(request);
@@ -152,6 +176,7 @@ function buildStrengtheningPromptText(request: DraftRequest, scope: DraftStrengt
     `Inferred mode: ${request.mode}`,
     `Target file: ${basename(request.target.ralphPath)}`,
     `Strengthening scope: ${scope}`,
+    buildCompatibilityContractSection(scope),
     "",
     "Repo signals summary:",
     repoSignals,
@@ -169,7 +194,7 @@ function buildStrengtheningPromptText(request: DraftRequest, scope: DraftStrengt
 export function buildStrengtheningPrompt(request: DraftRequest, scope: DraftStrengtheningScope): Context {
   return {
     systemPrompt:
-      "You strengthen existing RALPH.md drafts. Return only a complete RALPH.md. Do not explain, do not wrap the output in fences, and do not omit required frontmatter.",
+      "You strengthen existing RALPH.md drafts. Follow the scope contract in the user message exactly. Return only a complete RALPH.md. Do not explain, do not wrap the output in fences, and do not omit required frontmatter.",
     messages: [
       {
         role: "user",
@@ -216,9 +241,6 @@ async function runCompleteWithTimeout(
   }
 }
 
-function isAuthFailure(result: AuthResult | AuthFailure): result is AuthFailure {
-  return result.ok === false;
-}
 
 export async function strengthenDraftWithLlm(
   request: DraftRequest,
@@ -258,6 +280,12 @@ export async function strengthenDraftWithLlm(
 
     if (strengthened.body.trim().length === 0) return { kind: "fallback" };
     if (isWeakStrengthenedDraftForScope(baseline, strengthened, scope, rawText)) return { kind: "fallback" };
+
+    if (scope === "body-and-commands") {
+      const accepted = acceptStrengthenedDraft(request, rawText);
+      if (!accepted) return { kind: "fallback" };
+      return { kind: "llm-strengthened", draft: accepted };
+    }
 
     return {
       kind: "llm-strengthened",

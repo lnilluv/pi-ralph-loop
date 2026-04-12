@@ -88,9 +88,6 @@ type RegisterRalphCommandServices = {
   createDraftPlan?: DraftPlanFactory;
 };
 
-function parseRalphMd(filePath: string) {
-  return parseRalphMarkdown(readFileSync(filePath, "utf8"));
-}
 
 function validateFrontmatter(fm: Frontmatter, ctx: Pick<CommandContext, "ui">): boolean {
   const error = validateFrontmatterMessage(fm);
@@ -311,14 +308,12 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     let name: string;
     try {
       const raw = readFileSync(ralphPath, "utf8");
-      if (shouldValidateExistingDraft(raw)) {
-        const draftError = validateDraftContent(raw);
-        if (draftError) {
-          ctx.ui.notify(`Invalid RALPH.md: ${draftError}`, "error");
-          return;
-        }
+      const draftError = validateDraftContent(raw);
+      if (draftError) {
+        ctx.ui.notify(`Invalid RALPH.md: ${draftError}`, "error");
+        return;
       }
-      const { frontmatter } = parseRalphMd(ralphPath);
+      const { frontmatter } = parseRalphMarkdown(raw);
       if (!validateFrontmatter(frontmatter, ctx)) return;
       name = basename(dirname(ralphPath));
       loopState = {
@@ -352,11 +347,13 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
         loopState.iteration = i;
         const iterStart = Date.now();
-        const { frontmatter: fm, body: rawBody } = parseRalphMd(loopState.ralphPath);
-        if (!validateFrontmatter(fm, ctx)) {
+        const raw = readFileSync(loopState.ralphPath, "utf8");
+        const draftError = validateDraftContent(raw);
+        if (draftError) {
           ctx.ui.notify(`Invalid RALPH.md on iteration ${i}, stopping loop`, "error");
           break;
         }
+        const { frontmatter: fm, body: rawBody } = parseRalphMarkdown(raw);
 
         loopState.maxIterations = fm.maxIterations;
         loopState.timeout = fm.timeout;

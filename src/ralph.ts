@@ -131,6 +131,13 @@ function toStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)) : [];
 }
 
+function isUniversalProtectedGlob(pattern: string): boolean {
+  const trimmed = pattern.trim().replace(/\/+$/, "");
+  if (!trimmed) return true;
+  if (/^\*+$/.test(trimmed)) return true;
+  return /^(?:\*\*?\/)+\*\*?$/.test(trimmed);
+}
+
 function normalizeRawRalph(raw: string): string {
   return raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
 }
@@ -139,8 +146,58 @@ function matchRalphMarkdown(raw: string): RegExpMatchArray | null {
   return normalizeRawRalph(raw).match(/^(?:\s*<!--[\s\S]*?-->\s*)*---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
 }
 
-function hasRalphFrontmatter(raw: string): boolean {
-  return matchRalphMarkdown(raw) !== null;
+
+function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | null {
+  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "guardrails")) {
+    return null;
+  }
+
+  const guardrails = rawFrontmatter.guardrails;
+  if (!isRecord(guardrails)) {
+    return "Invalid RALPH frontmatter: guardrails must be a YAML mapping";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(guardrails, "block_commands") &&
+    !Array.isArray(guardrails.block_commands)
+  ) {
+    return "Invalid RALPH frontmatter: guardrails.block_commands must be a YAML sequence";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(guardrails, "protected_files") &&
+    !Array.isArray(guardrails.protected_files)
+  ) {
+    return "Invalid RALPH frontmatter: guardrails.protected_files must be a YAML sequence";
+  }
+  return null;
+}
+
+function parseStrictRalphMarkdown(raw: string): { parsed: ParsedRalph; rawFrontmatter: UnknownRecord } | { error: string } {
+  const normalized = normalizeRawRalph(raw);
+  const match = matchRalphMarkdown(normalized);
+  if (!match) return { error: "Missing RALPH frontmatter" };
+
+  let parsedYaml: unknown;
+  try {
+    parsedYaml = parseYaml(match[1]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { error: `Invalid RALPH frontmatter: ${message}` };
+  }
+
+  if (!isRecord(parsedYaml)) {
+    return { error: "Invalid RALPH frontmatter: Frontmatter must be a YAML mapping" };
+  }
+
+  const guardrailsError = validateRawGuardrailsShape(parsedYaml);
+  if (guardrailsError) {
+    return { error: guardrailsError };
+  }
+
+  return { parsed: parseRalphMarkdown(normalized), rawFrontmatter: parsedYaml };
+}
+
+function hasMalformedStrengthenedCommandsShape(rawFrontmatter: UnknownRecord): boolean {
+  return !Array.isArray(rawFrontmatter.commands);
 }
 
 function normalizeMissingMarkdownTarget(absoluteTarget: string): { dirPath: string; ralphPath: string } {
@@ -169,6 +226,21 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
 
 function summarizeFinishLabel(maxIterations: number): string {
   return `Stop after ${maxIterations} iterations or /ralph-stop`;
+}
+
+function summarizeFinishBehavior(frontmatter: Frontmatter): string[] {
+  const lines = [
+    `- Stop after ${frontmatter.maxIterations} iterations or /ralph-stop`,
+    `- Stop if an iteration exceeds ${frontmatter.timeout}s`,
+  ];
+  if (frontmatter.completionPromise) {
+    lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
+  }
+  return lines;
+}
+
+function isSafeCompletionPromise(value: string): boolean {
+  return !/[\r\n<>]/.test(value);
 }
 
 function isRalphMarkdownPath(path: string): boolean {
@@ -295,11 +367,14 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
   if ((fm.invalidCommandEntries?.length ?? 0) > 0) {
     return `Invalid command entry at index ${fm.invalidCommandEntries![0]}`;
   }
-  if (!Number.isFinite(fm.maxIterations) || !Number.isInteger(fm.maxIterations) || fm.maxIterations <= 0) {
-    return "Invalid max_iterations: must be a positive finite integer";
+  if (!Number.isFinite(fm.maxIterations) || !Number.isInteger(fm.maxIterations) || fm.maxIterations < 1 || fm.maxIterations > 50) {
+    return "Invalid max_iterations: must be between 1 and 50";
   }
-  if (!Number.isFinite(fm.timeout) || fm.timeout <= 0) {
-    return "Invalid timeout: must be a positive finite number";
+  if (!Number.isFinite(fm.timeout) || fm.timeout <= 0 || fm.timeout > 300) {
+    return "Invalid timeout: must be greater than 0 and at most 300";
+  }
+  if (fm.completionPromise !== undefined && !isSafeCompletionPromise(fm.completionPromise)) {
+    return "Invalid completion_promise: must be a single-line string without line breaks or angle brackets";
   }
   for (const pattern of fm.guardrails.blockCommands) {
     try {
@@ -308,18 +383,104 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
       return `Invalid block_commands regex: ${pattern}`;
     }
   }
+  for (const pattern of fm.guardrails.protectedFiles) {
+    if (isUniversalProtectedGlob(pattern)) {
+      return `Invalid protected_files glob: ${pattern}`;
+    }
+  }
   for (const cmd of fm.commands) {
     if (!cmd.name.trim()) {
       return "Invalid command: name is required";
     }
+    if (!/^\w[\w-]*$/.test(cmd.name)) {
+      return `Invalid command name: ${cmd.name} must match ^\\w[\\w-]*$`;
+    }
     if (!cmd.run.trim()) {
       return `Invalid command ${cmd.name}: run is required`;
     }
-    if (!Number.isFinite(cmd.timeout) || cmd.timeout <= 0) {
-      return `Invalid command ${cmd.name}: timeout must be positive`;
+    if (!Number.isFinite(cmd.timeout) || cmd.timeout <= 0 || cmd.timeout > 300) {
+      return `Invalid command ${cmd.name}: timeout must be greater than 0 and at most 300`;
+    }
+    if (cmd.timeout > fm.timeout) {
+      return `Invalid command ${cmd.name}: timeout must not exceed top-level timeout`;
     }
   }
   return null;
+}
+
+function parseCompletionPromiseValue(yaml: UnknownRecord): { present: boolean; value?: string; invalid: boolean } {
+  if (!Object.prototype.hasOwnProperty.call(yaml, "completion_promise")) {
+    return { present: false, invalid: false };
+  }
+  const value = yaml.completion_promise;
+  if (typeof value !== "string" || !value.trim() || !isSafeCompletionPromise(value)) {
+    return { present: true, invalid: true };
+  }
+  return { present: true, value, invalid: false };
+}
+
+export function acceptStrengthenedDraft(request: DraftRequest, strengthenedDraft: string): DraftPlan | null {
+  const baseline = parseStrictRalphMarkdown(request.baselineDraft);
+  const strengthened = parseStrictRalphMarkdown(strengthenedDraft);
+  if ("error" in baseline || "error" in strengthened) {
+    return null;
+  }
+
+  if (hasMalformedStrengthenedCommandsShape(strengthened.rawFrontmatter)) {
+    return null;
+  }
+
+  const validationError = validateFrontmatter(strengthened.parsed.frontmatter);
+  if (validationError) {
+    return null;
+  }
+
+  const baselineCompletion = parseCompletionPromiseValue(baseline.rawFrontmatter);
+  const strengthenedCompletion = parseCompletionPromiseValue(strengthened.rawFrontmatter);
+  if (baselineCompletion.invalid || strengthenedCompletion.invalid) {
+    return null;
+  }
+  if (baselineCompletion.present !== strengthenedCompletion.present || baselineCompletion.value !== strengthenedCompletion.value) {
+    return null;
+  }
+
+  if (baseline.parsed.frontmatter.maxIterations < strengthened.parsed.frontmatter.maxIterations) {
+    return null;
+  }
+  if (baseline.parsed.frontmatter.timeout < strengthened.parsed.frontmatter.timeout) {
+    return null;
+  }
+  if (
+    baseline.parsed.frontmatter.guardrails.blockCommands.join("\n") !== strengthened.parsed.frontmatter.guardrails.blockCommands.join("\n") ||
+    baseline.parsed.frontmatter.guardrails.protectedFiles.join("\n") !== strengthened.parsed.frontmatter.guardrails.protectedFiles.join("\n")
+  ) {
+    return null;
+  }
+
+  const baselineCommands = new Map(baseline.parsed.frontmatter.commands.map((command) => [command.name, command]));
+  const seenCommands = new Set<string>();
+  for (const command of strengthened.parsed.frontmatter.commands) {
+    if (seenCommands.has(command.name)) {
+      return null;
+    }
+    seenCommands.add(command.name);
+
+    const baselineCommand = baselineCommands.get(command.name);
+    if (!baselineCommand || baselineCommand.run !== command.run) {
+      return null;
+    }
+    if (command.timeout > baselineCommand.timeout || command.timeout > strengthened.parsed.frontmatter.timeout) {
+      return null;
+    }
+  }
+
+  for (const placeholder of strengthened.parsed.body.matchAll(/\{\{\s*commands\.(\w[\w-]*)\s*\}\}/g)) {
+    if (!seenCommands.has(placeholder[1])) {
+      return null;
+    }
+  }
+
+  return renderDraftPlan(request.task, request.mode, request.target, strengthened.parsed.frontmatter, "llm-strengthened", strengthened.parsed.body);
 }
 
 export function findBlockedCommandPattern(command: string, blockPatterns: string[]): string | undefined {
@@ -594,11 +755,14 @@ function renderDraftPlan(task: string, mode: DraftMode, target: DraftTarget, fro
     ...renderCommandsYaml(frontmatter.commands),
     `max_iterations: ${frontmatter.maxIterations}`,
     `timeout: ${frontmatter.timeout}`,
+    ...(frontmatter.completionPromise ? [`completion_promise: ${yamlQuote(frontmatter.completionPromise)}`] : []),
     "guardrails:",
-    "  block_commands:",
-    ...frontmatter.guardrails.blockCommands.map((pattern) => `    - ${yamlQuote(pattern)}`),
-    "  protected_files:",
-    ...frontmatter.guardrails.protectedFiles.map((pattern) => `    - ${yamlQuote(pattern)}`),
+    ...(frontmatter.guardrails.blockCommands.length > 0
+      ? ["  block_commands:", ...frontmatter.guardrails.blockCommands.map((pattern) => `    - ${yamlQuote(pattern)}`)]
+      : ["  block_commands: []"]),
+    ...(frontmatter.guardrails.protectedFiles.length > 0
+      ? ["  protected_files:", ...frontmatter.guardrails.protectedFiles.map((pattern) => `    - ${yamlQuote(pattern)}`)]
+      : ["  protected_files: []"]),
   ];
 
   return {
@@ -635,16 +799,25 @@ export function buildDraftRequest(task: string, target: DraftTarget, repoSignals
 
 export function normalizeStrengthenedDraft(request: DraftRequest, strengthenedDraft: string, scope: DraftStrengtheningScope): DraftPlan {
   const baseline = parseRalphMarkdown(request.baselineDraft);
-  const strengthened = parseRalphMarkdown(strengthenedDraft);
+  const strengthened = parseStrictRalphMarkdown(strengthenedDraft);
 
   if (scope === "body-only") {
-    return renderDraftPlan(request.task, request.mode, request.target, baseline.frontmatter, "llm-strengthened", strengthened.body);
+    if ("error" in strengthened || hasMalformedStrengthenedCommandsShape(strengthened.rawFrontmatter) || validateFrontmatter(strengthened.parsed.frontmatter)) {
+      return renderDraftPlan(request.task, request.mode, request.target, baseline.frontmatter, "llm-strengthened", baseline.body);
+    }
+
+    return renderDraftPlan(request.task, request.mode, request.target, baseline.frontmatter, "llm-strengthened", strengthened.parsed.body);
   }
 
-  return renderDraftPlan(request.task, request.mode, request.target, strengthened.frontmatter, "llm-strengthened", strengthened.body);
+  const accepted = acceptStrengthenedDraft(request, strengthenedDraft);
+  if (accepted) {
+    return accepted;
+  }
+
+  return renderDraftPlan(request.task, request.mode, request.target, baseline.frontmatter, "llm-strengthened", baseline.body);
 }
 
-function hasFakeRuntimeEnforcementClaim(text: string): boolean {
+export function hasFakeRuntimeEnforcementClaim(text: string): boolean {
   return /read[-\s]?only enforced|write protection is enforced/i.test(text);
 }
 
@@ -692,20 +865,23 @@ export type DraftContentInspection = {
 
 export function inspectDraftContent(raw: string): DraftContentInspection {
   const metadata = extractDraftMetadata(raw);
-  const normalized = normalizeRawRalph(raw);
+  const parsed = parseStrictRalphMarkdown(raw);
 
-  if (!hasRalphFrontmatter(normalized)) {
-    return { metadata, error: "Missing RALPH frontmatter" };
+  if ("error" in parsed) {
+    return { metadata, error: parsed.error };
   }
 
-  try {
-    const parsed = parseRalphMarkdown(normalized);
-    const error = validateFrontmatter(parsed.frontmatter);
-    return error ? { metadata, parsed, error } : { metadata, parsed };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { metadata, error: `Invalid RALPH frontmatter: ${message}` };
+  const rawCompletionPromise = parseCompletionPromiseValue(parsed.rawFrontmatter);
+  if (rawCompletionPromise.invalid) {
+    return { metadata, parsed: parsed.parsed, error: "Invalid completion_promise: must be a single-line string without line breaks or angle brackets" };
   }
+
+  if (metadata && hasMalformedStrengthenedCommandsShape(parsed.rawFrontmatter)) {
+    return { metadata, parsed: parsed.parsed, error: "Invalid RALPH frontmatter: commands must be a YAML sequence" };
+  }
+
+  const error = validateFrontmatter(parsed.parsed.frontmatter);
+  return error ? { metadata, parsed: parsed.parsed, error } : { metadata, parsed: parsed.parsed };
 }
 
 export function validateDraftContent(raw: string): string | null {
@@ -734,9 +910,8 @@ export function buildMissionBrief(plan: DraftPlan): string {
   }
 
   const parsed = inspection.parsed!;
-  const mode = inspection.metadata?.mode ?? "general";
   const commandLabels = parsed.frontmatter.commands.map(formatCommandLabel);
-  const finishLabel = summarizeFinishLabel(parsed.frontmatter.maxIterations);
+  const finishBehavior = summarizeFinishBehavior(parsed.frontmatter);
   const safetyLabel = summarizeSafetyLabel(parsed.frontmatter.guardrails);
 
   return [
@@ -753,7 +928,7 @@ export function buildMissionBrief(plan: DraftPlan): string {
     ...commandLabels.map((label) => `- ${label}`),
     "",
     "Finish behavior",
-    `- ${finishLabel}`,
+    ...finishBehavior,
     "",
     "Safety",
     `- ${safetyLabel}`,

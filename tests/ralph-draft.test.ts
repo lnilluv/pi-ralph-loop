@@ -134,7 +134,7 @@ test("createDraftPlan strengthens with an injected active model runtime", async 
       strengthenCalls += 1;
       assert.equal(runtimeArg.model?.id, activeModel.id);
       assert.equal(runtimeArg.modelRegistry, runtime.modelRegistry);
-      assert.equal(options?.scope, "body-only");
+      assert.equal(options?.scope, "body-and-commands");
       assert.match(request.baselineDraft, /reverse engineer this app/);
       return { kind: "llm-strengthened", draft: makeDraftPlan(task, target, "llm-strengthened", cwd) };
     },
