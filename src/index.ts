@@ -1,13 +1,10 @@
-import { minimatch } from "minimatch";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   buildMissionBrief,
   classifyIdleState,
-  generateDraft,
   inspectExistingTarget,
-  inspectRepo,
   parseCommandArgs,
   parseRalphMarkdown,
   planTaskDraftTarget,
@@ -22,11 +19,15 @@ import {
   createSiblingTarget,
   findBlockedCommandPattern,
 } from "./ralph.ts";
-import type { CommandDef, CommandOutput, DraftTarget, Frontmatter } from "./ralph.ts";
+import { matchesProtectedPath } from "./secret-paths.ts";
+import type { CommandDef, CommandOutput, DraftPlan, DraftTarget, Frontmatter } from "./ralph.ts";
+import { createDraftPlan as createDraftPlanService } from "./ralph-draft.ts";
+import type { StrengthenDraftRuntime } from "./ralph-draft-llm.ts";
 
 type LoopState = {
   active: boolean;
   ralphPath: string;
+  cwd: string;
   iteration: number;
   maxIterations: number;
   timeout: number;
@@ -39,6 +40,7 @@ type LoopState = {
 type PersistedLoopState = {
   active: boolean;
   sessionFile?: string;
+  cwd?: string;
   iteration?: number;
   maxIterations?: number;
   iterationSummaries?: Array<{ iteration: number; duration: number }>;
@@ -46,11 +48,51 @@ type PersistedLoopState = {
   stopRequested?: boolean;
 };
 
+type CommandUI = {
+  input(title: string, placeholder: string): Promise<string | undefined>;
+  select(title: string, options: string[]): Promise<string | undefined>;
+  editor(title: string, content: string): Promise<string | undefined>;
+  notify(message: string, level: "info" | "warning" | "error"): void;
+  setStatus(name: string, status?: string): void;
+};
+
+type CommandSessionEntry = {
+  type: string;
+  customType?: string;
+  data?: unknown;
+  message?: { role?: string; content?: Array<{ type: string; text?: string }> };
+};
+
+type CommandContext = {
+  cwd: string;
+  hasUI: boolean;
+  ui: CommandUI;
+  sessionManager: {
+    getEntries(): CommandSessionEntry[];
+    getSessionFile(): string | undefined;
+  };
+  newSession(): Promise<{ cancelled: boolean }>;
+  waitForIdle(): Promise<void>;
+  model?: StrengthenDraftRuntime["model"];
+  modelRegistry?: StrengthenDraftRuntime["modelRegistry"];
+};
+
+type DraftPlanFactory = (
+  task: string,
+  target: DraftTarget,
+  cwd: string,
+  runtime?: StrengthenDraftRuntime,
+) => Promise<DraftPlan>;
+
+type RegisterRalphCommandServices = {
+  createDraftPlan?: DraftPlanFactory;
+};
+
 function parseRalphMd(filePath: string) {
   return parseRalphMarkdown(readFileSync(filePath, "utf8"));
 }
 
-function validateFrontmatter(fm: Frontmatter, ctx: any): boolean {
+function validateFrontmatter(fm: Frontmatter, ctx: Pick<CommandContext, "ui">): boolean {
   const error = validateFrontmatterMessage(fm);
   if (error) {
     ctx.ui.notify(error, "error");
@@ -95,10 +137,11 @@ function defaultLoopState(): LoopState {
     iterationSummaries: [],
     guardrails: { blockCommands: [], protectedFiles: [] },
     loopSessionFile: undefined,
+    cwd: "",
   };
 }
 
-function readPersistedLoopState(ctx: any): PersistedLoopState | undefined {
+function readPersistedLoopState(ctx: Pick<CommandContext, "sessionManager">): PersistedLoopState | undefined {
   const entries = ctx.sessionManager.getEntries();
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
@@ -123,14 +166,14 @@ function displayPath(cwd: string, filePath: string): string {
   return rel && !rel.startsWith("..") ? `./${rel}` : filePath;
 }
 
-async function promptForTask(ctx: any, title: string, placeholder: string): Promise<string | undefined> {
+async function promptForTask(ctx: Pick<CommandContext, "hasUI" | "ui">, title: string, placeholder: string): Promise<string | undefined> {
   if (!ctx.hasUI) return undefined;
   const value = await ctx.ui.input(title, placeholder);
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
 
-async function reviewDraft(plan: ReturnType<typeof generateDraft>, mode: "run" | "draft", ctx: any): Promise<{ action: "start" | "save" | "cancel"; content: string }> {
+async function reviewDraft(plan: DraftPlan, mode: "run" | "draft", ctx: Pick<CommandContext, "ui">): Promise<{ action: "start" | "save" | "cancel"; content: string }> {
   let content = plan.content;
 
   while (true) {
@@ -162,7 +205,7 @@ async function reviewDraft(plan: ReturnType<typeof generateDraft>, mode: "run" |
   }
 }
 
-async function editExistingDraft(ralphPath: string, ctx: any, saveMessage = "Saved RALPH.md") {
+async function editExistingDraft(ralphPath: string, ctx: Pick<CommandContext, "cwd" | "hasUI" | "ui">, saveMessage = "Saved RALPH.md") {
   if (!ctx.hasUI) {
     ctx.ui.notify(`Use ${displayPath(ctx.cwd, ralphPath)} in an interactive session to edit the draft.`, "warning");
     return;
@@ -194,7 +237,7 @@ async function editExistingDraft(ralphPath: string, ctx: any, saveMessage = "Sav
 async function chooseRecoveryMode(
   input: string,
   dirPath: string,
-  ctx: any,
+  ctx: Pick<CommandContext, "cwd" | "ui">,
   allowTaskFallback = true,
 ): Promise<"draft-path" | "task" | "cancel"> {
   const options = allowTaskFallback ? ["Draft in that folder", "Treat as task text", "Cancel"] : ["Draft in that folder", "Cancel"];
@@ -204,7 +247,7 @@ async function chooseRecoveryMode(
   return "cancel";
 }
 
-async function chooseConflictTarget(commandName: "ralph" | "ralph-draft", task: string, target: DraftTarget, ctx: any): Promise<{ action: "run-existing" | "open-existing" | "draft-target" | "cancel"; target?: DraftTarget }> {
+async function chooseConflictTarget(commandName: "ralph" | "ralph-draft", task: string, target: DraftTarget, ctx: Pick<CommandContext, "cwd" | "ui">): Promise<{ action: "run-existing" | "open-existing" | "draft-target" | "cancel"; target?: DraftTarget }> {
   const hasExistingDraft = existsSync(target.ralphPath);
   const title = hasExistingDraft
     ? `Found an existing RALPH at ${displayPath(ctx.cwd, target.ralphPath)} for “${task}”.`
@@ -225,8 +268,23 @@ async function chooseConflictTarget(commandName: "ralph" | "ralph-draft", task: 
   return { action: "draft-target", target: createSiblingTarget(ctx.cwd, target.slug) };
 }
 
-async function draftFromTask(commandName: "ralph" | "ralph-draft", task: string, target: DraftTarget, ctx: any): Promise<string | undefined> {
-  const plan = generateDraft(task, target, inspectRepo(ctx.cwd));
+function getDraftStrengtheningRuntime(ctx: Pick<CommandContext, "model" | "modelRegistry">): StrengthenDraftRuntime | undefined {
+  if (!ctx.model || !ctx.modelRegistry) return undefined;
+  return {
+    model: ctx.model,
+    modelRegistry: ctx.modelRegistry,
+  };
+}
+
+async function draftFromTask(
+  commandName: "ralph" | "ralph-draft",
+  task: string,
+  target: DraftTarget,
+  ctx: Pick<CommandContext, "cwd" | "ui">,
+  draftPlanFactory: DraftPlanFactory,
+  runtime?: StrengthenDraftRuntime,
+): Promise<string | undefined> {
+  const plan = await draftPlanFactory(task, target, ctx.cwd, runtime);
   const review = await reviewDraft(plan, commandName === "ralph" ? "run" : "draft", ctx);
   if (review.action === "cancel") return undefined;
 
@@ -240,15 +298,16 @@ async function draftFromTask(commandName: "ralph" | "ralph-draft", task: string,
 
 let loopState: LoopState = defaultLoopState();
 
-export default function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI, services: RegisterRalphCommandServices = {}) {
   const failCounts = new Map<string, number>();
-  const isLoopSession = (ctx: any): boolean => {
+  const draftPlanFactory = services.createDraftPlan ?? createDraftPlanService;
+  const isLoopSession = (ctx: Pick<CommandContext, "sessionManager">): boolean => {
     const state = readPersistedLoopState(ctx);
     const sessionFile = ctx.sessionManager.getSessionFile();
     return state?.active === true && state.sessionFile === sessionFile;
   };
 
-  async function startRalphLoop(ralphPath: string, ctx: any) {
+  async function startRalphLoop(ralphPath: string, ctx: CommandContext) {
     let name: string;
     try {
       const raw = readFileSync(ralphPath, "utf8");
@@ -265,6 +324,7 @@ export default function (pi: ExtensionAPI) {
       loopState = {
         active: true,
         ralphPath,
+        cwd: ctx.cwd,
         iteration: 0,
         maxIterations: frontmatter.maxIterations,
         timeout: frontmatter.timeout,
@@ -325,6 +385,7 @@ export default function (pi: ExtensionAPI) {
         persistLoopState(pi, {
           active: true,
           sessionFile: loopState.loopSessionFile,
+          cwd: loopState.cwd,
           iteration: loopState.iteration,
           maxIterations: loopState.maxIterations,
           iterationSummaries: loopState.iterationSummaries,
@@ -403,17 +464,18 @@ export default function (pi: ExtensionAPI) {
       loopState.stopRequested = false;
       loopState.loopSessionFile = undefined;
       ctx.ui.setStatus("ralph", undefined);
-      persistLoopState(pi, { active: false });
+      persistLoopState(pi, { active: false, cwd: loopState.cwd });
     }
   }
 
-  async function handleDraftCommand(commandName: "ralph" | "ralph-draft", args: string, ctx: any): Promise<string | undefined> {
+  async function handleDraftCommand(commandName: "ralph" | "ralph-draft", args: string, ctx: CommandContext): Promise<string | undefined> {
     const parsed = parseCommandArgs(args);
+    const draftRuntime = getDraftStrengtheningRuntime(ctx);
 
     const resolveTaskForFolder = async (target: DraftTarget): Promise<string | undefined> => {
       const task = await promptForTask(ctx, "What should Ralph work on in this folder?", "reverse engineer this app");
       if (!task) return undefined;
-      return draftFromTask(commandName, task, target, ctx);
+      return draftFromTask(commandName, task, target, ctx, draftPlanFactory, draftRuntime);
     };
 
     const handleExistingInspection = async (input: string, explicitPath = false): Promise<string | undefined> => {
@@ -466,7 +528,7 @@ export default function (pi: ExtensionAPI) {
         }
         planned = { kind: "draft", target: decision.target! };
       }
-      return draftFromTask(commandName, task, planned.target, ctx);
+      return draftFromTask(commandName, task, planned.target, ctx, draftPlanFactory, draftRuntime);
     };
 
     if (parsed.mode === "task") {
@@ -504,8 +566,8 @@ export default function (pi: ExtensionAPI) {
 
     if (event.toolName === "write" || event.toolName === "edit") {
       const filePath = (event.input as { path?: string }).path ?? "";
-      for (const glob of persisted.guardrails?.protectedFiles ?? []) {
-        if (minimatch(filePath, glob, { matchBase: true })) return { block: true, reason: `ralph: ${filePath} is protected` };
+      if (matchesProtectedPath(filePath, persisted.guardrails?.protectedFiles ?? [], persisted.cwd)) {
+        return { block: true, reason: `ralph: ${filePath} is protected` };
       }
     }
   });
@@ -546,7 +608,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("ralph", {
     description: "Start Ralph from a task folder or RALPH.md",
-    handler: async (args: string, ctx: any) => {
+    handler: async (args: string, ctx: CommandContext) => {
       if (loopState.active) {
         ctx.ui.notify("A ralph loop is already running. Use /ralph-stop first.", "warning");
         return;
@@ -560,14 +622,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("ralph-draft", {
     description: "Draft a Ralph task without starting it",
-    handler: async (args: string, ctx: any) => {
+    handler: async (args: string, ctx: CommandContext) => {
       await handleDraftCommand("ralph-draft", args ?? "", ctx);
     },
   });
 
   pi.registerCommand("ralph-stop", {
     description: "Stop the ralph loop after the current iteration",
-    handler: async (_args: string, ctx: any) => {
+    handler: async (_args: string, ctx: CommandContext) => {
       const persisted = readPersistedLoopState(ctx);
       if (!persisted?.active) {
         if (!loopState.active) {

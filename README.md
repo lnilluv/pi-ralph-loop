@@ -47,6 +47,10 @@ pi drafts `./reverse-engineer-this-app/RALPH.md`, shows a short Mission Brief, l
 
 That saves the draft but does not launch the loop.
 
+### Smart drafting
+
+Smart drafting sends the selected repo excerpts from the current repo context to the currently selected active pi model, including models chosen with `/model` or by cycling within `/scoped-models`. It excludes common secret-bearing paths from that context, and non-analysis drafts use the shared `policy:secret-bearing-paths` token so runtime write protection stays aligned with the same policy. It does not switch models automatically. If no active authenticated model is available, drafting falls back to the deterministic path.
+
 ## How it works
 
 On each iteration, pi-ralph reads `RALPH.md`, runs the configured commands, injects their output into the prompt through `{{ commands.<name> }}` placeholders, starts a fresh session, sends the prompt, and waits for completion. Failed command output appears in the next iteration, which creates a self-healing loop.
@@ -123,7 +127,7 @@ Apply the smallest safe fix and explain why it works.
 | `timeout` | number | `300` | Per-iteration timeout in seconds; stops the loop if the agent is stuck |
 | `completion_promise` | string | — | Agent signals completion by sending `<promise>DONE</promise>`; loop breaks on match |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns to block in bash |
-| `guardrails.protected_files` | string[] | `[]` | Glob patterns enforced on `write`/`edit` tool calls |
+| `guardrails.protected_files` | string[] | `[]` | Glob patterns, or the shared `policy:secret-bearing-paths` token, enforced on `write`/`edit` tool calls |
 
 ### Placeholders
 
@@ -145,7 +149,7 @@ HTML comments (`<!-- ... -->`) are stripped from the prompt body after placehold
 
 ### Guardrails
 
-`guardrails.block_commands` and `guardrails.protected_files` come from RALPH frontmatter. The extension enforces them in the `tool_call` hook — but only for sessions created by the loop, so they don't leak into unrelated conversations. Matching bash commands are blocked, and `write`/`edit` tool calls targeting protected file globs are denied.
+`guardrails.block_commands` and `guardrails.protected_files` come from RALPH frontmatter. The extension enforces them in the `tool_call` hook — but only for sessions created by the loop, so they don't leak into unrelated conversations. Matching bash commands are blocked, and `write`/`edit` tool calls targeting protected file globs or the shared secret-path policy token are denied.
 
 ### Cross-iteration memory
 

@@ -1,8 +1,12 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { SECRET_PATH_POLICY_TOKEN, filterSecretBearingTopLevelNames, isSecretBearingPath, isSecretBearingTopLevelName } from "./secret-paths.ts";
 
 export type CommandDef = { name: string; run: string; timeout: number };
+export type DraftSource = "deterministic" | "llm-strengthened" | "fallback";
+export type DraftStrengtheningScope = "body-only" | "body-and-commands";
+export type CommandIntent = CommandDef & { source: "heuristic" | "repo-signal" };
 export type Frontmatter = {
   commands: CommandDef[];
   maxIterations: number;
@@ -29,12 +33,20 @@ export type ExistingTargetInspection =
   | { kind: "missing-path"; dirPath: string; ralphPath: string }
   | { kind: "not-path" };
 export type DraftMode = "analysis" | "fix" | "migration" | "general";
-export type DraftMetadata = {
-  generator: "pi-ralph-loop";
-  version: 1;
-  task: string;
-  mode: DraftMode;
-};
+export type DraftMetadata =
+  | {
+      generator: "pi-ralph-loop";
+      version: 1;
+      task: string;
+      mode: DraftMode;
+    }
+  | {
+      generator: "pi-ralph-loop";
+      version: 2;
+      source: DraftSource;
+      task: string;
+      mode: DraftMode;
+    };
 export type DraftTarget = {
   slug: string;
   dirPath: string;
@@ -51,10 +63,29 @@ export type RepoSignals = {
   topLevelDirs: string[];
   topLevelFiles: string[];
 };
+export type RepoContextSelectedFile = {
+  path: string;
+  content: string;
+  reason: string;
+};
+export type RepoContext = {
+  summaryLines: string[];
+  selectedFiles: RepoContextSelectedFile[];
+};
+export type DraftRequest = {
+  task: string;
+  mode: DraftMode;
+  target: DraftTarget;
+  repoSignals: RepoSignals;
+  repoContext: RepoContext;
+  commandIntent: CommandIntent[];
+  baselineDraft: string;
+};
 export type DraftPlan = {
   task: string;
   mode: DraftMode;
   target: DraftTarget;
+  source: DraftSource;
   content: string;
   commandLabels: string[];
   safetyLabel: string;
@@ -65,6 +96,17 @@ type UnknownRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const draftModes: DraftMode[] = ["analysis", "fix", "migration", "general"];
+const draftSources: DraftSource[] = ["deterministic", "llm-strengthened", "fallback"];
+
+function isDraftMode(value: unknown): value is DraftMode {
+  return typeof value === "string" && draftModes.includes(value as DraftMode);
+}
+
+function isDraftSource(value: unknown): value is DraftSource {
+  return typeof value === "string" && draftSources.includes(value as DraftSource);
 }
 
 function parseRalphFrontmatter(raw: string): UnknownRecord {
@@ -117,7 +159,7 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
   } else if (guardrails.blockCommands.length > 0) {
     labels.push(`blocks ${guardrails.blockCommands.length} command pattern${guardrails.blockCommands.length === 1 ? "" : "s"}`);
   }
-  if (guardrails.protectedFiles.some((pattern) => pattern.includes(".env") || pattern.includes("secret"))) {
+  if (guardrails.protectedFiles.some((pattern) => pattern === SECRET_PATH_POLICY_TOKEN || isSecretBearingPath(pattern))) {
     labels.push("blocks write/edit to secret files");
   } else if (guardrails.protectedFiles.length > 0) {
     labels.push(`blocks write/edit to ${guardrails.protectedFiles.length} file glob${guardrails.protectedFiles.length === 1 ? "" : "s"}`);
@@ -415,8 +457,9 @@ export function inspectRepo(cwd: string): RepoSignals {
 
   try {
     const entries = readdirSync(cwd, { withFileTypes: true }).slice(0, 50);
-    topLevelDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).slice(0, 10);
-    topLevelFiles = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).slice(0, 10);
+    const filteredEntries = entries.filter((entry) => !isSecretBearingTopLevelName(entry.name));
+    topLevelDirs = filteredEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).slice(0, 10);
+    topLevelFiles = filteredEntries.filter((entry) => entry.isFile()).map((entry) => entry.name).slice(0, 10);
   } catch {
     // ignore bounded inspection failures
   }
@@ -431,19 +474,68 @@ export function inspectRepo(cwd: string): RepoSignals {
   };
 }
 
-export function suggestedCommandsForMode(mode: DraftMode, signals: RepoSignals): CommandDef[] {
+export function buildRepoContext(signals: RepoSignals): RepoContext {
+  const topLevelDirs = filterSecretBearingTopLevelNames(signals.topLevelDirs);
+  const topLevelFiles = filterSecretBearingTopLevelNames(signals.topLevelFiles);
+
+  return {
+    summaryLines: [
+      `package manager: ${signals.packageManager ?? "unknown"}`,
+      `test command: ${signals.testCommand ?? "none"}`,
+      `lint command: ${signals.lintCommand ?? "none"}`,
+      `git repository: ${signals.hasGit ? "present" : "absent"}`,
+      `top-level dirs: ${topLevelDirs.length > 0 ? topLevelDirs.join(", ") : "none"}`,
+      `top-level files: ${topLevelFiles.length > 0 ? topLevelFiles.join(", ") : "none"}`,
+    ],
+    selectedFiles: topLevelFiles.slice(0, 10).map((path) => ({
+      path,
+      content: "",
+      reason: "top-level file",
+    })),
+  };
+}
+
+function normalizeSelectedFile(file: unknown): RepoContextSelectedFile {
+  if (isRecord(file)) {
+    return {
+      path: String(file.path ?? ""),
+      content: String(file.content ?? ""),
+      reason: String(file.reason ?? "selected file"),
+    };
+  }
+  if (typeof file === "string") {
+    return { path: file, content: "", reason: "selected file" };
+  }
+  return { path: String(file), content: "", reason: "selected file" };
+}
+
+function normalizeRepoContext(repoContext: RepoContext | undefined, signals: RepoSignals): RepoContext {
+  if (repoContext && Array.isArray(repoContext.summaryLines) && Array.isArray(repoContext.selectedFiles)) {
+    return {
+      summaryLines: repoContext.summaryLines.map((line) => String(line)),
+      selectedFiles: repoContext.selectedFiles.map((file) => normalizeSelectedFile(file)),
+    };
+  }
+  return buildRepoContext(signals);
+}
+
+export function buildCommandIntent(mode: DraftMode, signals: RepoSignals): CommandIntent[] {
   if (mode === "analysis") {
-    const commands: CommandDef[] = [{ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20 }];
-    if (signals.hasGit) commands.unshift({ name: "git-log", run: "git log --oneline -10", timeout: 20 });
+    const commands: CommandIntent[] = [{ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20, source: "heuristic" }];
+    if (signals.hasGit) commands.unshift({ name: "git-log", run: "git log --oneline -10", timeout: 20, source: "heuristic" });
     return commands;
   }
 
-  const commands: CommandDef[] = [];
-  if (signals.testCommand) commands.push({ name: "tests", run: signals.testCommand, timeout: 120 });
-  if (signals.lintCommand) commands.push({ name: "lint", run: signals.lintCommand, timeout: 90 });
-  if (signals.hasGit) commands.push({ name: "git-log", run: "git log --oneline -10", timeout: 20 });
-  if (commands.length === 0) commands.push({ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20 });
+  const commands: CommandIntent[] = [];
+  if (signals.testCommand) commands.push({ name: "tests", run: signals.testCommand, timeout: 120, source: "repo-signal" });
+  if (signals.lintCommand) commands.push({ name: "lint", run: signals.lintCommand, timeout: 90, source: "repo-signal" });
+  if (signals.hasGit) commands.push({ name: "git-log", run: "git log --oneline -10", timeout: 20, source: "heuristic" });
+  if (commands.length === 0) commands.push({ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20, source: "heuristic" });
   return commands;
+}
+
+export function suggestedCommandsForMode(mode: DraftMode, signals: RepoSignals): CommandDef[] {
+  return buildCommandIntent(mode, signals).map(({ source: _source, ...command }) => command);
 }
 
 function formatCommandLabel(command: CommandDef): string {
@@ -455,68 +547,134 @@ function extractVisibleTask(body: string): string | undefined {
   return match?.[1]?.trim() || undefined;
 }
 
-export function generateDraft(task: string, target: DraftTarget, signals: RepoSignals): DraftPlan {
-  const mode = classifyTaskMode(task);
-  const commands = suggestedCommandsForMode(mode, signals);
-  const metadata: DraftMetadata = { generator: "pi-ralph-loop", version: 1, task, mode };
+function buildDraftFrontmatter(mode: DraftMode, commands: CommandDef[]): Frontmatter {
   const guardrails = {
     blockCommands: ["git\\s+push"],
-    protectedFiles: mode === "analysis" ? [] : [".env*", "**/secrets/**"],
+    protectedFiles: mode === "analysis" ? [] : [SECRET_PATH_POLICY_TOKEN],
   };
-  const maxIterations = mode === "analysis" ? 12 : mode === "migration" ? 30 : 25;
+  return {
+    commands,
+    maxIterations: mode === "analysis" ? 12 : mode === "migration" ? 30 : 25,
+    timeout: 300,
+    guardrails,
+  };
+}
+
+function renderDraftBody(task: string, mode: DraftMode, commands: CommandDef[]): string {
+  const commandSections = commands.map((command) => bodySection(command.name === "git-log" ? "Recent git history" : `Latest ${command.name} output`, `{{ commands.${command.name} }}`));
+  return mode === "analysis"
+    ? [
+        `Task: ${escapeHtmlCommentMarkers(task)}`,
+        "",
+        ...commandSections,
+        "",
+        "Start with read-only inspection. Avoid edits and commits until you have a clear plan.",
+        "Map the architecture, identify entry points, and summarize the important moving parts.",
+        "End each iteration with concrete findings, open questions, and the next files to inspect.",
+        "Iteration {{ ralph.iteration }} of {{ ralph.name }}.",
+      ].join("\n")
+    : [
+        `Task: ${escapeHtmlCommentMarkers(task)}`,
+        "",
+        ...commandSections,
+        "",
+        mode === "fix" ? "If tests or lint are failing, fix those failures before starting new work." : "Make the smallest safe change that moves the task forward.",
+        "Prefer concrete, verifiable progress. Explain why your change works.",
+        "Iteration {{ ralph.iteration }} of {{ ralph.name }}.",
+      ].join("\n");
+}
+
+function commandIntentsToCommands(commandIntents: CommandIntent[]): CommandDef[] {
+  return commandIntents.map(({ source: _source, ...command }) => command);
+}
+
+function renderDraftPlan(task: string, mode: DraftMode, target: DraftTarget, frontmatter: Frontmatter, source: DraftSource, body: string): DraftPlan {
+  const metadata: DraftMetadata = { generator: "pi-ralph-loop", version: 2, source, task, mode };
   const frontmatterLines = [
-    ...renderCommandsYaml(commands),
-    `max_iterations: ${maxIterations}`,
-    "timeout: 300",
+    ...renderCommandsYaml(frontmatter.commands),
+    `max_iterations: ${frontmatter.maxIterations}`,
+    `timeout: ${frontmatter.timeout}`,
     "guardrails:",
     "  block_commands:",
-    ...guardrails.blockCommands.map((pattern) => `    - ${yamlQuote(pattern)}`),
+    ...frontmatter.guardrails.blockCommands.map((pattern) => `    - ${yamlQuote(pattern)}`),
     "  protected_files:",
-    ...guardrails.protectedFiles.map((pattern) => `    - ${yamlQuote(pattern)}`),
+    ...frontmatter.guardrails.protectedFiles.map((pattern) => `    - ${yamlQuote(pattern)}`),
   ];
-
-  const commandSections = commands.map((command) => bodySection(command.name === "git-log" ? "Recent git history" : `Latest ${command.name} output`, `{{ commands.${command.name} }}`));
-  const body =
-    mode === "analysis"
-      ? [
-          `Task: ${escapeHtmlCommentMarkers(task)}`,
-          "",
-          ...commandSections,
-          "",
-          "Start with read-only inspection. Avoid edits and commits until you have a clear plan.",
-          "Map the architecture, identify entry points, and summarize the important moving parts.",
-          "End each iteration with concrete findings, open questions, and the next files to inspect.",
-          "Iteration {{ ralph.iteration }} of {{ ralph.name }}.",
-        ].join("\n")
-      : [
-          `Task: ${escapeHtmlCommentMarkers(task)}`,
-          "",
-          ...commandSections,
-          "",
-          mode === "fix"
-            ? "If tests or lint are failing, fix those failures before starting new work."
-            : "Make the smallest safe change that moves the task forward.",
-          "Prefer concrete, verifiable progress. Explain why your change works.",
-          "Iteration {{ ralph.iteration }} of {{ ralph.name }}.",
-        ].join("\n");
 
   return {
     task,
     mode,
     target,
+    source,
     content: `${metadataComment(metadata)}\n${yamlBlock(frontmatterLines)}\n\n${body}`,
-    commandLabels: commands.map(formatCommandLabel),
-    safetyLabel: summarizeSafetyLabel(guardrails),
-    finishLabel: summarizeFinishLabel(maxIterations),
+    commandLabels: frontmatter.commands.map(formatCommandLabel),
+    safetyLabel: summarizeSafetyLabel(frontmatter.guardrails),
+    finishLabel: summarizeFinishLabel(frontmatter.maxIterations),
   };
+}
+
+export function generateDraftFromRequest(request: Omit<DraftRequest, "baselineDraft">, source: DraftSource): DraftPlan {
+  const commands = commandIntentsToCommands(request.commandIntent);
+  const frontmatter = buildDraftFrontmatter(request.mode, commands);
+  return renderDraftPlan(request.task, request.mode, request.target, frontmatter, source, renderDraftBody(request.task, request.mode, commands));
+}
+
+export function buildDraftRequest(task: string, target: DraftTarget, repoSignals: RepoSignals, repoContext?: RepoContext): DraftRequest {
+  const mode = classifyTaskMode(task);
+  const commandIntents = buildCommandIntent(mode, repoSignals);
+  const request: Omit<DraftRequest, "baselineDraft"> = {
+    task,
+    mode,
+    target,
+    repoSignals,
+    repoContext: normalizeRepoContext(repoContext, repoSignals),
+    commandIntent: commandIntents,
+  };
+  return { ...request, baselineDraft: generateDraftFromRequest(request, "deterministic").content };
+}
+
+export function normalizeStrengthenedDraft(request: DraftRequest, strengthenedDraft: string, scope: DraftStrengtheningScope): DraftPlan {
+  const baseline = parseRalphMarkdown(request.baselineDraft);
+  const strengthened = parseRalphMarkdown(strengthenedDraft);
+
+  if (scope === "body-only") {
+    return renderDraftPlan(request.task, request.mode, request.target, baseline.frontmatter, "llm-strengthened", strengthened.body);
+  }
+
+  return renderDraftPlan(request.task, request.mode, request.target, strengthened.frontmatter, "llm-strengthened", strengthened.body);
+}
+
+function hasFakeRuntimeEnforcementClaim(text: string): boolean {
+  return /read[-\s]?only enforced|write protection is enforced/i.test(text);
+}
+
+export function isWeakStrengthenedDraft(baselineBody: string, analysisText: string, strengthenedBody: string): boolean {
+  return baselineBody.trim() === strengthenedBody.trim() || hasFakeRuntimeEnforcementClaim(analysisText) || hasFakeRuntimeEnforcementClaim(strengthenedBody);
+}
+
+export function generateDraft(task: string, target: DraftTarget, signals: RepoSignals): DraftPlan {
+  const request = buildDraftRequest(task, target, signals);
+  return generateDraftFromRequest(request, "deterministic");
 }
 
 export function extractDraftMetadata(raw: string): DraftMetadata | undefined {
   const match = raw.match(/^<!-- pi-ralph-loop: (.+?) -->/);
   if (!match) return undefined;
+
   try {
-    const parsed = JSON.parse(decodeDraftMetadata(match[1])) as DraftMetadata;
-    return parsed?.generator === "pi-ralph-loop" ? parsed : undefined;
+    const parsed: unknown = JSON.parse(decodeDraftMetadata(match[1]));
+    if (!isRecord(parsed) || parsed.generator !== "pi-ralph-loop") return undefined;
+    if (!isDraftMode(parsed.mode) || typeof parsed.task !== "string") return undefined;
+
+    if (parsed.version === 1) {
+      return { generator: "pi-ralph-loop", version: 1, task: parsed.task, mode: parsed.mode };
+    }
+
+    if (parsed.version === 2 && isDraftSource(parsed.source)) {
+      return { generator: "pi-ralph-loop", version: 2, source: parsed.source, task: parsed.task, mode: parsed.mode };
+    }
+
+    return undefined;
   } catch {
     return undefined;
   }

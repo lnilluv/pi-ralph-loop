@@ -20,6 +20,7 @@
     "url": "git+https://github.com/lnilluv/pi-ralph-loop.git"
   },
   "dependencies": {
+    "@mariozechner/pi-ai": "0.66.1",
     "minimatch": "10.2.3",
     "yaml": "2.8.3"
   },
