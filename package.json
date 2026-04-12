@@ -8,11 +8,7 @@
       "./src/index.ts"
     ]
   },
-  "engines": {
-    "node": "22.22.1 || 24.14.1"
-  },
   "scripts": {
-    "test": "node --test --experimental-strip-types $(find tests -type f -name '*.ts' | sort)",
     "typecheck": "tsc --noEmit"
   },
   "repository": {
@@ -20,8 +16,8 @@
     "url": "git+https://github.com/lnilluv/pi-ralph-loop.git"
   },
   "dependencies": {
-    "minimatch": "10.2.3",
-    "yaml": "2.8.3"
+    "yaml": "2.8.3",
+    "minimatch": "10.2.3"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*"
@@ -33,9 +29,5 @@
     "autonomous",
     "loop"
   ],
-  "license": "MIT",
-  "devDependencies": {
-    "@types/node": "25.6.0",
-    "typescript": "6.0.2"
-  }
+  "license": "MIT"
 }
