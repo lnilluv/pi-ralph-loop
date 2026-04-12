@@ -1,6 +1,6 @@
 {
   "name": "@lnilluv/pi-ralph-loop",
-  "version": "0.1.3",
+  "version": "0.1.4-dev.0",
   "description": "Pi-native ralph loop — autonomous coding iterations with mid-turn supervision",
   "type": "module",
   "pi": {
