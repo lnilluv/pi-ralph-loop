@@ -39,7 +39,7 @@ function makeDraftPlan(task: string, target: DraftTarget, source: DraftPlan["sou
   };
 }
 
-function createHarness(options?: { createDraftPlan?: (...args: Array<any>) => Promise<DraftPlan>; exec?: (...args: Array<any>) => Promise<any> }) {
+function createHarness(options?: { createDraftPlan?: (...args: Array<any>) => Promise<DraftPlan>; exec?: (...args: Array<any>) => Promise<any>; sendUserMessage?: (...args: Array<any>) => any }) {
   const handlers = new Map<string, (args: string, ctx: any) => Promise<string | undefined>>();
   const eventHandlers = new Map<string, (...args: Array<any>) => Promise<any> | any>();
   const pi = {
@@ -50,7 +50,7 @@ function createHarness(options?: { createDraftPlan?: (...args: Array<any>) => Pr
       handlers.set(name, spec.handler);
     },
     appendEntry: () => undefined,
-    sendUserMessage: () => undefined,
+    sendUserMessage: options?.sendUserMessage ?? (() => undefined),
     exec:
       options?.exec ??
       (async () => ({
@@ -675,6 +675,68 @@ test("/ralph re-validates raw draft content before each loop iteration", async (
     ),
   );
 });
+
+test("/ralph uses follow-up delivery for later iterations that resume a busy session", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const task = "Fix flaky auth tests";
+  const target = createTarget(cwd, task);
+  const draft = generateDraft(task, target, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    lintCommand: "npm run lint",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  mkdirSync(target.dirPath, { recursive: true });
+  writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 2"), "utf8");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const sendCalls: Array<{ message: string; options: { deliverAs?: string } | undefined }> = [];
+  let newSessionCalls = 0;
+  const harness = createHarness({
+    sendUserMessage: (message: string, options?: { deliverAs?: string }) => {
+      sendCalls.push({ message, options });
+      if (newSessionCalls >= 2 && options?.deliverAs !== "followUp") {
+        throw new Error("Agent is already processing");
+      }
+    },
+  });
+
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => {
+        throw new Error("should not prompt");
+      },
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+    newSession: async () => {
+      newSessionCalls += 1;
+      return { cancelled: false };
+    },
+    waitForIdle: async () => undefined,
+  };
+
+  await handler(`--path ${target.ralphPath}`, ctx);
+
+  assert.equal(newSessionCalls, 2);
+  assert.equal(sendCalls.length, 2);
+  assert.deepEqual(sendCalls[1]?.options, { deliverAs: "followUp" });
+  assert.ok(notifications.some(({ level, message }) => level === "info" && message.includes("Ralph loop done: 2 iterations")));
+  assert.equal(notifications.some(({ level, message }) => level === "error" && message.includes("Ralph loop failed")), false);
+});
+
 
 test("/ralph-draft passes the active model runtime to the draft planner", async (t) => {
   const cwd = createTempDir();

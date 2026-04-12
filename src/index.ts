@@ -390,7 +390,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
           stopRequested: false,
         });
 
-        pi.sendUserMessage(prompt);
+        await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
         const timeoutMs = fm.timeout * 1000;
         let timedOut = false;
         let idleError: Error | undefined;
