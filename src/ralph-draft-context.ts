@@ -105,7 +105,7 @@ function isSecretBearingPath(relativePath: string): boolean {
   if (!normalizedPath || normalizedPath.startsWith("..")) return false;
 
   const segments = normalizedPath.split("/").filter(Boolean);
-  if (segments.some((segment) => SECRET_PATH_SEGMENTS.has(segment))) return true;
+  if (segments.some((segment) => SECRET_PATH_SEGMENTS.has(segment) || segment.includes("secret") || segment.includes("credential"))) return true;
 
   const normalizedName = basename(normalizedPath);
   return (

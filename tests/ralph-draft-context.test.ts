@@ -539,6 +539,8 @@ test("secret-like files are excluded from selected files", (t) => {
   writeTextFile(cwd, ".netrc", "machine example.invalid login user password secret\n");
   writeTextFile(cwd, "keys/server.pem", "pem\n");
   writeTextFile(cwd, "keys/private.key", "key\n");
+  writeTextFile(cwd, "ops-secrets/config.json", "{}\n");
+  writeTextFile(cwd, "credentials-prod/token.txt", "token\n");
   writeTextFile(cwd, "config/secrets/prod.json", "{}\n");
   writeTextFile(cwd, "config/credentials/service.json", "{}\n");
   writeTextFile(cwd, "config/secret-config.json", "{}\n");
@@ -551,8 +553,8 @@ test("secret-like files are excluded from selected files", (t) => {
     "Reverse engineer this app",
     "analysis",
     makeSignals({
-      topLevelDirs: ["src", "keys", "config", ".aws", ".ssh"],
-      topLevelFiles: ["README.md", ".env", ".env.local", ".npmrc", ".pypirc", ".netrc"],
+      topLevelDirs: ["src", "keys", "ops-secrets", "credentials-prod", "config", ".aws", ".ssh"],
+      topLevelFiles: ["README.md", "ops-secrets/config.json", "credentials-prod/token.txt", ".env", ".env.local", ".npmrc", ".pypirc", ".netrc"],
     }),
   );
 
@@ -565,6 +567,8 @@ test("secret-like files are excluded from selected files", (t) => {
     ".netrc",
     "keys/server.pem",
     "keys/private.key",
+    "ops-secrets/config.json",
+    "credentials-prod/token.txt",
     "config/secrets/prod.json",
     "config/credentials/service.json",
     "config/secret-config.json",
@@ -579,7 +583,7 @@ test("secret-like files are excluded from selected files", (t) => {
     assert.ok(!selectedPaths.includes(path), `unexpected secret-like file selected: ${path}`);
   }
   assert.ok(selectedPaths.every((path) => !/(?:\.env(?:\..*)?$|\.npmrc$|\.pypirc$|\.netrc$|\.pem$|\.key$|secret|credential|\.aws\/|\.ssh\/)/i.test(path)));
-  for (const token of [".env", ".npmrc", ".ssh", "secrets", "credentials"]) {
+  for (const token of [".env", ".npmrc", ".ssh", "secrets", "credentials", "ops-secrets", "credentials-prod"]) {
     assert.ok(context.summaryLines.every((line) => !line.includes(token)), `unexpected secret-like token in summary lines: ${token}`);
   }
 });
