@@ -25,10 +25,32 @@ import {
   validateDraftContent,
   validateFrontmatter,
 } from "../src/ralph.ts";
-import { runCommands } from "../src/index.ts";
+import registerRalphCommands, { runCommands } from "../src/index.ts";
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-loop-"));
+}
+
+function createCommandHarness() {
+  const handlers = new Map<string, (args: string, ctx: any) => Promise<string | undefined>>();
+  const pi = {
+    on: () => undefined,
+    registerCommand: (name: string, spec: { handler: (args: string, ctx: any) => Promise<string | undefined> }) => {
+      handlers.set(name, spec.handler);
+    },
+    appendEntry: () => undefined,
+    sendUserMessage: () => undefined,
+  } as any;
+
+  registerRalphCommands(pi);
+
+  return {
+    handler(name: string) {
+      const handler = handlers.get(name);
+      assert.ok(handler);
+      return handler;
+    },
+  };
 }
 
 test("parseRalphMarkdown falls back to default frontmatter when no frontmatter is present", () => {
@@ -143,6 +165,35 @@ test("parseCommandArgs handles explicit task/path flags and auto mode", () => {
   assert.deepEqual(parseCommandArgs("  reverse engineer this app  "), { mode: "auto", value: "reverse engineer this app" });
 });
 
+test("explicit path mode stays path-centric and does not offer task fallback", async () => {
+  const harness = createCommandHarness();
+  const handler = harness.handler("ralph");
+  const selectOptions: string[][] = [];
+  const ctx = {
+    cwd: createTempDir(),
+    hasUI: true,
+    ui: {
+      select: async (_title: string, options: string[]) => {
+        selectOptions.push(options);
+        return "Cancel";
+      },
+      input: async () => {
+        throw new Error("should not prompt for task text");
+      },
+      notify: () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => ({ cancelled: true }),
+    waitForIdle: async () => undefined,
+  };
+
+  await handler("--path reverse engineer auth", ctx);
+
+  assert.deepEqual(selectOptions, [["Draft in that folder", "Cancel"]]);
+});
+
 test("path detection and existing-target inspection distinguish runnable Ralph targets from arbitrary markdown", (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -157,8 +208,14 @@ test("path detection and existing-target inspection distinguish runnable Ralph t
   assert.equal(looksLikePath("auth-audit"), true);
   assert.equal(looksLikePath("README.md"), true);
   assert.equal(looksLikePath("foo/bar"), true);
+  assert.equal(looksLikePath("~draft"), false);
 
   assert.deepEqual(inspectExistingTarget("task", cwd), { kind: "run", ralphPath: join(cwd, "task", "RALPH.md") });
+  assert.deepEqual(inspectExistingTarget("reverse engineer auth", cwd, true), {
+    kind: "missing-path",
+    dirPath: join(cwd, "reverse engineer auth"),
+    ralphPath: join(cwd, "reverse engineer auth", "RALPH.md"),
+  });
   assert.deepEqual(inspectExistingTarget("README.md", cwd), { kind: "invalid-markdown", path: join(cwd, "README.md") });
   assert.deepEqual(inspectExistingTarget("package.json", cwd), { kind: "invalid-target", path: join(cwd, "package.json") });
   assert.deepEqual(inspectExistingTarget("empty", cwd), {
@@ -296,6 +353,47 @@ test("generated drafts reparse as valid RALPH files", () => {
   assert.match(reparsed.body, /\{\{ commands.git-log \}\}/);
   assert.match(reparsed.body, /\{\{ ralph.iteration \}\}/);
   assert.equal(extractDraftMetadata(draft.content)?.mode, "analysis");
+});
+
+test("generated draft starts fail closed when validation no longer passes", async () => {
+  const cwd = createTempDir();
+  const targetDir = join(cwd, "generated-draft");
+  const ralphPath = join(targetDir, "RALPH.md");
+  mkdirSync(targetDir, { recursive: true });
+  const draft = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "generated-draft", dirPath: targetDir, ralphPath },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+  writeFileSync(ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 0"), "utf8");
+
+  const notifications: Array<{ level: string; message: string }> = [];
+  const harness = createCommandHarness();
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ level, message }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => {
+        throw new Error("should not prompt");
+      },
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => {
+      throw new Error("should not start");
+    },
+    waitForIdle: async () => undefined,
+  };
+
+  await handler(`--path ${ralphPath}`, ctx);
+
+  assert.deepEqual(notifications, [{ level: "error", message: "Invalid RALPH.md: Invalid max_iterations: must be a positive finite integer" }]);
 });
 
 test("generateDraft creates metadata-rich analysis and fix drafts", () => {

@@ -191,8 +191,14 @@ async function editExistingDraft(ralphPath: string, ctx: any, saveMessage = "Sav
   }
 }
 
-async function chooseRecoveryMode(input: string, dirPath: string, ctx: any): Promise<"draft-path" | "task" | "cancel"> {
-  const choice = await ctx.ui.select(`No RALPH.md in ${displayPath(ctx.cwd, dirPath)}.`, ["Draft in that folder", "Treat as task text", "Cancel"]);
+async function chooseRecoveryMode(
+  input: string,
+  dirPath: string,
+  ctx: any,
+  allowTaskFallback = true,
+): Promise<"draft-path" | "task" | "cancel"> {
+  const options = allowTaskFallback ? ["Draft in that folder", "Treat as task text", "Cancel"] : ["Draft in that folder", "Cancel"];
+  const choice = await ctx.ui.select(`No RALPH.md in ${displayPath(ctx.cwd, dirPath)}.`, options);
   if (choice === "Draft in that folder") return "draft-path";
   if (choice === "Treat as task text") return "task";
   return "cancel";
@@ -245,6 +251,14 @@ export default function (pi: ExtensionAPI) {
   async function startRalphLoop(ralphPath: string, ctx: any) {
     let name: string;
     try {
+      const raw = readFileSync(ralphPath, "utf8");
+      if (shouldValidateExistingDraft(raw)) {
+        const draftError = validateDraftContent(raw);
+        if (draftError) {
+          ctx.ui.notify(`Invalid RALPH.md: ${draftError}`, "error");
+          return;
+        }
+      }
       const { frontmatter } = parseRalphMd(ralphPath);
       if (!validateFrontmatter(frontmatter, ctx)) return;
       name = basename(dirname(ralphPath));
@@ -402,8 +416,8 @@ export default function (pi: ExtensionAPI) {
       return draftFromTask(commandName, task, target, ctx);
     };
 
-    const handleExistingInspection = async (input: string): Promise<string | undefined> => {
-      const inspection = inspectExistingTarget(input, ctx.cwd);
+    const handleExistingInspection = async (input: string, explicitPath = false): Promise<string | undefined> => {
+      const inspection = inspectExistingTarget(input, ctx.cwd, explicitPath);
       switch (inspection.kind) {
         case "run":
           if (commandName === "ralph") return inspection.ralphPath;
@@ -421,7 +435,7 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify("Draft review requires an interactive session. Pass a task folder or RALPH.md path instead.", "warning");
             return undefined;
           }
-          const recovery = await chooseRecoveryMode(input, inspection.dirPath, ctx);
+          const recovery = await chooseRecoveryMode(input, inspection.dirPath, ctx, !explicitPath);
           if (recovery === "cancel") return undefined;
           if (recovery === "task") {
             return handleTaskFlow(input);
@@ -459,7 +473,7 @@ export default function (pi: ExtensionAPI) {
       return handleTaskFlow(parsed.value);
     }
     if (parsed.mode === "path") {
-      return handleExistingInspection(parsed.value || ".");
+      return handleExistingInspection(parsed.value || ".", true);
     }
     if (!parsed.value) {
       const inspection = inspectExistingTarget(".", ctx.cwd);
