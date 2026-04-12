@@ -1,4 +1,3 @@
-import { minimatch } from "minimatch";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -20,6 +19,7 @@ import {
   createSiblingTarget,
   findBlockedCommandPattern,
 } from "./ralph.ts";
+import { matchesProtectedPath } from "./secret-paths.ts";
 import type { CommandDef, CommandOutput, DraftPlan, DraftTarget, Frontmatter } from "./ralph.ts";
 import { createDraftPlan as createDraftPlanService } from "./ralph-draft.ts";
 import type { StrengthenDraftRuntime } from "./ralph-draft-llm.ts";
@@ -561,8 +561,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
     if (event.toolName === "write" || event.toolName === "edit") {
       const filePath = (event.input as { path?: string }).path ?? "";
-      for (const glob of persisted.guardrails?.protectedFiles ?? []) {
-        if (minimatch(filePath, glob, { matchBase: true })) return { block: true, reason: `ralph: ${filePath} is protected` };
+      if (matchesProtectedPath(filePath, persisted.guardrails?.protectedFiles ?? [])) {
+        return { block: true, reason: `ralph: ${filePath} is protected` };
       }
     }
   });

@@ -1,8 +1,10 @@
 import { basename } from "node:path";
+import { minimatch } from "minimatch";
 
 const SECRET_PATH_SEGMENTS = new Set(["secret", "secrets", "credential", "credentials", ".aws", ".ssh"]);
 const SECRET_BASENAMES = new Set([".npmrc", ".pypirc", ".netrc", "authorized_keys", "known_hosts", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]);
 const SECRET_SUFFIXES = [".pem", ".key", ".crt", ".cer", ".der", ".p12", ".pfx", ".jks", ".keystore", ".asc"];
+export const SECRET_PATH_POLICY_TOKEN = "policy:secret-bearing-paths";
 
 function toPosixPath(value: string): string {
   return value.replace(/\\/g, "/");
@@ -26,6 +28,14 @@ export function isSecretBearingPath(relativePath: string): boolean {
     SECRET_SUFFIXES.some((suffix) => normalizedName.endsWith(suffix)) ||
     normalizedName.includes("secret") ||
     normalizedName.includes("credential")
+  );
+}
+
+export function matchesProtectedPath(relativePath: string, protectedFiles: string[]): boolean {
+  return protectedFiles.some((pattern) =>
+    pattern === SECRET_PATH_POLICY_TOKEN
+      ? isSecretBearingPath(relativePath)
+      : minimatch(relativePath, pattern, { matchBase: true }),
   );
 }
 

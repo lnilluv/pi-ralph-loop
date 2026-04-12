@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { filterSecretBearingTopLevelNames, isSecretBearingTopLevelName } from "./secret-paths.ts";
+import { SECRET_PATH_POLICY_TOKEN, filterSecretBearingTopLevelNames, isSecretBearingPath, isSecretBearingTopLevelName } from "./secret-paths.ts";
 
 export type CommandDef = { name: string; run: string; timeout: number };
 export type DraftSource = "deterministic" | "llm-strengthened" | "fallback";
@@ -159,7 +159,7 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
   } else if (guardrails.blockCommands.length > 0) {
     labels.push(`blocks ${guardrails.blockCommands.length} command pattern${guardrails.blockCommands.length === 1 ? "" : "s"}`);
   }
-  if (guardrails.protectedFiles.some((pattern) => pattern.includes(".env") || pattern.includes("secret"))) {
+  if (guardrails.protectedFiles.some((pattern) => pattern === SECRET_PATH_POLICY_TOKEN || isSecretBearingPath(pattern))) {
     labels.push("blocks write/edit to secret files");
   } else if (guardrails.protectedFiles.length > 0) {
     labels.push(`blocks write/edit to ${guardrails.protectedFiles.length} file glob${guardrails.protectedFiles.length === 1 ? "" : "s"}`);
@@ -550,7 +550,7 @@ function extractVisibleTask(body: string): string | undefined {
 function buildDraftFrontmatter(mode: DraftMode, commands: CommandDef[]): Frontmatter {
   const guardrails = {
     blockCommands: ["git\\s+push"],
-    protectedFiles: mode === "analysis" ? [] : [".env*", "**/secrets/**"],
+    protectedFiles: mode === "analysis" ? [] : [SECRET_PATH_POLICY_TOKEN],
   };
   return {
     commands,

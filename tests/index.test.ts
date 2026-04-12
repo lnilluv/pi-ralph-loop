@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import registerRalphCommands from "../src/index.ts";
+import { SECRET_PATH_POLICY_TOKEN } from "../src/secret-paths.ts";
 import { generateDraft, slugifyTask, type DraftPlan, type DraftTarget } from "../src/ralph.ts";
 import type { StrengthenDraftRuntime } from "../src/ralph-draft-llm.ts";
 
@@ -40,8 +41,11 @@ function makeDraftPlan(task: string, target: DraftTarget, source: DraftPlan["sou
 
 function createHarness(options?: { createDraftPlan?: (...args: Array<any>) => Promise<DraftPlan> }) {
   const handlers = new Map<string, (args: string, ctx: any) => Promise<string | undefined>>();
+  const eventHandlers = new Map<string, (...args: Array<any>) => Promise<any> | any>();
   const pi = {
-    on: () => undefined,
+    on: (eventName: string, handler: (...args: Array<any>) => Promise<any> | any) => {
+      eventHandlers.set(eventName, handler);
+    },
     registerCommand: (name: string, spec: { handler: (args: string, ctx: any) => Promise<string | undefined> }) => {
       handlers.set(name, spec.handler);
     },
@@ -55,6 +59,11 @@ function createHarness(options?: { createDraftPlan?: (...args: Array<any>) => Pr
     handler(name: string) {
       const handler = handlers.get(name);
       assert.ok(handler, `missing handler for ${name}`);
+      return handler;
+    },
+    event(name: string) {
+      const handler = eventHandlers.get(name);
+      assert.ok(handler, `missing event handler for ${name}`);
       return handler;
     },
   };
@@ -368,4 +377,59 @@ test("/ralph-draft passes the active model runtime to the draft planner", async 
 
   assert.equal(draftCalls.length, 1);
   assert.equal(existsSync(target.ralphPath), true);
+});
+
+test("tool_call blocks write and edit for token-covered secret paths", async () => {
+  const harness = createHarness();
+  const toolCall = harness.event("tool_call");
+  const ctx = {
+    sessionManager: {
+      getEntries: () => [
+        {
+          type: "custom",
+          customType: "ralph-loop-state",
+          data: {
+            active: true,
+            sessionFile: "session-a",
+            guardrails: { blockCommands: [], protectedFiles: [SECRET_PATH_POLICY_TOKEN] },
+          },
+        },
+      ],
+      getSessionFile: () => "session-a",
+    },
+  };
+
+  for (const toolName of ["write", "edit"] as const) {
+    const result = await toolCall({ toolName, input: { path: ".ssh/config" } }, ctx);
+    assert.deepEqual(result, { block: true, reason: "ralph: .ssh/config is protected" });
+  }
+});
+
+test("tool_call keeps explicit protected-file globs working", async () => {
+  const harness = createHarness();
+  const toolCall = harness.event("tool_call");
+  const ctx = {
+    sessionManager: {
+      getEntries: () => [
+        {
+          type: "custom",
+          customType: "ralph-loop-state",
+          data: {
+            active: true,
+            sessionFile: "session-a",
+            guardrails: { blockCommands: [], protectedFiles: ["src/generated/**"] },
+          },
+        },
+      ],
+      getSessionFile: () => "session-a",
+    },
+  };
+
+  for (const toolName of ["write", "edit"] as const) {
+    const result = await toolCall({ toolName, input: { path: "src/generated/output.ts" } }, ctx);
+    assert.deepEqual(result, { block: true, reason: "ralph: src/generated/output.ts is protected" });
+  }
+
+  const allowed = await toolCall({ toolName: "write", input: { path: "src/app.ts" } }, ctx);
+  assert.equal(allowed, undefined);
 });

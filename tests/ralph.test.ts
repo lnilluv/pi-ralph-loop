@@ -29,6 +29,7 @@ import {
   validateDraftContent,
   validateFrontmatter,
 } from "../src/ralph.ts";
+import { SECRET_PATH_POLICY_TOKEN } from "../src/secret-paths.ts";
 import type { RepoSignals } from "../src/ralph.ts";
 import registerRalphCommands, { runCommands } from "../src/index.ts";
 
@@ -533,6 +534,7 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
     { slug: "reverse-engineer-this-app", dirPath: "/repo/reverse-engineer-this-app", ralphPath: "/repo/reverse-engineer-this-app/RALPH.md" },
     { packageManager: "npm", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
   );
+  const analysisParsed = parseRalphMarkdown(analysisDraft.content);
   assert.equal(analysisDraft.mode, "analysis");
   assert.equal(analysisDraft.source, "deterministic");
   assert.equal(extractDraftMetadata(analysisDraft.content)?.mode, "analysis");
@@ -540,6 +542,7 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   assert.match(analysisDraft.content, /Start with read-only inspection/);
   assert.match(analysisDraft.content, /\{\{ commands.repo-map \}\}/);
   assert.equal(analysisDraft.safetyLabel, "blocks git push");
+  assert.deepEqual(analysisParsed.frontmatter.guardrails.protectedFiles, []);
   assert.doesNotMatch(analysisDraft.content, /\*\*\/\*/);
   const analysisBrief = buildMissionBrief(analysisDraft);
   assert.match(analysisBrief, /- blocks git push/);
@@ -550,6 +553,7 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
     { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
     { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
   );
+  const fixParsed = parseRalphMarkdown(fixDraft.content);
   assert.equal(fixDraft.mode, "fix");
   assert.equal(fixDraft.source, "deterministic");
   assert.match(fixDraft.content, /If tests or lint are failing/);
@@ -557,6 +561,8 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   assert.match(fixDraft.content, /\{\{ commands.lint \}\}/);
   assert.equal(extractDraftMetadata(fixDraft.content)?.task, "Fix flaky auth tests");
   assertMetadataSource(extractDraftMetadata(fixDraft.content), "deterministic");
+  assert.deepEqual(fixParsed.frontmatter.guardrails.protectedFiles, [SECRET_PATH_POLICY_TOKEN]);
+  assert.match(fixDraft.safetyLabel, /secret files/);
 });
 
 test("generated draft metadata survives task text containing HTML comment markers", () => {
