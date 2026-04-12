@@ -495,6 +495,77 @@ test("validateDraftContent fails closed on YAML frontmatter that is not a mappin
   assert.equal(validateDraftContent("---\n- nope\n---\nBody"), "Invalid RALPH frontmatter: Frontmatter must be a YAML mapping");
 });
 
+test("inspectDraftContent and validateDraftContent fail closed on raw malformed frontmatter shapes and scalars", () => {
+  const makeRawDraft = (frontmatterLines: readonly string[]) => `---\n${frontmatterLines.join("\n")}\n---\nTask: Fix flaky auth tests\n\nKeep the change small.`;
+
+  for (const { label, raw, expectedError } of [
+    {
+      label: "commands mapping",
+      raw: makeRawDraft([
+        "commands:",
+        "  name: tests",
+        "  run: npm test",
+        "  timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands must be a YAML sequence",
+    },
+    {
+      label: "max_iterations boolean",
+      raw: makeRawDraft(["commands: []", "max_iterations: true", "timeout: 300"]),
+      expectedError: "Invalid RALPH frontmatter: max_iterations must be a YAML number",
+    },
+    {
+      label: "timeout boolean",
+      raw: makeRawDraft(["commands: []", "max_iterations: 2", "timeout: true"]),
+      expectedError: "Invalid RALPH frontmatter: timeout must be a YAML number",
+    },
+    {
+      label: "command name array",
+      raw: makeRawDraft([
+        "commands:",
+        "  - name:",
+        "      - build",
+        "    run: npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].name must be a YAML string",
+    },
+    {
+      label: "command run array",
+      raw: makeRawDraft([
+        "commands:",
+        "  - name: build",
+        "    run:",
+        "      - npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].run must be a YAML string",
+    },
+    {
+      label: "command timeout array",
+      raw: makeRawDraft([
+        "commands:",
+        "  - name: build",
+        "    run: npm test",
+        "    timeout:",
+        "      - 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].timeout must be a YAML number",
+    },
+  ] as const) {
+    assert.equal(inspectDraftContent(raw).error, expectedError, label);
+    assert.equal(validateDraftContent(raw), expectedError, label);
+  }
+});
+
 test("inspectDraftContent and validateDraftContent reject metadata-tagged generated drafts with malformed commands mappings", () => {
   const raw = makeStrengthenedDraft(
     [

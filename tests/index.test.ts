@@ -534,6 +534,75 @@ test("/ralph rejects raw malformed guardrails shapes before starting the loop", 
   }
 });
 
+test("/ralph rejects raw malformed max_iterations arrays before starting the loop", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const targetDir = join(cwd, "raw-invalid-max-iterations");
+  const ralphPath = join(targetDir, "RALPH.md");
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(
+    ralphPath,
+    [
+      "---",
+      "commands: []",
+      "max_iterations:",
+      "  - 2",
+      "timeout: 300",
+      "guardrails:",
+      "  block_commands: []",
+      "  protected_files: []",
+      "---",
+      "Task: Fix flaky auth tests",
+      "",
+      "Keep the change small.",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  let newSessionCalls = 0;
+  let execCalls = 0;
+  const harness = createHarness({
+    exec: async () => {
+      execCalls += 1;
+      return { killed: false, stdout: "ok", stderr: "" };
+    },
+  });
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => {
+        throw new Error("should not prompt");
+      },
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+    newSession: async () => {
+      newSessionCalls += 1;
+      return { cancelled: true };
+    },
+    waitForIdle: async () => {
+      throw new Error("should not reach the loop");
+    },
+  };
+
+  await handler(`--path ${ralphPath}`, ctx);
+
+  assert.equal(newSessionCalls, 0);
+  assert.equal(execCalls, 0);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.level, "error");
+  assert.match(notifications[0]?.message ?? "", /Invalid RALPH\.md: Invalid RALPH frontmatter: max_iterations must be a YAML number/);
+});
+
 test("/ralph re-validates raw draft content before each loop iteration", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));

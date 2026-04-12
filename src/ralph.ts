@@ -171,6 +171,50 @@ function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | nul
   return null;
 }
 
+function validateRawCommandEntryShape(command: unknown, index: number): string | null {
+  if (!isRecord(command)) {
+    return `Invalid RALPH frontmatter: commands[${index}] must be a YAML mapping`;
+  }
+  if (Object.prototype.hasOwnProperty.call(command, "name") && typeof command.name !== "string") {
+    return `Invalid RALPH frontmatter: commands[${index}].name must be a YAML string`;
+  }
+  if (Object.prototype.hasOwnProperty.call(command, "run") && typeof command.run !== "string") {
+    return `Invalid RALPH frontmatter: commands[${index}].run must be a YAML string`;
+  }
+  if (Object.prototype.hasOwnProperty.call(command, "timeout") && typeof command.timeout !== "number") {
+    return `Invalid RALPH frontmatter: commands[${index}].timeout must be a YAML number`;
+  }
+  return null;
+}
+
+function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | null {
+  if (Object.prototype.hasOwnProperty.call(rawFrontmatter, "commands")) {
+    const commands = rawFrontmatter.commands;
+    if (!Array.isArray(commands)) {
+      return "Invalid RALPH frontmatter: commands must be a YAML sequence";
+    }
+    for (const [index, command] of commands.entries()) {
+      const commandError = validateRawCommandEntryShape(command, index);
+      if (commandError) return commandError;
+    }
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(rawFrontmatter, "max_iterations") &&
+    (typeof rawFrontmatter.max_iterations !== "number" || !Number.isFinite(rawFrontmatter.max_iterations))
+  ) {
+    return "Invalid RALPH frontmatter: max_iterations must be a YAML number";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(rawFrontmatter, "timeout") &&
+    (typeof rawFrontmatter.timeout !== "number" || !Number.isFinite(rawFrontmatter.timeout))
+  ) {
+    return "Invalid RALPH frontmatter: timeout must be a YAML number";
+  }
+
+  return null;
+}
+
 function parseStrictRalphMarkdown(raw: string): { parsed: ParsedRalph; rawFrontmatter: UnknownRecord } | { error: string } {
   const normalized = normalizeRawRalph(raw);
   const match = matchRalphMarkdown(normalized);
@@ -193,11 +237,12 @@ function parseStrictRalphMarkdown(raw: string): { parsed: ParsedRalph; rawFrontm
     return { error: guardrailsError };
   }
 
-  return { parsed: parseRalphMarkdown(normalized), rawFrontmatter: parsedYaml };
-}
+  const rawShapeError = validateRawFrontmatterShape(parsedYaml);
+  if (rawShapeError) {
+    return { error: rawShapeError };
+  }
 
-function hasMalformedStrengthenedCommandsShape(rawFrontmatter: UnknownRecord): boolean {
-  return !Array.isArray(rawFrontmatter.commands);
+  return { parsed: parseRalphMarkdown(normalized), rawFrontmatter: parsedYaml };
 }
 
 function normalizeMissingMarkdownTarget(absoluteTarget: string): { dirPath: string; ralphPath: string } {
@@ -423,10 +468,6 @@ export function acceptStrengthenedDraft(request: DraftRequest, strengthenedDraft
   const baseline = parseStrictRalphMarkdown(request.baselineDraft);
   const strengthened = parseStrictRalphMarkdown(strengthenedDraft);
   if ("error" in baseline || "error" in strengthened) {
-    return null;
-  }
-
-  if (hasMalformedStrengthenedCommandsShape(strengthened.rawFrontmatter)) {
     return null;
   }
 
@@ -802,7 +843,7 @@ export function normalizeStrengthenedDraft(request: DraftRequest, strengthenedDr
   const strengthened = parseStrictRalphMarkdown(strengthenedDraft);
 
   if (scope === "body-only") {
-    if ("error" in strengthened || hasMalformedStrengthenedCommandsShape(strengthened.rawFrontmatter) || validateFrontmatter(strengthened.parsed.frontmatter)) {
+    if ("error" in strengthened || validateFrontmatter(strengthened.parsed.frontmatter)) {
       return renderDraftPlan(request.task, request.mode, request.target, baseline.frontmatter, "llm-strengthened", baseline.body);
     }
 
@@ -874,10 +915,6 @@ export function inspectDraftContent(raw: string): DraftContentInspection {
   const rawCompletionPromise = parseCompletionPromiseValue(parsed.rawFrontmatter);
   if (rawCompletionPromise.invalid) {
     return { metadata, parsed: parsed.parsed, error: "Invalid completion_promise: must be a single-line string without line breaks or angle brackets" };
-  }
-
-  if (metadata && hasMalformedStrengthenedCommandsShape(parsed.rawFrontmatter)) {
-    return { metadata, parsed: parsed.parsed, error: "Invalid RALPH frontmatter: commands must be a YAML sequence" };
   }
 
   const error = validateFrontmatter(parsed.parsed.frontmatter);
