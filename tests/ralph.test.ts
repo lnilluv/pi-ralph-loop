@@ -4,12 +4,16 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
+  buildDraftRequest,
   buildMissionBrief,
+  buildRepoContext,
   classifyTaskMode,
   createSiblingTarget,
   defaultFrontmatter,
   extractDraftMetadata,
   generateDraft,
+  isWeakStrengthenedDraft,
+  normalizeStrengthenedDraft,
   inspectExistingTarget,
   inspectRepo,
   looksLikePath,
@@ -25,10 +29,15 @@ import {
   validateDraftContent,
   validateFrontmatter,
 } from "../src/ralph.ts";
+import type { RepoSignals } from "../src/ralph.ts";
 import registerRalphCommands, { runCommands } from "../src/index.ts";
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-loop-"));
+}
+
+function encodeMetadata(metadata: Record<string, unknown>): string {
+  return `<!-- pi-ralph-loop: ${encodeURIComponent(JSON.stringify(metadata))} -->`;
 }
 
 function createCommandHarness() {
@@ -51,6 +60,13 @@ function createCommandHarness() {
       return handler;
     },
   };
+}
+
+function assertMetadataSource(metadata: ReturnType<typeof extractDraftMetadata>, expected: "deterministic" | "llm-strengthened" | "fallback") {
+  if (!metadata || !("source" in metadata)) {
+    assert.fail("Expected draft metadata with a source");
+  }
+  assert.equal(metadata.source, expected);
 }
 
 test("parseRalphMarkdown falls back to default frontmatter when no frontmatter is present", () => {
@@ -334,6 +350,8 @@ test("generated drafts reparse as valid RALPH files", () => {
 
   const reparsed = parseRalphMarkdown(draft.content);
   assert.equal(validateFrontmatter(reparsed.frontmatter), null);
+  assert.equal(draft.source, "deterministic");
+  assertMetadataSource(extractDraftMetadata(draft.content), "deterministic");
   assert.deepEqual(reparsed.frontmatter.commands, [
     { name: "git-log", run: "git log --oneline -10", timeout: 20 },
     { name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20 },
@@ -353,6 +371,119 @@ test("generated drafts reparse as valid RALPH files", () => {
   assert.match(reparsed.body, /\{\{ commands.git-log \}\}/);
   assert.match(reparsed.body, /\{\{ ralph.iteration \}\}/);
   assert.equal(extractDraftMetadata(draft.content)?.mode, "analysis");
+  assertMetadataSource(extractDraftMetadata(draft.content), "deterministic");
+});
+
+test("extractDraftMetadata accepts Phase 1 and Phase 2 metadata", () => {
+  const phase1 = `${encodeMetadata({ generator: "pi-ralph-loop", version: 1, task: "Fix flaky auth tests", mode: "fix" })}\n---\ncommands: []\nmax_iterations: 25\ntimeout: 300\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody`;
+  const phase2 = `${encodeMetadata({ generator: "pi-ralph-loop", version: 2, source: "llm-strengthened", task: "Fix flaky auth tests", mode: "fix" })}\n---\ncommands: []\nmax_iterations: 25\ntimeout: 300\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody`;
+
+  assert.deepEqual(extractDraftMetadata(phase1), {
+    generator: "pi-ralph-loop",
+    version: 1,
+    task: "Fix flaky auth tests",
+    mode: "fix",
+  });
+  assert.deepEqual(extractDraftMetadata(phase2), {
+    generator: "pi-ralph-loop",
+    version: 2,
+    source: "llm-strengthened",
+    task: "Fix flaky auth tests",
+    mode: "fix",
+  });
+});
+
+test("buildDraftRequest tags deterministic command intents and seeds a baseline draft", () => {
+  const repoSignals: RepoSignals = { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] };
+  const repoContext = buildRepoContext(repoSignals);
+  const request = buildDraftRequest(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    repoSignals,
+    repoContext,
+  );
+
+  assert.equal(request.mode, "fix");
+  assert.deepEqual(request.repoSignals, repoSignals);
+  assert.deepEqual(request.repoContext, repoContext);
+  assert.deepEqual(request.repoContext.selectedFiles, [{ path: "package.json", content: "", reason: "top-level file" }]);
+  assert.deepEqual(
+    request.commandIntent.map(({ name, source }) => ({ name, source })),
+    [
+      { name: "tests", source: "repo-signal" },
+      { name: "lint", source: "repo-signal" },
+      { name: "git-log", source: "heuristic" },
+    ],
+  );
+  assertMetadataSource(extractDraftMetadata(request.baselineDraft), "deterministic");
+  assert.ok(request.baselineDraft.length > 0);
+});
+
+test("normalizeStrengthenedDraft keeps deterministic frontmatter in body-only mode", () => {
+  const request = buildDraftRequest(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+    { summaryLines: ["repo summary"], selectedFiles: [{ path: "package.json", content: "", reason: "top-level file" }] },
+  );
+  const baseline = parseRalphMarkdown(request.baselineDraft);
+  const strengthenedDraft = `${encodeMetadata({ generator: "pi-ralph-loop", version: 2, source: "llm-strengthened", task: "Fix flaky auth tests", mode: "fix" })}\n---\ncommands:\n  - name: rogue\n    run: rm -rf /\n    timeout: 1\nmax_iterations: 1\ntimeout: 1\nguardrails:\n  block_commands:\n    - allow-all\n  protected_files:\n    - tmp/**\n---\nTask: Fix flaky auth tests\n\nRead-only enforced and write protection is enforced.`;
+
+  const normalized = normalizeStrengthenedDraft(request, strengthenedDraft, "body-only");
+  const reparsed = parseRalphMarkdown(normalized.content);
+
+  assert.deepEqual(reparsed.frontmatter.commands, baseline.frontmatter.commands);
+  assert.deepEqual(reparsed.frontmatter.guardrails, baseline.frontmatter.guardrails);
+  assert.equal(reparsed.body.trimStart(), "Task: Fix flaky auth tests\n\nRead-only enforced and write protection is enforced.");
+  assert.deepEqual(extractDraftMetadata(normalized.content), {
+    generator: "pi-ralph-loop",
+    version: 2,
+    source: "llm-strengthened",
+    task: "Fix flaky auth tests",
+    mode: "fix",
+  });
+});
+
+test("normalizeStrengthenedDraft applies strengthened commands in body-and-commands mode", () => {
+  const request = buildDraftRequest(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+    { summaryLines: ["repo summary"], selectedFiles: [{ path: "package.json", content: "", reason: "top-level file" }] },
+  );
+  const strengthenedDraft = `${encodeMetadata({ generator: "pi-ralph-loop", version: 2, source: "llm-strengthened", task: "Fix flaky auth tests", mode: "fix" })}\n---\ncommands:\n  - name: smoke\n    run: npm run smoke\n    timeout: 45\nmax_iterations: 7\ntimeout: 120\nguardrails:\n  block_commands:\n    - git\\s+push\n  protected_files:\n    - .env*\n---\nTask: Fix flaky auth tests\n\nUse the smoke check and keep the output concise.`;
+
+  const normalized = normalizeStrengthenedDraft(request, strengthenedDraft, "body-and-commands");
+  const reparsed = parseRalphMarkdown(normalized.content);
+
+  assert.deepEqual(reparsed.frontmatter.commands, [{ name: "smoke", run: "npm run smoke", timeout: 45 }]);
+  assert.equal(reparsed.frontmatter.maxIterations, 7);
+  assert.deepEqual(reparsed.frontmatter.guardrails, { blockCommands: ["git\\s+push"], protectedFiles: [".env*"] });
+  assert.match(reparsed.body, /Use the smoke check and keep the output concise\./);
+  assert.deepEqual(extractDraftMetadata(normalized.content), {
+    generator: "pi-ralph-loop",
+    version: 2,
+    source: "llm-strengthened",
+    task: "Fix flaky auth tests",
+    mode: "fix",
+  });
+});
+
+test("isWeakStrengthenedDraft rejects unchanged bodies and fake runtime enforcement claims", () => {
+  const request = buildDraftRequest(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+    { summaryLines: ["repo summary"], selectedFiles: [{ path: "package.json", content: "", reason: "top-level file" }] },
+  );
+  const baselineBody = parseRalphMarkdown(request.baselineDraft).body;
+  const unchangedBody = baselineBody;
+  const changedBody = `${baselineBody}\n\nAdd concrete verification steps.`;
+
+  assert.equal(isWeakStrengthenedDraft(baselineBody, "analysis text", unchangedBody), true);
+  assert.equal(isWeakStrengthenedDraft(baselineBody, "read-only enforced", changedBody), true);
+  assert.equal(isWeakStrengthenedDraft(baselineBody, "analysis text", `write protection is enforced\n\n${changedBody}`), true);
+  assert.equal(isWeakStrengthenedDraft(baselineBody, "analysis text", changedBody), false);
 });
 
 test("generated draft starts fail closed when validation no longer passes", async () => {
@@ -403,7 +534,9 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
     { packageManager: "npm", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
   );
   assert.equal(analysisDraft.mode, "analysis");
+  assert.equal(analysisDraft.source, "deterministic");
   assert.equal(extractDraftMetadata(analysisDraft.content)?.mode, "analysis");
+  assertMetadataSource(extractDraftMetadata(analysisDraft.content), "deterministic");
   assert.match(analysisDraft.content, /Start with read-only inspection/);
   assert.match(analysisDraft.content, /\{\{ commands.repo-map \}\}/);
   assert.equal(analysisDraft.safetyLabel, "blocks git push");
@@ -418,10 +551,12 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
     { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
   );
   assert.equal(fixDraft.mode, "fix");
+  assert.equal(fixDraft.source, "deterministic");
   assert.match(fixDraft.content, /If tests or lint are failing/);
   assert.match(fixDraft.content, /\{\{ commands.tests \}\}/);
   assert.match(fixDraft.content, /\{\{ commands.lint \}\}/);
   assert.equal(extractDraftMetadata(fixDraft.content)?.task, "Fix flaky auth tests");
+  assertMetadataSource(extractDraftMetadata(fixDraft.content), "deterministic");
 });
 
 test("generated draft metadata survives task text containing HTML comment markers", () => {
