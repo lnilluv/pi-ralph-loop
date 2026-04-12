@@ -133,7 +133,7 @@ Apply the smallest safe fix and explain why it works.
 | `{{ ralph.iteration }}` | Current 1-based iteration number |
 | `{{ ralph.name }}` | Directory name containing the `RALPH.md` |
 
-HTML comments (`<!-- ... -->`) are stripped from the prompt body after placeholder resolution, so you can annotate your `RALPH.md` freely.
+HTML comments (`<!-- ... -->`) are stripped from the prompt body after placeholder resolution, so you can annotate your `RALPH.md` freely. Generated-draft metadata is stored in a URL-encoded leading HTML comment so task text can safely contain comment-like sequences.
 
 ## Commands
 
