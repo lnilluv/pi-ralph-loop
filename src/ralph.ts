@@ -307,7 +307,6 @@ export function looksLikePath(value: string): boolean {
   return (
     trimmed.startsWith(".") ||
     trimmed.startsWith("/") ||
-    trimmed.startsWith("~") ||
     trimmed.includes("\\") ||
     trimmed.includes("/") ||
     trimmed.endsWith(".md") ||
@@ -329,7 +328,7 @@ export function resolveRalphTargetResolution(args: string, cwd: string): RalphTa
   };
 }
 
-export function inspectExistingTarget(input: string, cwd: string): ExistingTargetInspection {
+export function inspectExistingTarget(input: string, cwd: string, explicitPath = false): ExistingTargetInspection {
   const resolution = resolveRalphTargetResolution(input, cwd);
   const absoluteTarget = resolution.absoluteTarget;
   const markdownPath = resolution.markdownPath;
@@ -350,7 +349,7 @@ export function inspectExistingTarget(input: string, cwd: string): ExistingTarge
     return { kind: "invalid-target", path: absoluteTarget };
   }
 
-  if (!looksLikePath(input)) {
+  if (!explicitPath && !looksLikePath(input)) {
     return { kind: "not-path" };
   }
 
