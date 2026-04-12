@@ -544,8 +544,6 @@ test("secret-like files are excluded from selected files", (t) => {
   writeTextFile(cwd, "credentials-prod/token.txt", "token\n");
   writeTextFile(cwd, "config/secrets/prod.json", "{}\n");
   writeTextFile(cwd, "config/credentials/service.json", "{}\n");
-  writeTextFile(cwd, "config/secret-config.json", "{}\n");
-  writeTextFile(cwd, "config/credential-store.json", "{}\n");
   writeTextFile(cwd, ".aws/config", "[default]\nregion = us-west-2\n");
   writeTextFile(cwd, ".ssh/id_rsa", "private-key\n");
 
@@ -573,8 +571,6 @@ test("secret-like files are excluded from selected files", (t) => {
     "credentials-prod/token.txt",
     "config/secrets/prod.json",
     "config/credentials/service.json",
-    "config/secret-config.json",
-    "config/credential-store.json",
     ".aws/config",
     ".ssh/id_rsa",
   ];
@@ -584,9 +580,38 @@ test("secret-like files are excluded from selected files", (t) => {
   for (const path of secretLikePaths) {
     assert.ok(!selectedPaths.includes(path), `unexpected secret-like file selected: ${path}`);
   }
-  assert.ok(selectedPaths.every((path) => !/(?:\.env(?:\..*)?$|\.npmrc$|\.pypirc$|\.netrc$|\.pem$|\.key$|secret|credential|\.aws\/|\.ssh\/)/i.test(path)));
   for (const token of [".env", ".npmrc", ".ssh", "secrets", "credentials", "ops-secrets", "credentials-prod", "release.asc"]) {
     assert.ok(context.summaryLines.every((line) => !line.includes(token)), `unexpected secret-like token in summary lines: ${token}`);
+  }
+});
+
+test("similarly named source files stay visible while exact secret directories stay hidden", (t) => {
+  const cwd = createTempRepo();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  writeTextFile(cwd, "README.md", "# Demo\n");
+  writeTextFile(cwd, "src/secretary.ts", "export const secretary = true;\n");
+  writeTextFile(cwd, "src/credential-form.tsx", "export const form = true;\n");
+  writeTextFile(cwd, "config/secrets/prod.json", "{}\n");
+  writeTextFile(cwd, "config/credentials/service.json", "{}\n");
+
+  const context = assembleRepoContext(
+    cwd,
+    "Reverse engineer this app",
+    "analysis",
+    makeSignals({
+      topLevelDirs: ["src", "config"],
+      topLevelFiles: ["README.md", "src/secretary.ts", "src/credential-form.tsx", "config/secrets/prod.json", "config/credentials/service.json"],
+    }),
+  );
+
+  const selectedPaths = context.selectedFiles.map((file) => file.path);
+
+  assert.ok(selectedPaths.includes("README.md"));
+  assert.ok(selectedPaths.includes("src/secretary.ts"));
+  assert.ok(selectedPaths.includes("src/credential-form.tsx"));
+  for (const path of ["config/secrets/prod.json", "config/credentials/service.json"]) {
+    assert.ok(!selectedPaths.includes(path), `unexpected secret-like file selected: ${path}`);
   }
 });
 

@@ -27,6 +27,7 @@ import type { StrengthenDraftRuntime } from "./ralph-draft-llm.ts";
 type LoopState = {
   active: boolean;
   ralphPath: string;
+  cwd: string;
   iteration: number;
   maxIterations: number;
   timeout: number;
@@ -39,6 +40,7 @@ type LoopState = {
 type PersistedLoopState = {
   active: boolean;
   sessionFile?: string;
+  cwd?: string;
   iteration?: number;
   maxIterations?: number;
   iterationSummaries?: Array<{ iteration: number; duration: number }>;
@@ -135,6 +137,7 @@ function defaultLoopState(): LoopState {
     iterationSummaries: [],
     guardrails: { blockCommands: [], protectedFiles: [] },
     loopSessionFile: undefined,
+    cwd: "",
   };
 }
 
@@ -321,6 +324,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       loopState = {
         active: true,
         ralphPath,
+        cwd: ctx.cwd,
         iteration: 0,
         maxIterations: frontmatter.maxIterations,
         timeout: frontmatter.timeout,
@@ -381,6 +385,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         persistLoopState(pi, {
           active: true,
           sessionFile: loopState.loopSessionFile,
+          cwd: loopState.cwd,
           iteration: loopState.iteration,
           maxIterations: loopState.maxIterations,
           iterationSummaries: loopState.iterationSummaries,
@@ -459,7 +464,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       loopState.stopRequested = false;
       loopState.loopSessionFile = undefined;
       ctx.ui.setStatus("ralph", undefined);
-      persistLoopState(pi, { active: false });
+      persistLoopState(pi, { active: false, cwd: loopState.cwd });
     }
   }
 
@@ -561,7 +566,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
     if (event.toolName === "write" || event.toolName === "edit") {
       const filePath = (event.input as { path?: string }).path ?? "";
-      if (matchesProtectedPath(filePath, persisted.guardrails?.protectedFiles ?? [])) {
+      if (matchesProtectedPath(filePath, persisted.guardrails?.protectedFiles ?? [], persisted.cwd)) {
         return { block: true, reason: `ralph: ${filePath} is protected` };
       }
     }

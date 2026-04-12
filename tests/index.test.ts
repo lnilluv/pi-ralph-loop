@@ -405,6 +405,35 @@ test("tool_call blocks write and edit for token-covered secret paths", async () 
   }
 });
 
+test("tool_call blocks absolute write paths against repo-relative protected globs", async () => {
+  const harness = createHarness();
+  const toolCall = harness.event("tool_call");
+  const cwd = "/repo/project";
+  const absolutePath = join(cwd, "src", "generated", "output.ts");
+  const ctx = {
+    sessionManager: {
+      getEntries: () => [
+        {
+          type: "custom",
+          customType: "ralph-loop-state",
+          data: {
+            active: true,
+            sessionFile: "session-a",
+            cwd,
+            guardrails: { blockCommands: [], protectedFiles: ["src/generated/**"] },
+          },
+        },
+      ],
+      getSessionFile: () => "session-a",
+    },
+  };
+
+  for (const toolName of ["write", "edit"] as const) {
+    const result = await toolCall({ toolName, input: { path: absolutePath } }, ctx);
+    assert.deepEqual(result, { block: true, reason: `ralph: ${absolutePath} is protected` });
+  }
+});
+
 test("tool_call keeps explicit protected-file globs working", async () => {
   const harness = createHarness();
   const toolCall = harness.event("tool_call");
