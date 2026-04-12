@@ -207,6 +207,28 @@ test("buildStrengtheningPrompt omits .env* top-level repo names from repo signal
   assert.match(text, /package\.json/);
 });
 
+test("buildStrengtheningPrompt redacts secret-bearing target paths", () => {
+  const request = makeRequest();
+
+  for (const [ralphPath, leakedPrefix] of [
+    ["/repo/config/secrets/task/RALPH.md", "/repo/config/secrets/task"],
+    ["/repo/credentials/task/RALPH.md", "/repo/credentials/task"],
+  ] as const) {
+    const prompt = buildStrengtheningPrompt(
+      {
+        ...request,
+        target: { ...request.target, ralphPath },
+      },
+      "body-only",
+    );
+    const text = promptText(prompt);
+
+    assert.ok(!text.includes(ralphPath), `unexpected leaked target path in prompt: ${ralphPath}`);
+    assert.ok(!text.includes(leakedPrefix), `unexpected leaked target path prefix in prompt: ${ralphPath}`);
+    assert.match(text, /Target file: RALPH\.md/);
+  }
+});
+
 test("strengthenDraftWithLlm falls back when the selected model is missing", async () => {
   const request = makeRequest();
   const result = await strengthenDraftWithLlm(request, makeRuntime({ model: undefined }), {

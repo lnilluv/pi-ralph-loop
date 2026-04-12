@@ -1,4 +1,5 @@
 import { complete, type AssistantMessage, type Context, type Model } from "@mariozechner/pi-ai";
+import { basename } from "node:path";
 import {
   filterSecretBearingTopLevelNames,
   normalizeStrengthenedDraft,
@@ -149,7 +150,7 @@ function buildStrengtheningPromptText(request: DraftRequest, scope: DraftStrengt
   return [
     `Task: ${request.task}`,
     `Inferred mode: ${request.mode}`,
-    `Target path: ${request.target.ralphPath}`,
+    `Target file: ${basename(request.target.ralphPath)}`,
     `Strengthening scope: ${scope}`,
     "",
     "Repo signals summary:",
