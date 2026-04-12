@@ -118,9 +118,9 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
     labels.push(`blocks ${guardrails.blockCommands.length} command pattern${guardrails.blockCommands.length === 1 ? "" : "s"}`);
   }
   if (guardrails.protectedFiles.some((pattern) => pattern.includes(".env") || pattern.includes("secret"))) {
-    labels.push("protects secret files");
+    labels.push("blocks write/edit to secret files");
   } else if (guardrails.protectedFiles.length > 0) {
-    labels.push(`protects ${guardrails.protectedFiles.length} file glob${guardrails.protectedFiles.length === 1 ? "" : "s"}`);
+    labels.push(`blocks write/edit to ${guardrails.protectedFiles.length} file glob${guardrails.protectedFiles.length === 1 ? "" : "s"}`);
   }
   return labels.length > 0 ? labels.join(" and ") : "No extra safety rules";
 }
@@ -207,6 +207,10 @@ function bodySection(title: string, placeholder: string): string {
   return `${title}:\n${placeholder}`;
 }
 
+function escapeHtmlCommentMarkers(text: string): string {
+  return text.replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
+}
+
 export function defaultFrontmatter(): Frontmatter {
   return { commands: [], maxIterations: 50, timeout: 300, guardrails: { blockCommands: [], protectedFiles: [] } };
 }
@@ -274,6 +278,17 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
     }
   }
   return null;
+}
+
+export function findBlockedCommandPattern(command: string, blockPatterns: string[]): string | undefined {
+  for (const pattern of blockPatterns) {
+    try {
+      if (new RegExp(pattern).test(command)) return pattern;
+    } catch {
+      // ignore malformed regexes; validateFrontmatter should catch these first
+    }
+  }
+  return undefined;
 }
 
 export function parseCommandArgs(raw: string): CommandArgs {
@@ -465,7 +480,7 @@ export function generateDraft(task: string, target: DraftTarget, signals: RepoSi
   const body =
     mode === "analysis"
       ? [
-          `Task: ${task}`,
+          `Task: ${escapeHtmlCommentMarkers(task)}`,
           "",
           ...commandSections,
           "",
@@ -475,7 +490,7 @@ export function generateDraft(task: string, target: DraftTarget, signals: RepoSi
           "Iteration {{ ralph.iteration }} of {{ ralph.name }}.",
         ].join("\n")
       : [
-          `Task: ${task}`,
+          `Task: ${escapeHtmlCommentMarkers(task)}`,
           "",
           ...commandSections,
           "",

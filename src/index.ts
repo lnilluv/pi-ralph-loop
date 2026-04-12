@@ -20,6 +20,7 @@ import {
   validateDraftContent,
   validateFrontmatter as validateFrontmatterMessage,
   createSiblingTarget,
+  findBlockedCommandPattern,
 } from "./ralph.ts";
 import type { CommandDef, CommandOutput, DraftTarget, Frontmatter } from "./ralph.ts";
 
@@ -58,9 +59,15 @@ function validateFrontmatter(fm: Frontmatter, ctx: any): boolean {
   return true;
 }
 
-async function runCommands(commands: CommandDef[], pi: ExtensionAPI): Promise<CommandOutput[]> {
+export async function runCommands(commands: CommandDef[], blockPatterns: string[], pi: ExtensionAPI): Promise<CommandOutput[]> {
   const results: CommandOutput[] = [];
   for (const cmd of commands) {
+    const blockedPattern = findBlockedCommandPattern(cmd.run, blockPatterns);
+    if (blockedPattern) {
+      results.push({ name: cmd.name, output: `[blocked by guardrail: ${blockedPattern}]` });
+      continue;
+    }
+
     try {
       const result = await pi.exec("bash", ["-c", cmd.run], { timeout: cmd.timeout * 1000 });
       results.push(
@@ -282,7 +289,7 @@ export default function (pi: ExtensionAPI) {
         loopState.completionPromise = fm.completionPromise;
         loopState.guardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
 
-        const outputs = await runCommands(fm.commands, pi);
+        const outputs = await runCommands(fm.commands, fm.guardrails.blockCommands, pi);
         const body = renderRalphBody(rawBody, outputs, { iteration: i, name });
         const prompt = renderIterationPrompt(body, i, loopState.maxIterations);
 
@@ -477,13 +484,8 @@ export default function (pi: ExtensionAPI) {
 
     if (event.toolName === "bash") {
       const cmd = (event.input as { command?: string }).command ?? "";
-      for (const pattern of persisted.guardrails?.blockCommands ?? []) {
-        try {
-          if (new RegExp(pattern).test(cmd)) return { block: true, reason: `ralph: blocked (${pattern})` };
-        } catch {
-          // ignore malformed persisted regex
-        }
-      }
+      const blockedPattern = findBlockedCommandPattern(cmd, persisted.guardrails?.blockCommands ?? []);
+      if (blockedPattern) return { block: true, reason: `ralph: blocked (${blockedPattern})` };
     }
 
     if (event.toolName === "write" || event.toolName === "edit") {

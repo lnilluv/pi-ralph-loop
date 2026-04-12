@@ -25,6 +25,7 @@ import {
   validateDraftContent,
   validateFrontmatter,
 } from "../src/ralph.ts";
+import { runCommands } from "../src/index.ts";
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-loop-"));
@@ -83,6 +84,31 @@ test("validateFrontmatter accepts valid input and rejects invalid values", () =>
     validateFrontmatter(parseRalphMarkdown("---\ncommands:\n  - nope\n  - null\n---\nbody").frontmatter),
     "Invalid command entry at index 0",
   );
+});
+
+test("runCommands skips blocked commands before shelling out", async () => {
+  const calls: string[] = [];
+  const pi = {
+    exec: async (_tool: string, args: string[]) => {
+      calls.push(args.join(" "));
+      return { killed: false, stdout: "allowed", stderr: "" };
+    },
+  } as any;
+
+  const outputs = await runCommands(
+    [
+      { name: "blocked", run: "git push origin main", timeout: 1 },
+      { name: "allowed", run: "echo ok", timeout: 1 },
+    ],
+    ["git\\s+push"],
+    pi,
+  );
+
+  assert.deepEqual(outputs, [
+    { name: "blocked", output: "[blocked by guardrail: git\\s+push]" },
+    { name: "allowed", output: "allowed" },
+  ]);
+  assert.deepEqual(calls, ["-c echo ok"]);
 });
 
 test("legacy RALPH.md drafts bypass the generated-draft validation gate", () => {
@@ -300,8 +326,8 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   assert.equal(extractDraftMetadata(fixDraft.content)?.task, "Fix flaky auth tests");
 });
 
-test("generated draft metadata survives task text containing comment-breaking content", () => {
-  const task = "Reverse engineer the parser --> and document the edge case";
+test("generated draft metadata survives task text containing HTML comment markers", () => {
+  const task = "Reverse engineer the parser <!-- tricky --> and document the edge case";
   const draft = generateDraft(
     task,
     {
@@ -311,10 +337,15 @@ test("generated draft metadata survives task text containing comment-breaking co
     },
     { packageManager: "npm", hasGit: false, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
   );
+  const parsed = parseRalphMarkdown(draft.content);
 
   assert.equal(extractDraftMetadata(draft.content)?.task, task);
   assert.equal(validateDraftContent(draft.content), null);
-  assert.match(draft.content, /Task: Reverse engineer the parser --> and document the edge case/);
+  assert.match(draft.content, /Task: Reverse engineer the parser &lt;!-- tricky --&gt; and document the edge case/);
+  assert.match(parsed.body, /Task: Reverse engineer the parser &lt;!-- tricky --&gt; and document the edge case/);
+  const rendered = renderRalphBody(parsed.body, [], { iteration: 1, name: "ralph" });
+  assert.match(rendered, /Task: Reverse engineer the parser &lt;!-- tricky --&gt; and document the edge case/);
+  assert.doesNotMatch(rendered, /<!-- tricky -->/);
 });
 
 test("buildMissionBrief refreshes after draft edits", () => {

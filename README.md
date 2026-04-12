@@ -123,7 +123,7 @@ Apply the smallest safe fix and explain why it works.
 | `timeout` | number | `300` | Per-iteration timeout in seconds; stops the loop if the agent is stuck |
 | `completion_promise` | string | — | Agent signals completion by sending `<promise>DONE</promise>`; loop breaks on match |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns to block in bash |
-| `guardrails.protected_files` | string[] | `[]` | Glob patterns to block writes |
+| `guardrails.protected_files` | string[] | `[]` | Glob patterns enforced on `write`/`edit` tool calls |
 
 ### Placeholders
 
@@ -133,7 +133,7 @@ Apply the smallest safe fix and explain why it works.
 | `{{ ralph.iteration }}` | Current 1-based iteration number |
 | `{{ ralph.name }}` | Directory name containing the `RALPH.md` |
 
-HTML comments (`<!-- ... -->`) are stripped from the prompt body after placeholder resolution, so you can annotate your `RALPH.md` freely. Generated-draft metadata is stored in a URL-encoded leading HTML comment so task text can safely contain comment-like sequences.
+HTML comments (`<!-- ... -->`) are stripped from the prompt body after placeholder resolution, so you can annotate your `RALPH.md` freely. Generated drafts also escape literal `<!--` and `-->` in the visible task line, and the leading metadata comment is URL-encoded so task text can safely contain comment-like sequences.
 
 ## Commands
 
@@ -145,7 +145,7 @@ HTML comments (`<!-- ... -->`) are stripped from the prompt body after placehold
 
 ### Guardrails
 
-`guardrails.block_commands` and `guardrails.protected_files` come from RALPH frontmatter. The extension enforces them in the `tool_call` hook — but only for sessions created by the loop, so they don't leak into unrelated conversations. Matching bash commands are blocked, and writes/edits to protected file globs are denied.
+`guardrails.block_commands` and `guardrails.protected_files` come from RALPH frontmatter. The extension enforces them in the `tool_call` hook — but only for sessions created by the loop, so they don't leak into unrelated conversations. Matching bash commands are blocked, and `write`/`edit` tool calls targeting protected file globs are denied.
 
 ### Cross-iteration memory
 
