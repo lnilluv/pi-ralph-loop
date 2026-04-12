@@ -49,9 +49,8 @@ That saves the draft but does not launch the loop.
 
 ### Smart drafting
 
-### Smart drafting
-
 Smart drafting sends the selected repo excerpts from the current repo context to the currently selected active pi model, including models chosen with `/model` or by cycling within `/scoped-models`. It excludes common secret-bearing paths from that context, including `.env*`, `.npmrc`, `.pypirc`, `.netrc`, `.aws/**`, `.ssh/**`, key/cert files like `*.pem` and `*.key`, and paths whose names or segments include `secret` or `credential`. It does not switch models automatically. If no active authenticated model is available, drafting falls back to the deterministic path.
+
 ## How it works
 
 On each iteration, pi-ralph reads `RALPH.md`, runs the configured commands, injects their output into the prompt through `{{ commands.<name> }}` placeholders, starts a fresh session, sends the prompt, and waits for completion. Failed command output appears in the next iteration, which creates a self-healing loop.

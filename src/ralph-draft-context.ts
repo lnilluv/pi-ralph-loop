@@ -109,8 +109,7 @@ function isSecretBearingPath(relativePath: string): boolean {
 
   const normalizedName = basename(normalizedPath);
   return (
-    normalizedName === ".env" ||
-    normalizedName.startsWith(".env.") ||
+    normalizedName.startsWith(".env") ||
     SECRET_BASENAMES.has(normalizedName) ||
     SECRET_SUFFIXES.some((suffix) => normalizedName.endsWith(suffix)) ||
     normalizedName.includes("secret") ||
@@ -621,8 +620,8 @@ function summarizeSignals(signals: RepoSignals): string[] {
     `package manager: ${signals.packageManager ?? "unknown"}`,
     `scripts: ${scripts.length > 0 ? scripts.join(", ") : "none"}`,
     `git repository: ${signals.hasGit ? "present" : "absent"}`,
-    `top-level dirs: ${signals.topLevelDirs.length > 0 ? signals.topLevelDirs.join(", ") : "none"}`,
-    `top-level files: ${signals.topLevelFiles.length > 0 ? signals.topLevelFiles.join(", ") : "none"}`,
+    `top-level dirs: ${signals.topLevelDirs.filter((relativePath) => !isSecretBearingPath(relativePath)).length > 0 ? signals.topLevelDirs.filter((relativePath) => !isSecretBearingPath(relativePath)).join(", ") : "none"}`,
+    `top-level files: ${signals.topLevelFiles.filter((relativePath) => !isSecretBearingPath(relativePath)).length > 0 ? signals.topLevelFiles.filter((relativePath) => !isSecretBearingPath(relativePath)).join(", ") : "none"}`,
   ];
 }
 

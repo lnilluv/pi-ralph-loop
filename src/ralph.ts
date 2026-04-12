@@ -448,6 +448,34 @@ export function createSiblingTarget(cwd: string, baseSlug: string): DraftTarget 
   };
 }
 
+function isSecretBearingTopLevelName(name: string): boolean {
+  const normalizedName = name.toLowerCase();
+  return (
+    normalizedName.startsWith(".env") ||
+    normalizedName === ".npmrc" ||
+    normalizedName === ".pypirc" ||
+    normalizedName === ".netrc" ||
+    normalizedName === ".aws" ||
+    normalizedName === ".ssh" ||
+    normalizedName === "authorized_keys" ||
+    normalizedName === "known_hosts" ||
+    normalizedName.includes("secret") ||
+    normalizedName.includes("credential") ||
+    normalizedName.endsWith(".pem") ||
+    normalizedName.endsWith(".key") ||
+    normalizedName.endsWith(".crt") ||
+    normalizedName.endsWith(".cer") ||
+    normalizedName.endsWith(".der") ||
+    normalizedName.endsWith(".p12") ||
+    normalizedName.endsWith(".pfx") ||
+    normalizedName.endsWith(".asc")
+  );
+}
+
+export function filterSecretBearingTopLevelNames(names: string[]): string[] {
+  return names.filter((name) => !isSecretBearingTopLevelName(name));
+}
+
 export function inspectRepo(cwd: string): RepoSignals {
   const packageManager = detectPackageManager(cwd);
   const packageScripts = detectPackageScripts(cwd, packageManager);
@@ -456,8 +484,9 @@ export function inspectRepo(cwd: string): RepoSignals {
 
   try {
     const entries = readdirSync(cwd, { withFileTypes: true }).slice(0, 50);
-    topLevelDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).slice(0, 10);
-    topLevelFiles = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).slice(0, 10);
+    const filteredEntries = entries.filter((entry) => !isSecretBearingTopLevelName(entry.name));
+    topLevelDirs = filteredEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).slice(0, 10);
+    topLevelFiles = filteredEntries.filter((entry) => entry.isFile()).map((entry) => entry.name).slice(0, 10);
   } catch {
     // ignore bounded inspection failures
   }
@@ -473,16 +502,19 @@ export function inspectRepo(cwd: string): RepoSignals {
 }
 
 export function buildRepoContext(signals: RepoSignals): RepoContext {
+  const topLevelDirs = filterSecretBearingTopLevelNames(signals.topLevelDirs);
+  const topLevelFiles = filterSecretBearingTopLevelNames(signals.topLevelFiles);
+
   return {
     summaryLines: [
       `package manager: ${signals.packageManager ?? "unknown"}`,
       `test command: ${signals.testCommand ?? "none"}`,
       `lint command: ${signals.lintCommand ?? "none"}`,
       `git repository: ${signals.hasGit ? "present" : "absent"}`,
-      `top-level dirs: ${signals.topLevelDirs.length > 0 ? signals.topLevelDirs.join(", ") : "none"}`,
-      `top-level files: ${signals.topLevelFiles.length > 0 ? signals.topLevelFiles.join(", ") : "none"}`,
+      `top-level dirs: ${topLevelDirs.length > 0 ? topLevelDirs.join(", ") : "none"}`,
+      `top-level files: ${topLevelFiles.length > 0 ? topLevelFiles.join(", ") : "none"}`,
     ],
-    selectedFiles: signals.topLevelFiles.slice(0, 10).map((path) => ({
+    selectedFiles: topLevelFiles.slice(0, 10).map((path) => ({
       path,
       content: "",
       reason: "top-level file",

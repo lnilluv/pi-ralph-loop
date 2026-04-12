@@ -579,6 +579,41 @@ test("secret-like files are excluded from selected files", (t) => {
     assert.ok(!selectedPaths.includes(path), `unexpected secret-like file selected: ${path}`);
   }
   assert.ok(selectedPaths.every((path) => !/(?:\.env(?:\..*)?$|\.npmrc$|\.pypirc$|\.netrc$|\.pem$|\.key$|secret|credential|\.aws\/|\.ssh\/)/i.test(path)));
+  for (const token of [".env", ".npmrc", ".ssh", "secrets", "credentials"]) {
+    assert.ok(context.summaryLines.every((line) => !line.includes(token)), `unexpected secret-like token in summary lines: ${token}`);
+  }
+});
+
+test("basename .env* files are excluded from selected files and summaries", (t) => {
+  const cwd = createTempRepo();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  writeTextFile(cwd, "README.md", "# Demo\n");
+  writeTextFile(cwd, "src/index.ts", "export {};\n");
+  writeTextFile(cwd, ".envrc", "export TOKEN=one\n");
+  writeTextFile(cwd, ".env.production", "TOKEN=two\n");
+  writeTextFile(cwd, ".envrc.local", "export TOKEN=three\n");
+
+  const context = assembleRepoContext(
+    cwd,
+    "Reverse engineer this app",
+    "analysis",
+    makeSignals({
+      topLevelDirs: ["src"],
+      topLevelFiles: ["README.md", ".envrc", ".env.production", ".envrc.local"],
+    }),
+  );
+
+  const selectedPaths = context.selectedFiles.map((file) => file.path);
+
+  assert.ok(selectedPaths.includes("README.md"));
+  assert.ok(selectedPaths.includes("src/index.ts"));
+  for (const path of [".envrc", ".env.production", ".envrc.local"]) {
+    assert.ok(!selectedPaths.includes(path), `unexpected secret-like file selected: ${path}`);
+  }
+  for (const token of [".envrc", ".env.production", ".envrc.local"]) {
+    assert.ok(context.summaryLines.every((line) => !line.includes(token)), `unexpected secret-like token in summary lines: ${token}`);
+  }
 });
 
 test("excluded directories never contribute selected files", (t) => {

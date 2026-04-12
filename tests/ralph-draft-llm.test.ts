@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import {
   buildDraftRequest,
   buildRepoContext,
   extractDraftMetadata,
+  inspectRepo,
   parseRalphMarkdown,
   type DraftRequest,
 } from "../src/ralph.ts";
@@ -13,6 +17,16 @@ import {
   strengthenDraftWithLlm,
   type StrengthenDraftRuntime,
 } from "../src/ralph-draft-llm.ts";
+
+function createTempRepo(): string {
+  return mkdtempSync(join(tmpdir(), "pi-ralph-llm-"));
+}
+
+function writeTextFile(root: string, relativePath: string, content: string): void {
+  const fullPath = join(root, relativePath);
+  mkdirSync(join(fullPath, ".."), { recursive: true });
+  writeFileSync(fullPath, content, "utf8");
+}
 
 function makeRequest(): DraftRequest {
   const repoSignals = {
@@ -122,6 +136,75 @@ test("buildStrengtheningPrompt includes the full prompt contract and repo signal
   assert.match(text, /export function login\(\) \{ return true; \}/);
   assert.match(text, /deterministic baseline draft/i);
   assert.match(text, /return only a complete RALPH\.md/i);
+});
+
+test("buildStrengtheningPrompt omits secret-bearing top-level repo names", (t) => {
+  const cwd = createTempRepo();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  writeTextFile(cwd, ".env", "TOKEN=one\n");
+  writeTextFile(cwd, ".npmrc", "registry=https://example.invalid\n");
+  mkdirSync(join(cwd, ".ssh"), { recursive: true });
+  mkdirSync(join(cwd, "secrets"), { recursive: true });
+  mkdirSync(join(cwd, "credentials"), { recursive: true });
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  writeTextFile(cwd, "package.json", JSON.stringify({ name: "demo", scripts: { test: "vitest", lint: "eslint ." } }, null, 2));
+
+  const repoSignals = inspectRepo(cwd);
+  const request = buildDraftRequest(
+    "Reverse engineer this app",
+    { slug: "reverse-engineer-this-app", dirPath: "/repo/reverse-engineer-this-app", ralphPath: "/repo/reverse-engineer-this-app/RALPH.md" },
+    repoSignals,
+    buildRepoContext(repoSignals),
+  );
+  const prompt = buildStrengtheningPrompt(request, "body-only");
+  const text = promptText(prompt);
+
+  assert.ok(repoSignals.topLevelFiles.includes("package.json"));
+  assert.ok(repoSignals.topLevelDirs.includes("src"));
+  assert.ok(!repoSignals.topLevelFiles.includes(".env"));
+  assert.ok(!repoSignals.topLevelFiles.includes(".npmrc"));
+  assert.ok(!repoSignals.topLevelDirs.includes(".ssh"));
+  assert.ok(!repoSignals.topLevelDirs.includes("secrets"));
+  assert.ok(!repoSignals.topLevelDirs.includes("credentials"));
+
+  for (const token of [".env", ".npmrc", ".ssh", "secrets", "credentials"]) {
+    assert.ok(!text.includes(token), `unexpected leaked token in prompt: ${token}`);
+  }
+  assert.match(text, /package manager: npm/);
+  assert.match(text, /package\.json/);
+});
+
+test("buildStrengtheningPrompt omits .env* top-level repo names from repo signals and prompt text", (t) => {
+  const cwd = createTempRepo();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  writeTextFile(cwd, ".envrc", "TOKEN=one\n");
+  writeTextFile(cwd, ".env.production", "TOKEN=two\n");
+  writeTextFile(cwd, ".npmrc", "registry=https://example.invalid\n");
+  mkdirSync(join(cwd, ".ssh"), { recursive: true });
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  writeTextFile(cwd, "package.json", JSON.stringify({ name: "demo", scripts: { test: "vitest", lint: "eslint ." } }, null, 2));
+
+  const repoSignals = inspectRepo(cwd);
+  const request = buildDraftRequest(
+    "Reverse engineer this app",
+    { slug: "reverse-engineer-this-app", dirPath: "/repo/reverse-engineer-this-app", ralphPath: "/repo/reverse-engineer-this-app/RALPH.md" },
+    repoSignals,
+    buildRepoContext(repoSignals),
+  );
+  const prompt = buildStrengtheningPrompt(request, "body-only");
+  const text = promptText(prompt);
+
+  assert.ok(repoSignals.topLevelFiles.includes("package.json"));
+  assert.ok(!repoSignals.topLevelFiles.includes(".envrc"));
+  assert.ok(!repoSignals.topLevelFiles.includes(".env.production"));
+  assert.ok(!request.repoContext.summaryLines.some((line) => line.includes(".envrc")));
+  assert.ok(!request.repoContext.summaryLines.some((line) => line.includes(".env.production")));
+  assert.ok(!text.includes(".envrc"));
+  assert.ok(!text.includes(".env.production"));
+  assert.match(text, /package manager: npm/);
+  assert.match(text, /package\.json/);
 });
 
 test("strengthenDraftWithLlm falls back when the selected model is missing", async () => {

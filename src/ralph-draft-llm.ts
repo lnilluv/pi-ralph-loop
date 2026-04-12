@@ -1,5 +1,6 @@
 import { complete, type AssistantMessage, type Context, type Model } from "@mariozechner/pi-ai";
 import {
+  filterSecretBearingTopLevelNames,
   normalizeStrengthenedDraft,
   parseRalphMarkdown,
   validateFrontmatter,
@@ -102,13 +103,16 @@ function isWeakStrengthenedDraftForScope(
 function summarizeRepoSignals(request: DraftRequest): string[] {
   if (request.repoContext.summaryLines.length > 0) return request.repoContext.summaryLines.map((line) => String(line));
 
+  const topLevelDirs = filterSecretBearingTopLevelNames(request.repoSignals.topLevelDirs);
+  const topLevelFiles = filterSecretBearingTopLevelNames(request.repoSignals.topLevelFiles);
+
   return [
     `package manager: ${request.repoSignals.packageManager ?? "unknown"}`,
     `test command: ${request.repoSignals.testCommand ?? "none"}`,
     `lint command: ${request.repoSignals.lintCommand ?? "none"}`,
     `git repository: ${request.repoSignals.hasGit ? "present" : "absent"}`,
-    `top-level dirs: ${request.repoSignals.topLevelDirs.length > 0 ? request.repoSignals.topLevelDirs.join(", ") : "none"}`,
-    `top-level files: ${request.repoSignals.topLevelFiles.length > 0 ? request.repoSignals.topLevelFiles.join(", ") : "none"}`,
+    `top-level dirs: ${topLevelDirs.length > 0 ? topLevelDirs.join(", ") : "none"}`,
+    `top-level files: ${topLevelFiles.length > 0 ? topLevelFiles.join(", ") : "none"}`,
   ];
 }
 
