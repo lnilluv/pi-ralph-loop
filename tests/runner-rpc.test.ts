@@ -1,0 +1,194 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import test from "node:test";
+
+import { parseRpcEvent, runRpcIteration } from "../src/runner-rpc.ts";
+
+// --- parseRpcEvent ---
+
+test("parseRpcEvent parses agent_end events", () => {
+  const event = parseRpcEvent('{"type":"agent_end","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":[{"type":"text","text":"done"}]}]}');
+  assert.equal(event.type, "agent_end");
+  assert.ok(Array.isArray(event.messages));
+});
+
+test("parseRpcEvent returns unknown for unrecognized lines", () => {
+  const event = parseRpcEvent("not json at all");
+  assert.equal(event.type, "unknown");
+});
+
+test("parseRpcEvent returns unknown for lines without type", () => {
+  const event = parseRpcEvent('{"foo":"bar"}');
+  assert.equal(event.type, "unknown");
+});
+
+test("parseRpcEvent handles response events", () => {
+  const event = parseRpcEvent('{"type":"response","command":"prompt","success":true,"id":"req-1"}');
+  assert.equal(event.type, "response");
+});
+
+test("parseRpcEvent handles message_update events with text deltas", () => {
+  const event = parseRpcEvent('{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"Hello"}}');
+  assert.equal(event.type, "message_update");
+});
+
+test("parseRpcEvent handles extension_ui_request events", () => {
+  const event = parseRpcEvent('{"type":"extension_ui_request","id":"ui-1","method":"notify","message":"test"}');
+  assert.equal(event.type, "extension_ui_request");
+});
+
+// --- runRpcIteration with mock subprocess ---
+
+async function writeMockScript(cwd: string, name: string, script: string): Promise<string> {
+  const path = join(cwd, name);
+  writeFileSync(path, script, { mode: 0o755 });
+  return path;
+}
+
+test("runRpcIteration returns success when subprocess completes", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_start"}'
+echo '{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"done"}}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.lastAssistantText, "done");
+    assert.equal(result.agentEndMessages.length, 1);
+    assert.equal(result.error, undefined);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration returns timeout when subprocess takes too long", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-slow.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+sleep 30
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 500,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration returns error when subprocess fails to start", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "/nonexistent/command/that/does/not/exist",
+      spawnArgs: [],
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.ok(result.error);
+    assert.ok(result.error.length > 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration collects completion promise text from agent_end", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-promise.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"I am done. <promise>DONE</promise> Please review."}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.lastAssistantText, "I am done. <promise>DONE</promise> Please review.");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration handles empty agent_end messages gracefully", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-empty.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.lastAssistantText, "");
+    assert.equal(result.agentEndMessages.length, 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration calls onEvent callback for streamed events", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-events.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_start"}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"hello"}]}]}'
+`);
+
+    const events: string[] = [];
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+      onEvent(event) {
+        events.push(event.type);
+      },
+    });
+    assert.equal(result.success, true);
+    assert.ok(events.includes("agent_start"));
+    assert.ok(events.includes("agent_end"));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
