@@ -49,7 +49,7 @@ That saves the draft but does not launch the loop.
 
 ### Smart drafting
 
-Smart drafting sends the selected repo excerpts from the current repo context to the currently selected active pi model, including models chosen with `/model` or by cycling within `/scoped-models`. It excludes common secret-bearing paths from that context, and non-analysis drafts use the shared `policy:secret-bearing-paths` token so runtime write protection stays aligned with the same policy. It does not switch models automatically. If no active authenticated model is available, drafting falls back to the deterministic path.
+Smart drafting sends the selected repo excerpts from the current repo context to the currently selected active pi model, including models chosen with `/model` or by cycling within `/scoped-models`. It excludes common secret-bearing paths from that context, and non-analysis drafts use the shared `policy:secret-bearing-paths` token so runtime write protection stays aligned with the same policy. It does not switch models automatically. When the active model is used to strengthen an existing draft, it now accepts validated body-and-commands drafts instead of body-only drafts. If no active authenticated model is available, drafting falls back to the deterministic path.
 
 ## How it works
 
@@ -117,14 +117,16 @@ Iteration {{ ralph.iteration }} of {{ ralph.name }}.
 Apply the smallest safe fix and explain why it works.
 ```
 
+Strengthened body-and-commands drafts keep the deterministic baseline exact: command `name -> run` pairs must match the baseline, commands may only be reordered, dropped, or have timeouts stay the same or decrease, `max_iterations` and top-level `timeout` may stay the same or decrease, every `{{ commands.<name> }}` used in the strengthened draft must point to an accepted command, `completion_promise` must stay unchanged, including staying absent when absent, and guardrails stay fixed in this phase. If the strengthened frontmatter is invalid or unsupported, pi rejects the whole strengthened draft and falls back automatically instead of splicing fields.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `commands` | array | `[]` | Commands to run each iteration |
-| `commands[].name` | string | required | Key for `{{ commands.<name> }}` |
+| `commands[].name` | string | required | Must match `^\w[\w-]*$`; key for `{{ commands.<name> }}` |
 | `commands[].run` | string | required | Shell command |
-| `commands[].timeout` | number | `60` | Seconds before kill |
-| `max_iterations` | number | `50` | Stop after N iterations |
-| `timeout` | number | `300` | Per-iteration timeout in seconds; stops the loop if the agent is stuck |
+| `commands[].timeout` | number | `60` | Seconds before kill; greater than 0 and at most 300 seconds, and must be `<= timeout` |
+| `max_iterations` | integer | `50` | Stop after N iterations; must be 1-50 |
+| `timeout` | number | `300` | Per-iteration timeout in seconds; must be greater than 0 and at most 300; stops the loop if the agent is stuck |
 | `completion_promise` | string | — | Agent signals completion by sending `<promise>DONE</promise>`; loop breaks on match |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns to block in bash |
 | `guardrails.protected_files` | string[] | `[]` | Glob patterns, or the shared `policy:secret-bearing-paths` token, enforced on `write`/`edit` tool calls |
@@ -133,7 +135,7 @@ Apply the smallest safe fix and explain why it works.
 
 | Placeholder | Description |
 |-------------|-------------|
-| `{{ commands.<name> }}` | Output from the named command |
+| `{{ commands.<name> }}` | Output from the command named `<name>` |
 | `{{ ralph.iteration }}` | Current 1-based iteration number |
 | `{{ ralph.name }}` | Directory name containing the `RALPH.md` |
 
@@ -169,7 +171,7 @@ Each iteration has a configurable timeout (default 300 seconds). If the agent is
 
 ### Input validation
 
-The extension validates `RALPH.md` frontmatter before starting and on each re-parse: `max_iterations` must be a positive integer, `timeout` must be positive, `block_commands` regexes must compile, and commands must have non-empty names and run strings with positive timeouts.
+The extension validates `RALPH.md` frontmatter before starting and on each re-parse: `max_iterations` must be an integer from 1 to 50, `timeout` must be greater than 0 and at most 300 seconds, command names must match `^\w[\w-]*$`, command timeouts must be greater than 0 and at most 300 seconds and no greater than top-level `timeout`, `block_commands` regexes must compile, and commands must have non-empty names and run strings. The current runtime also rejects unsafe `completion_promise` values (non-string, blank, multiline, or angle-bracketed) and universal `guardrails.protected_files` globs such as `**/*`.
 
 ## Comparison table
 

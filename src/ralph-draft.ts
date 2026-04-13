@@ -25,7 +25,7 @@ export async function createDraftPlan(
   const request = buildDraftRequest(task, target, repoSignals, repoContext);
   if (runtime?.model) {
     const strengthen = options.strengthenDraftWithLlmImpl ?? strengthenDraftWithLlm;
-    const strengthened = await strengthen(request, runtime, { scope: "body-only" });
+    const strengthened = await strengthen(request, runtime, { scope: "body-and-commands" });
     if (strengthened.kind === "llm-strengthened") return strengthened.draft;
   }
 

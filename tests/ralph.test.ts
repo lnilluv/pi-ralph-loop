@@ -13,7 +13,9 @@ import {
   extractDraftMetadata,
   generateDraft,
   isWeakStrengthenedDraft,
+  acceptStrengthenedDraft,
   normalizeStrengthenedDraft,
+  inspectDraftContent,
   inspectExistingTarget,
   inspectRepo,
   looksLikePath,
@@ -70,6 +72,26 @@ function assertMetadataSource(metadata: ReturnType<typeof extractDraftMetadata>,
   assert.equal(metadata.source, expected);
 }
 
+function makeFixRequest() {
+  return buildDraftRequest(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+}
+
+function makeFixRequestWithCompletionPromise(completionPromise: string) {
+  const request = makeFixRequest();
+  return {
+    ...request,
+    baselineDraft: request.baselineDraft.replace("timeout: 300\n", `completion_promise: ${completionPromise}\ntimeout: 300\n`),
+  };
+}
+
+function makeStrengthenedDraft(frontmatterLines: readonly string[], body: string, task = "Fix flaky auth tests") {
+  return `${encodeMetadata({ generator: "pi-ralph-loop", version: 2, source: "llm-strengthened", task, mode: "fix" })}\n---\n${frontmatterLines.join("\n")}\n---\n${body}`;
+}
+
 test("parseRalphMarkdown falls back to default frontmatter when no frontmatter is present", () => {
   const parsed = parseRalphMarkdown("hello\nworld");
 
@@ -93,23 +115,39 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
   assert.equal(parsed.body, "Body\n");
 });
 
-test("validateFrontmatter accepts valid input and rejects invalid values", () => {
+test("validateFrontmatter accepts valid input and rejects invalid bounds, names, and globs", () => {
   assert.equal(validateFrontmatter(defaultFrontmatter()), null);
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), maxIterations: 0 }),
-    "Invalid max_iterations: must be a positive finite integer",
+    "Invalid max_iterations: must be between 1 and 50",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), maxIterations: 51 }),
+    "Invalid max_iterations: must be between 1 and 50",
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), timeout: 0 }),
-    "Invalid timeout: must be a positive finite number",
+    "Invalid timeout: must be greater than 0 and at most 300",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), timeout: 301 }),
+    "Invalid timeout: must be greater than 0 and at most 300",
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: ["["], protectedFiles: [] } }),
     "Invalid block_commands regex: [",
   );
   assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: [], protectedFiles: ["**/*"] } }),
+    "Invalid protected_files glob: **/*",
+  );
+  assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "", run: "echo ok", timeout: 1 }] }),
     "Invalid command: name is required",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "build now", run: "echo ok", timeout: 1 }] }),
+    "Invalid command name: build now must match ^\\w[\\w-]*$",
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "build", run: "", timeout: 1 }] }),
@@ -117,12 +155,199 @@ test("validateFrontmatter accepts valid input and rejects invalid values", () =>
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "build", run: "echo ok", timeout: 0 }] }),
-    "Invalid command build: timeout must be positive",
+    "Invalid command build: timeout must be greater than 0 and at most 300",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "build", run: "echo ok", timeout: 301 }] }),
+    "Invalid command build: timeout must be greater than 0 and at most 300",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), timeout: 20, commands: [{ name: "build", run: "echo ok", timeout: 21 }] }),
+    "Invalid command build: timeout must not exceed top-level timeout",
   );
   assert.equal(
     validateFrontmatter(parseRalphMarkdown("---\ncommands:\n  - nope\n  - null\n---\nbody").frontmatter),
     "Invalid command entry at index 0",
   );
+});
+
+test("validateFrontmatter rejects unsafe completion_promise values and Mission Brief fails closed", () => {
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), completionPromise: "ready\nnow" }),
+    "Invalid completion_promise: must be a single-line string without line breaks or angle brackets",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), completionPromise: "<promise>ready</promise>" }),
+    "Invalid completion_promise: must be a single-line string without line breaks or angle brackets",
+  );
+
+  const plan = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+  const brief = buildMissionBrief({
+    ...plan,
+    content: plan.content.replace(
+      "timeout: 300\n",
+      "timeout: 45\ncompletion_promise: |\n  ready\n  now\n",
+    ),
+  });
+
+  assert.match(brief, /^Mission Brief/m);
+  assert.match(brief, /Invalid RALPH\.md: Invalid completion_promise: must be a single-line string without line breaks or angle brackets/);
+  assert.match(brief, /^Draft status$/m);
+  assert.doesNotMatch(brief, /Finish behavior/);
+  assert.doesNotMatch(brief, /<promise>/);
+});
+
+test("inspectDraftContent, validateDraftContent, and Mission Brief fail closed on raw invalid completion_promise values", () => {
+  const plan = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+
+  for (const [label, rawValue] of [
+    ["array", "completion_promise: [oops]"],
+    ["number", "completion_promise: 7"],
+    ["blank string", 'completion_promise: ""'],
+  ] as const) {
+    const raw = plan.content.replace("timeout: 300\n", `${rawValue}\ntimeout: 300\n`);
+
+    assert.equal(
+      inspectDraftContent(raw).error,
+      "Invalid completion_promise: must be a single-line string without line breaks or angle brackets",
+      label,
+    );
+    assert.equal(
+      validateDraftContent(raw),
+      "Invalid completion_promise: must be a single-line string without line breaks or angle brackets",
+      label,
+    );
+
+    const brief = buildMissionBrief({ ...plan, content: raw });
+    assert.match(brief, /^Mission Brief/m, label);
+    assert.match(brief, /Invalid RALPH\.md: Invalid completion_promise: must be a single-line string without line breaks or angle brackets/, label);
+    assert.doesNotMatch(brief, /Finish behavior/, label);
+    assert.doesNotMatch(brief, /<promise>/, label);
+  }
+});
+
+test("inspectDraftContent, validateDraftContent, and Mission Brief fail closed on raw malformed guardrails values", () => {
+  const plan = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+
+  for (const { label, frontmatterLines, expectedError, briefError } of [
+    {
+      label: "block_commands scalar",
+      frontmatterLines: [
+        "commands: []",
+        "max_iterations: 25",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: 'git\\s+push'",
+        "  protected_files: []",
+      ],
+      expectedError: "Invalid RALPH frontmatter: guardrails.block_commands must be a YAML sequence",
+      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: guardrails\.block_commands must be a YAML sequence/,
+    },
+    {
+      label: "block_commands null",
+      frontmatterLines: [
+        "commands: []",
+        "max_iterations: 25",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: null",
+        "  protected_files: []",
+      ],
+      expectedError: "Invalid RALPH frontmatter: guardrails.block_commands must be a YAML sequence",
+      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: guardrails\.block_commands must be a YAML sequence/,
+    },
+    {
+      label: "protected_files scalar",
+      frontmatterLines: [
+        "commands: []",
+        "max_iterations: 25",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: []",
+        "  protected_files: 'src/generated/**'",
+      ],
+      expectedError: "Invalid RALPH frontmatter: guardrails.protected_files must be a YAML sequence",
+      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: guardrails\.protected_files must be a YAML sequence/,
+    },
+    {
+      label: "protected_files null",
+      frontmatterLines: [
+        "commands: []",
+        "max_iterations: 25",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: []",
+        "  protected_files: null",
+      ],
+      expectedError: "Invalid RALPH frontmatter: guardrails.protected_files must be a YAML sequence",
+      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: guardrails\.protected_files must be a YAML sequence/,
+    },
+  ] as const) {
+    const raw = makeStrengthenedDraft(frontmatterLines, "Task: Fix flaky auth tests\n\nKeep the change small.");
+    const inspection = inspectDraftContent(raw);
+
+    assert.equal(inspection.error, expectedError, label);
+    assert.equal(validateDraftContent(raw), expectedError, label);
+
+    const brief = buildMissionBrief({ ...plan, content: raw });
+    assert.match(brief, /^Mission Brief/m, label);
+    assert.match(brief, briefError, label);
+    assert.doesNotMatch(brief, /Finish behavior/, label);
+    assert.doesNotMatch(brief, /<promise>/, label);
+  }
+});
+
+test("acceptStrengthenedDraft rejects raw malformed guardrails shapes", () => {
+  const request = makeFixRequest();
+
+  for (const { label, frontmatterLines } of [
+    {
+      label: "block_commands scalar",
+      frontmatterLines: [
+        "commands:",
+        "  - name: tests",
+        "    run: npm test",
+        "    timeout: 20",
+        "max_iterations: 20",
+        "timeout: 120",
+        "guardrails:",
+        "  block_commands: 'git\\s+push'",
+        "  protected_files:",
+        `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+      ],
+    },
+    {
+      label: "protected_files scalar",
+      frontmatterLines: [
+        "commands:",
+        "  - name: tests",
+        "    run: npm test",
+        "    timeout: 20",
+        "max_iterations: 20",
+        "timeout: 120",
+        "guardrails:",
+        "  block_commands:",
+        "    - 'git\\s+push'",
+        "  protected_files: 'src/generated/**'",
+      ],
+    },
+  ] as const) {
+    const strengthenedDraft = makeStrengthenedDraft(frontmatterLines, "Task: Fix flaky auth tests\n\nKeep the change small.");
+
+    assert.equal(acceptStrengthenedDraft(request, strengthenedDraft), null, label);
+  }
 });
 
 test("runCommands skips blocked commands before shelling out", async () => {
@@ -262,8 +487,105 @@ test("validateDraftContent rejects missing and malformed frontmatter", () => {
   assert.equal(validateDraftContent("Task body"), "Missing RALPH frontmatter");
   assert.equal(
     validateDraftContent("---\nmax_iterations: 0\n---\nBody"),
-    "Invalid max_iterations: must be a positive finite integer",
+    "Invalid max_iterations: must be between 1 and 50",
   );
+});
+
+test("validateDraftContent fails closed on YAML frontmatter that is not a mapping", () => {
+  assert.equal(validateDraftContent("---\n- nope\n---\nBody"), "Invalid RALPH frontmatter: Frontmatter must be a YAML mapping");
+});
+
+test("inspectDraftContent and validateDraftContent fail closed on raw malformed frontmatter shapes and scalars", () => {
+  const makeRawDraft = (frontmatterLines: readonly string[]) => `---\n${frontmatterLines.join("\n")}\n---\nTask: Fix flaky auth tests\n\nKeep the change small.`;
+
+  for (const { label, raw, expectedError } of [
+    {
+      label: "commands mapping",
+      raw: makeRawDraft([
+        "commands:",
+        "  name: tests",
+        "  run: npm test",
+        "  timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands must be a YAML sequence",
+    },
+    {
+      label: "max_iterations boolean",
+      raw: makeRawDraft(["commands: []", "max_iterations: true", "timeout: 300"]),
+      expectedError: "Invalid RALPH frontmatter: max_iterations must be a YAML number",
+    },
+    {
+      label: "timeout boolean",
+      raw: makeRawDraft(["commands: []", "max_iterations: 2", "timeout: true"]),
+      expectedError: "Invalid RALPH frontmatter: timeout must be a YAML number",
+    },
+    {
+      label: "command name array",
+      raw: makeRawDraft([
+        "commands:",
+        "  - name:",
+        "      - build",
+        "    run: npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].name must be a YAML string",
+    },
+    {
+      label: "command run array",
+      raw: makeRawDraft([
+        "commands:",
+        "  - name: build",
+        "    run:",
+        "      - npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].run must be a YAML string",
+    },
+    {
+      label: "command timeout array",
+      raw: makeRawDraft([
+        "commands:",
+        "  - name: build",
+        "    run: npm test",
+        "    timeout:",
+        "      - 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].timeout must be a YAML number",
+    },
+  ] as const) {
+    assert.equal(inspectDraftContent(raw).error, expectedError, label);
+    assert.equal(validateDraftContent(raw), expectedError, label);
+  }
+});
+
+test("inspectDraftContent and validateDraftContent reject metadata-tagged generated drafts with malformed commands mappings", () => {
+  const raw = makeStrengthenedDraft(
+    [
+      "commands:",
+      "  name: tests",
+      "  run: npm test",
+      "  timeout: 20",
+      "max_iterations: 20",
+      "timeout: 120",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nKeep the change small.",
+  );
+
+  assert.equal(inspectDraftContent(raw).error, "Invalid RALPH frontmatter: commands must be a YAML sequence");
+  assert.equal(validateDraftContent(raw), "Invalid RALPH frontmatter: commands must be a YAML sequence");
 });
 
 test("buildMissionBrief fails closed when the current draft content is invalid", () => {
@@ -445,29 +767,480 @@ test("normalizeStrengthenedDraft keeps deterministic frontmatter in body-only mo
   });
 });
 
-test("normalizeStrengthenedDraft applies strengthened commands in body-and-commands mode", () => {
-  const request = buildDraftRequest(
-    "Fix flaky auth tests",
-    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
-    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
-    { summaryLines: ["repo summary"], selectedFiles: [{ path: "package.json", content: "", reason: "top-level file" }] },
+test("normalizeStrengthenedDraft falls back to the baseline body when body-only frontmatter is invalid", () => {
+  const request = makeFixRequest();
+  const baseline = parseRalphMarkdown(request.baselineDraft);
+  const strengthenedDraft = makeStrengthenedDraft(
+    [
+      "commands:",
+      "  name: rogue",
+      "  run: rm -rf /",
+      "  timeout: 1",
+      "max_iterations: 20",
+      "timeout: 120",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nRead-only enforced and write protection is enforced.",
   );
-  const strengthenedDraft = `${encodeMetadata({ generator: "pi-ralph-loop", version: 2, source: "llm-strengthened", task: "Fix flaky auth tests", mode: "fix" })}\n---\ncommands:\n  - name: smoke\n    run: npm run smoke\n    timeout: 45\nmax_iterations: 7\ntimeout: 120\nguardrails:\n  block_commands:\n    - git\\s+push\n  protected_files:\n    - .env*\n---\nTask: Fix flaky auth tests\n\nUse the smoke check and keep the output concise.`;
 
-  const normalized = normalizeStrengthenedDraft(request, strengthenedDraft, "body-and-commands");
+  const normalized = normalizeStrengthenedDraft(request, strengthenedDraft, "body-only");
   const reparsed = parseRalphMarkdown(normalized.content);
 
-  assert.deepEqual(reparsed.frontmatter.commands, [{ name: "smoke", run: "npm run smoke", timeout: 45 }]);
-  assert.equal(reparsed.frontmatter.maxIterations, 7);
-  assert.deepEqual(reparsed.frontmatter.guardrails, { blockCommands: ["git\\s+push"], protectedFiles: [".env*"] });
-  assert.match(reparsed.body, /Use the smoke check and keep the output concise\./);
-  assert.deepEqual(extractDraftMetadata(normalized.content), {
-    generator: "pi-ralph-loop",
-    version: 2,
-    source: "llm-strengthened",
-    task: "Fix flaky auth tests",
-    mode: "fix",
-  });
+  assert.deepEqual(reparsed.frontmatter, baseline.frontmatter);
+  assert.equal(reparsed.body.trimStart(), baseline.body.trimStart());
+});
+
+test("normalizeStrengthenedDraft falls back to the baseline body when body-only YAML syntax is malformed", () => {
+  const request = makeFixRequest();
+  const baseline = parseRalphMarkdown(request.baselineDraft);
+  const strengthenedDraft = makeStrengthenedDraft(
+    [
+      "commands: [",
+      "max_iterations: 20",
+      "timeout: 120",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nRead-only enforced and write protection is enforced.",
+  );
+
+  const normalized = normalizeStrengthenedDraft(request, strengthenedDraft, "body-only");
+  const reparsed = parseRalphMarkdown(normalized.content);
+
+  assert.deepEqual(reparsed.frontmatter, baseline.frontmatter);
+  assert.equal(reparsed.body.trimStart(), baseline.body.trimStart());
+});
+
+test("normalizeStrengthenedDraft applies strengthened commands in body-and-commands mode", () => {
+  const request = makeFixRequest();
+  const baseline = parseRalphMarkdown(request.baselineDraft);
+  const strengthenedDraft = makeStrengthenedDraft(
+    [
+      "commands:",
+      "  - name: git-log",
+      "    run: git log --oneline -10",
+      "    timeout: 15",
+      "  - name: tests",
+      "    run: npm test",
+      "    timeout: 45",
+      "max_iterations: 20",
+      "timeout: 120",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nUse {{ commands.tests }} and {{ commands.git-log }}.\n\nIteration {{ ralph.iteration }} of {{ ralph.name }}.",
+  );
+
+  const accepted = acceptStrengthenedDraft(request, strengthenedDraft);
+  if (!accepted) {
+    assert.fail("expected strengthened draft to be accepted");
+  }
+
+  const normalized = normalizeStrengthenedDraft(request, strengthenedDraft, "body-and-commands");
+  assert.equal(normalized.content, accepted.content);
+  const reparsed = parseRalphMarkdown(normalized.content);
+
+  assert.deepEqual(reparsed.frontmatter.commands, [
+    { name: "git-log", run: "git log --oneline -10", timeout: 15 },
+    { name: "tests", run: "npm test", timeout: 45 },
+  ]);
+  assert.equal(reparsed.frontmatter.maxIterations, 20);
+  assert.equal(reparsed.frontmatter.timeout, 120);
+  assert.deepEqual(reparsed.frontmatter.guardrails, baseline.frontmatter.guardrails);
+  assert.equal(validateFrontmatter(reparsed.frontmatter), null);
+  assert.match(reparsed.body, /Use \{\{ commands\.tests \}\} and \{\{ commands\.git-log \}\}\./);
+});
+
+test("acceptStrengthenedDraft rejects malformed commands frontmatter shapes", () => {
+  const request = makeFixRequest();
+  const body = "Task: Fix flaky auth tests\n\nKeep the change small.";
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  name: tests",
+          "  run: npm test",
+          "  timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+});
+
+test("acceptStrengthenedDraft rejects invented, renamed, swapped, and duplicate commands", () => {
+  const request = makeFixRequest();
+  const body = "Task: Fix flaky auth tests\n\nKeep the change small.";
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: smoke",
+          "    run: npm run smoke",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: unit-tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: tests",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: git-log",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+});
+
+test("acceptStrengthenedDraft rejects placeholder drift, increased limits, and command-timeout overflow", () => {
+  const request = makeFixRequest();
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 26",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        "Task: Fix flaky auth tests\n\nUse {{ commands.tests }} and {{ commands.lint }}.",
+      ),
+    ),
+    null,
+  );
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 21",
+          "max_iterations: 20",
+          "timeout: 20",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        "Task: Fix flaky auth tests\n\nUse {{ commands.tests }} and {{ commands.git-log }}.",
+      ),
+    ),
+    null,
+  );
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 301",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        "Task: Fix flaky auth tests\n\nUse {{ commands.tests }} and {{ commands.git-log }}.",
+      ),
+    ),
+    null,
+  );
+});
+
+test("acceptStrengthenedDraft rejects changed guardrails and missing secret-path protection", () => {
+  const request = makeFixRequest();
+  const body = "Task: Fix flaky auth tests\n\nKeep the change small.";
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          "    - .env*",
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files: [],",
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+});
+
+test("acceptStrengthenedDraft accepts unchanged completion_promise and rejects new or invalid ones", () => {
+  const request = makeFixRequest();
+  const body = "Task: Fix flaky auth tests\n\nKeep the change small.";
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+          "completion_promise: ship-it",
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+
+  const promisedRequest = makeFixRequestWithCompletionPromise("ship-it");
+  const promisedDraft = makeStrengthenedDraft(
+    [
+      "commands:",
+      "  - name: git-log",
+      "    run: git log --oneline -10",
+      "    timeout: 20",
+      "  - name: tests",
+      "    run: npm test",
+      "    timeout: 20",
+      "max_iterations: 20",
+      "timeout: 120",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+      "completion_promise: ship-it",
+    ],
+    body,
+  );
+  const accepted = acceptStrengthenedDraft(promisedRequest, promisedDraft);
+  if (!accepted) {
+    assert.fail("expected unchanged completion_promise to be accepted");
+  }
+  assert.equal(parseRalphMarkdown(accepted.content).frontmatter.completionPromise, "ship-it");
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      promisedRequest,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+          "completion_promise: ship-it-too",
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+          "completion_promise: [oops]",
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
 });
 
 test("isWeakStrengthenedDraft rejects unchanged bodies and fake runtime enforcement claims", () => {
@@ -525,7 +1298,7 @@ test("generated draft starts fail closed when validation no longer passes", asyn
 
   await handler(`--path ${ralphPath}`, ctx);
 
-  assert.deepEqual(notifications, [{ level: "error", message: "Invalid RALPH.md: Invalid max_iterations: must be a positive finite integer" }]);
+  assert.deepEqual(notifications, [{ level: "error", message: "Invalid RALPH.md: Invalid max_iterations: must be between 1 and 50" }]);
 });
 
 test("generateDraft creates metadata-rich analysis and fix drafts", () => {
@@ -598,7 +1371,8 @@ test("buildMissionBrief refreshes after draft edits", () => {
     content: plan.content
       .replace("Task: Fix flaky auth tests", "Task: Fix flaky auth regressions")
       .replace("name: tests\n    run: npm test\n    timeout: 120", "name: smoke\n    run: npm run smoke\n    timeout: 45")
-      .replace("max_iterations: 25", "max_iterations: 7"),
+      .replace("max_iterations: 25", "max_iterations: 7")
+      .replace("timeout: 300\n", "timeout: 90\ncompletion_promise: deploy-ready\n"),
   };
 
   const brief = buildMissionBrief(editedPlan);
@@ -607,5 +1381,7 @@ test("buildMissionBrief refreshes after draft edits", () => {
   assert.doesNotMatch(brief, /Fix flaky auth tests/);
   assert.match(brief, /smoke: npm run smoke/);
   assert.match(brief, /Stop after 7 iterations or \/ralph-stop/);
+  assert.match(brief, /Stop if an iteration exceeds 90s/);
+  assert.match(brief, /Stop early on <promise>deploy-ready<\/promise>/);
   assert.doesNotMatch(brief, /tests: npm test/);
 });
