@@ -53,7 +53,41 @@ Smart drafting sends the selected repo excerpts from the current repo context to
 
 ## How it works
 
-On each iteration, pi-ralph reads `RALPH.md`, runs the configured commands, injects their output into the prompt through `{{ commands.<name> }}` placeholders, starts a fresh session, sends the prompt, and waits for completion. Failed command output appears in the next iteration, which creates a self-healing loop.
+Each iteration re-reads `RALPH.md`, runs the configured commands, injects their output into `{{ commands.<name> }}` placeholders, and sends the task to a fresh `pi --mode rpc` subprocess instead of keeping a long-lived in-process session. Failed command output appears in the next iteration, which keeps the loop self-healing.
+
+### Subprocess runner
+
+`runner.ts` orchestrates the loop for each iteration:
+- re-read `RALPH.md` so live edits apply on the next turn
+- run any configured pre-iteration commands
+- snapshot the task directory before the agent runs
+- spawn a fresh RPC subprocess
+- compare before/after snapshots and evaluate completion
+- stop on max iterations, timeout, or no-progress exhaustion
+
+`runner-rpc.ts` manages the subprocess:
+- starts `pi --mode rpc --no-session`
+- sends `set_model`, `set_thinking_level`, and `prompt` over stdin as JSONL
+- reads JSONL events from stdout
+- keeps stdin open until `agent_end`
+- handles timeouts and process lifecycle
+
+### Model selection
+
+`modelPattern` supports `provider/modelId` and `provider/modelId:thinkingLevel`. When a thinking level is present, the runner sends `set_model` first, then `set_thinking_level`, and only then sends the prompt. The RPC manager waits for acknowledgments before continuing.
+
+### Progress detection
+
+The runner hashes task-directory files before and after each iteration and diffs the snapshots. New or modified files count as progress. `.git`, `node_modules`, `.ralph-runner`, and similar ignored paths are excluded. If a snapshot is truncated because it exceeds 200 files or 2 MB, progress is reported as `"unknown"` instead of `false`. After the subprocess exits, the runner waits 100 ms and polls once more for late file writes.
+
+### Durable state
+
+`runner-state.ts` stores durable state in `.ralph-runner/` inside the task directory:
+- `status.json` — current status, loop token, and timestamps
+- `iterations.jsonl` — appended iteration records
+- `stop.flag` — graceful stop signal
+
+`status.json` records runner states such as `initializing`, `running`, `complete`, `max-iterations`, `no-progress-exhaustion`, `stopped`, `timeout`, `error`, and `cancelled`. `/ralph-stop` now writes `stop.flag`, and the runner checks it before each iteration.
 
 ## Smart `/ralph` behavior
 
@@ -145,7 +179,7 @@ HTML comments (`<!-- ... -->`) are stripped from the prompt body after placehold
 
 - `/ralph [path-or-task]` - Start Ralph from a task folder or `RALPH.md`, or draft a new loop from natural language.
 - `/ralph-draft [path-or-task]` - Draft or edit a Ralph task without starting it.
-- `/ralph-stop` - Request a graceful stop after the current iteration.
+- `/ralph-stop` - Request a graceful stop after the current iteration by writing `.ralph-runner/stop.flag`.
 
 ## Pi-only features
 
@@ -179,6 +213,11 @@ The extension validates `RALPH.md` frontmatter before starting and on each re-pa
 |---------|----------------------------|----------|-----------------|--------|----------|
 | Command output injection | ✓ | ✗ | ✗ | ✗ | ✓ |
 | Fresh-context sessions | ✓ | ✓ | ✗ | ✓ | ✓ |
+| Subprocess isolation | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Durable state | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Model selection | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Progress detection | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Live RALPH.md editing | ✓ | ✗ | ✗ | ✗ | ✗ | |
 | Mid-turn guardrails | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Cross-iteration memory | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Mid-turn steering | ✓ | ✗ | ✗ | ✗ | ✗ |
