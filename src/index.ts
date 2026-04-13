@@ -680,8 +680,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         maxIterations: loopState.maxIterations,
         guardrails: loopState.guardrails,
         modelPattern: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
-        // Thinking level from the model's thinking level if available
-        thinkingLevel: (ctx.model as any)?.thinkingLevel || undefined,
+        thinkingLevel: ctx.model?.reasoning ? "high" : undefined,
         runCommandsFn: async (commands, blocked) => runCommands(commands, blocked, pi),
         onStatusChange(status) {
           ctx.ui.setStatus("ralph", status === "running" || status === "initializing" ? `🔁 ${name}: running` : undefined);
