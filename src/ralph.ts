@@ -12,6 +12,7 @@ export type Frontmatter = {
   maxIterations: number;
   timeout: number;
   completionPromise?: string;
+  requiredOutputs?: string[];
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
   invalidCommandEntries?: number[];
 };
@@ -171,6 +172,23 @@ function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | nul
   return null;
 }
 
+function validateRawRequiredOutputsShape(rawFrontmatter: UnknownRecord): string | null {
+  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "required_outputs")) {
+    return null;
+  }
+
+  const requiredOutputs = rawFrontmatter.required_outputs;
+  if (!Array.isArray(requiredOutputs)) {
+    return "Invalid RALPH frontmatter: required_outputs must be a YAML sequence";
+  }
+  for (const [index, output] of requiredOutputs.entries()) {
+    if (typeof output !== "string") {
+      return `Invalid RALPH frontmatter: required_outputs[${index}] must be a YAML string`;
+    }
+  }
+  return null;
+}
+
 function validateRawCommandEntryShape(command: unknown, index: number): string | null {
   if (!isRecord(command)) {
     return `Invalid RALPH frontmatter: commands[${index}] must be a YAML mapping`;
@@ -196,6 +214,15 @@ function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | nu
     for (const [index, command] of commands.entries()) {
       const commandError = validateRawCommandEntryShape(command, index);
       if (commandError) return commandError;
+    }
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(rawFrontmatter, "required_outputs")
+  ) {
+    const requiredOutputsError = validateRawRequiredOutputsShape(rawFrontmatter);
+    if (requiredOutputsError) {
+      return requiredOutputsError;
     }
   }
 
@@ -269,23 +296,55 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
   return labels.length > 0 ? labels.join(" and ") : "No extra safety rules";
 }
 
-function summarizeFinishLabel(maxIterations: number): string {
-  return `Stop after ${maxIterations} iterations or /ralph-stop`;
+function summarizeFinishLabel(frontmatter: Frontmatter): string {
+  const requiredOutputs = frontmatter.requiredOutputs ?? [];
+  const labels = [`Stop after ${frontmatter.maxIterations} iterations or /ralph-stop`];
+  if (requiredOutputs.length > 0) {
+    labels.push(`required outputs: ${requiredOutputs.join(", ")}`);
+  }
+  return labels.join("; ");
 }
 
 function summarizeFinishBehavior(frontmatter: Frontmatter): string[] {
+  const requiredOutputs = frontmatter.requiredOutputs ?? [];
   const lines = [
     `- Stop after ${frontmatter.maxIterations} iterations or /ralph-stop`,
     `- Stop if an iteration exceeds ${frontmatter.timeout}s`,
   ];
+
   if (frontmatter.completionPromise) {
+    if (requiredOutputs.length > 0) {
+      lines.push(`- Required outputs must exist before stopping: ${requiredOutputs.join(", ")}`);
+    }
+    lines.push("- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.");
     lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
   }
+
   return lines;
 }
 
 function isSafeCompletionPromise(value: string): boolean {
   return !/[\r\n<>]/.test(value);
+}
+
+function validateRequiredOutputEntry(value: string): string | null {
+  const trimmed = value.trim();
+  if (
+    !trimmed ||
+    trimmed !== value ||
+    /[\u0000-\u001f\u007f]/.test(value) ||
+    trimmed === "." ||
+    trimmed === ".." ||
+    trimmed.startsWith("/") ||
+    /^[A-Za-z]:[\\/]/.test(trimmed) ||
+    trimmed.includes("\\") ||
+    trimmed.endsWith("/") ||
+    trimmed.endsWith("\\") ||
+    trimmed.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    return `Invalid required_outputs entry: ${value} must be a relative file path`;
+  }
+  return null;
 }
 
 function isRalphMarkdownPath(path: string): boolean {
@@ -371,7 +430,7 @@ function escapeHtmlCommentMarkers(text: string): string {
 }
 
 export function defaultFrontmatter(): Frontmatter {
-  return { commands: [], maxIterations: 50, timeout: 300, guardrails: { blockCommands: [], protectedFiles: [] } };
+  return { commands: [], maxIterations: 50, timeout: 300, requiredOutputs: [], guardrails: { blockCommands: [], protectedFiles: [] } };
 }
 
 export function parseRalphMarkdown(raw: string): ParsedRalph {
@@ -398,6 +457,7 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
       timeout: Number(yaml.timeout ?? 300),
       completionPromise:
         typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
+      requiredOutputs: toStringArray(yaml.required_outputs),
       guardrails: {
         blockCommands: toStringArray(guardrails.block_commands),
         protectedFiles: toStringArray(guardrails.protected_files),
@@ -420,6 +480,12 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
   }
   if (fm.completionPromise !== undefined && !isSafeCompletionPromise(fm.completionPromise)) {
     return "Invalid completion_promise: must be a single-line string without line breaks or angle brackets";
+  }
+  for (const output of fm.requiredOutputs ?? []) {
+    const requiredOutputError = validateRequiredOutputEntry(output);
+    if (requiredOutputError) {
+      return requiredOutputError;
+    }
   }
   for (const pattern of fm.guardrails.blockCommands) {
     try {
@@ -473,6 +539,12 @@ export function acceptStrengthenedDraft(request: DraftRequest, strengthenedDraft
 
   const validationError = validateFrontmatter(strengthened.parsed.frontmatter);
   if (validationError) {
+    return null;
+  }
+
+  const baselineRequiredOutputs = baseline.parsed.frontmatter.requiredOutputs ?? [];
+  const strengthenedRequiredOutputs = strengthened.parsed.frontmatter.requiredOutputs ?? [];
+  if (baselineRequiredOutputs.join("\n") !== strengthenedRequiredOutputs.join("\n")) {
     return null;
   }
 
@@ -758,6 +830,7 @@ function buildDraftFrontmatter(mode: DraftMode, commands: CommandDef[]): Frontma
     commands,
     maxIterations: mode === "analysis" ? 12 : mode === "migration" ? 30 : 25,
     timeout: 300,
+    requiredOutputs: [],
     guardrails,
   };
 }
@@ -792,10 +865,14 @@ function commandIntentsToCommands(commandIntents: CommandIntent[]): CommandDef[]
 
 function renderDraftPlan(task: string, mode: DraftMode, target: DraftTarget, frontmatter: Frontmatter, source: DraftSource, body: string): DraftPlan {
   const metadata: DraftMetadata = { generator: "pi-ralph-loop", version: 2, source, task, mode };
+  const requiredOutputs = frontmatter.requiredOutputs ?? [];
   const frontmatterLines = [
     ...renderCommandsYaml(frontmatter.commands),
     `max_iterations: ${frontmatter.maxIterations}`,
     `timeout: ${frontmatter.timeout}`,
+    ...(requiredOutputs.length > 0
+      ? ["required_outputs:", ...requiredOutputs.map((output) => `  - ${yamlQuote(output)}`)]
+      : []),
     ...(frontmatter.completionPromise ? [`completion_promise: ${yamlQuote(frontmatter.completionPromise)}`] : []),
     "guardrails:",
     ...(frontmatter.guardrails.blockCommands.length > 0
@@ -814,7 +891,7 @@ function renderDraftPlan(task: string, mode: DraftMode, target: DraftTarget, fro
     content: `${metadataComment(metadata)}\n${yamlBlock(frontmatterLines)}\n\n${body}`,
     commandLabels: frontmatter.commands.map(formatCommandLabel),
     safetyLabel: summarizeSafetyLabel(frontmatter.guardrails),
-    finishLabel: summarizeFinishLabel(frontmatter.maxIterations),
+    finishLabel: summarizeFinishLabel(frontmatter),
   };
 }
 
@@ -993,8 +1070,29 @@ export function renderRalphBody(body: string, outputs: CommandOutput[], ralph: {
   return resolvePlaceholders(body, outputs, ralph).replace(/<!--[\s\S]*?-->/g, "");
 }
 
-export function renderIterationPrompt(body: string, iteration: number, maxIterations: number): string {
-  return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
+export function renderIterationPrompt(
+  body: string,
+  iteration: number,
+  maxIterations: number,
+  completionGate?: { completionPromise?: string; requiredOutputs?: string[]; failureReasons?: string[] },
+): string {
+  if (!completionGate) {
+    return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
+  }
+
+  const requiredOutputs = completionGate.requiredOutputs ?? [];
+  const failureReasons = completionGate.failureReasons ?? [];
+  const completionPromise = completionGate.completionPromise ?? "DONE";
+  const gateLines = [
+    "[completion gate]",
+    `- Required outputs must exist before stopping${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`,
+    "- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.",
+    "- Label inferred claims as HYPOTHESIS.",
+    ...(failureReasons.length > 0 ? [`- Previous gate failures: ${failureReasons.join("; ")}`] : []),
+    `- Emit <promise>${completionPromise}</promise> only when the gate is truly satisfied.`,
+  ];
+
+  return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}\n\n${gateLines.join("\n")}`;
 }
 
 export function shouldWarnForBashFailure(output: string): boolean {

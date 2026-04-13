@@ -101,7 +101,7 @@ test("parseRalphMarkdown falls back to default frontmatter when no frontmatter i
 
 test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => {
   const parsed = parseRalphMarkdown(
-    "\uFEFF---\r\ncommands:\r\n  - name: build\r\n    run: npm test\r\n    timeout: 15\r\nmax_iterations: 3\r\ntimeout: 12.5\r\ncompletion_promise: done\r\nguardrails:\r\n  block_commands:\r\n    - rm .*\r\n  protected_files:\r\n    - src/**\r\n---\r\nBody\r\n",
+    "\uFEFF---\r\ncommands:\r\n  - name: build\r\n    run: npm test\r\n    timeout: 15\r\nmax_iterations: 3\r\ntimeout: 12.5\r\nrequired_outputs:\r\n  - docs/ARCHITECTURE.md\r\ncompletion_promise: done\r\nguardrails:\r\n  block_commands:\r\n    - rm .*\r\n  protected_files:\r\n    - src/**\r\n---\r\nBody\r\n",
   );
 
   assert.deepEqual(parsed.frontmatter, {
@@ -109,6 +109,7 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
     maxIterations: 3,
     timeout: 12.5,
     completionPromise: "done",
+    requiredOutputs: ["docs/ARCHITECTURE.md"],
     guardrails: { blockCommands: ["rm .*"], protectedFiles: ["src/**"] },
     invalidCommandEntries: undefined,
   });
@@ -168,6 +169,34 @@ test("validateFrontmatter accepts valid input and rejects invalid bounds, names,
   assert.equal(
     validateFrontmatter(parseRalphMarkdown("---\ncommands:\n  - nope\n  - null\n---\nbody").frontmatter),
     "Invalid command entry at index 0",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), requiredOutputs: [""] }),
+    "Invalid required_outputs entry:  must be a relative file path",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), requiredOutputs: ["/abs.md"] }),
+    "Invalid required_outputs entry: /abs.md must be a relative file path",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), requiredOutputs: ["../oops.md"] }),
+    "Invalid required_outputs entry: ../oops.md must be a relative file path",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), requiredOutputs: ["docs/"] }),
+    "Invalid required_outputs entry: docs/ must be a relative file path",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), requiredOutputs: ["./file.md"] }),
+    "Invalid required_outputs entry: ./file.md must be a relative file path",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), requiredOutputs: ["docs/./guide.md"] }),
+    "Invalid required_outputs entry: docs/./guide.md must be a relative file path",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), requiredOutputs: ["docs/\nREADME.md"] }),
+    "Invalid required_outputs entry: docs/\nREADME.md must be a relative file path",
   );
 });
 
@@ -232,6 +261,30 @@ test("inspectDraftContent, validateDraftContent, and Mission Brief fail closed o
     assert.doesNotMatch(brief, /Finish behavior/, label);
     assert.doesNotMatch(brief, /<promise>/, label);
   }
+});
+
+test("acceptStrengthenedDraft rejects required_outputs changes", () => {
+  const request = makeFixRequest();
+  const strengthenedDraft = makeStrengthenedDraft(
+    [
+      "commands:",
+      "  - name: tests",
+      "    run: npm test",
+      "    timeout: 20",
+      "max_iterations: 20",
+      "timeout: 120",
+      "required_outputs:",
+      "  - ARCHITECTURE.md",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nKeep the change small.",
+  );
+
+  assert.equal(acceptStrengthenedDraft(request, strengthenedDraft), null);
 });
 
 test("inspectDraftContent, validateDraftContent, and Mission Brief fail closed on raw malformed guardrails values", () => {
@@ -400,6 +453,20 @@ test("render helpers expand placeholders and strip comments", () => {
   assert.equal(renderIterationPrompt("Body", 2, 5), "[ralph: iteration 2/5]\n\nBody");
 });
 
+test("renderIterationPrompt includes completion-gate reminders and previous failure reasons", () => {
+  const prompt = renderIterationPrompt("Body", 2, 5, {
+    completionPromise: "DONE",
+    requiredOutputs: ["ARCHITECTURE.md", "OPEN_QUESTIONS.md"],
+    failureReasons: ["Missing required output: ARCHITECTURE.md", "OPEN_QUESTIONS.md still has P0 items"],
+  });
+
+  assert.match(prompt, /Required outputs must exist before stopping: ARCHITECTURE\.md, OPEN_QUESTIONS\.md/);
+  assert.match(prompt, /OPEN_QUESTIONS\.md must have no remaining P0\/P1 items before stopping\./);
+  assert.match(prompt, /Label inferred claims as HYPOTHESIS\./);
+  assert.match(prompt, /Previous gate failures: Missing required output: ARCHITECTURE\.md; OPEN_QUESTIONS\.md still has P0 items/);
+  assert.match(prompt, /Emit <promise>DONE<\/promise> only when the gate is truly satisfied\./);
+});
+
 test("parseCommandArgs handles explicit task/path flags and auto mode", () => {
   assert.deepEqual(parseCommandArgs("--task reverse engineer auth"), { mode: "task", value: "reverse engineer auth" });
   assert.deepEqual(parseCommandArgs("--path my-task"), { mode: "path", value: "my-task" });
@@ -566,6 +633,41 @@ test("inspectDraftContent and validateDraftContent fail closed on raw malformed 
   }
 });
 
+test("inspectDraftContent, validateDraftContent, and Mission Brief fail closed on raw malformed required_outputs values", () => {
+  const plan = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+
+  for (const { label, rawValue, expectedError, briefError } of [
+    {
+      label: "required_outputs scalar",
+      rawValue: "required_outputs: docs/ARCHITECTURE.md",
+      expectedError: "Invalid RALPH frontmatter: required_outputs must be a YAML sequence",
+      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: required_outputs must be a YAML sequence/,
+    },
+    {
+      label: "required_outputs entry number",
+      rawValue: "required_outputs:\n  - 123",
+      expectedError: "Invalid RALPH frontmatter: required_outputs[0] must be a YAML string",
+      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: required_outputs\[0\] must be a YAML string/,
+    },
+  ] as const) {
+    const raw = plan.content.replace("timeout: 300\n", `${rawValue}\ntimeout: 300\n`);
+
+    assert.equal(inspectDraftContent(raw).error, expectedError, label);
+    assert.equal(validateDraftContent(raw), expectedError, label);
+
+    const brief = buildMissionBrief({ ...plan, content: raw });
+    assert.match(brief, /^Mission Brief/m, label);
+    assert.match(brief, briefError, label);
+    assert.doesNotMatch(brief, /Finish behavior/, label);
+    assert.doesNotMatch(brief, /<promise>/, label);
+  }
+});
+
+
 test("inspectDraftContent and validateDraftContent reject metadata-tagged generated drafts with malformed commands mappings", () => {
   const raw = makeStrengthenedDraft(
     [
@@ -687,6 +789,7 @@ test("generated drafts reparse as valid RALPH files", () => {
     maxIterations: 12,
     timeout: 300,
     completionPromise: undefined,
+    requiredOutputs: [],
     guardrails: { blockCommands: ["git\\s+push"], protectedFiles: [] },
     invalidCommandEntries: undefined,
   });
@@ -1320,6 +1423,8 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   const analysisBrief = buildMissionBrief(analysisDraft);
   assert.match(analysisBrief, /- blocks git push/);
   assert.doesNotMatch(analysisBrief, /read-only/);
+  assert.doesNotMatch(analysisBrief, /Required outputs must exist before stopping/);
+  assert.doesNotMatch(analysisBrief, /OPEN_QUESTIONS\.md must have no remaining P0\/P1 items before stopping\./);
 
   const fixDraft = generateDraft(
     "Fix flaky auth tests",
@@ -1382,6 +1487,8 @@ test("buildMissionBrief refreshes after draft edits", () => {
   assert.match(brief, /smoke: npm run smoke/);
   assert.match(brief, /Stop after 7 iterations or \/ralph-stop/);
   assert.match(brief, /Stop if an iteration exceeds 90s/);
+  assert.match(brief, /OPEN_QUESTIONS\.md must have no remaining P0\/P1 items before stopping\./);
   assert.match(brief, /Stop early on <promise>deploy-ready<\/promise>/);
+  assert.match(brief, /OPEN_QUESTIONS\.md must have no remaining P0\/P1 items before stopping\./);
   assert.doesNotMatch(brief, /tests: npm test/);
 });

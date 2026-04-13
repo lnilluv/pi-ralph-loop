@@ -2,14 +2,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
-  parseRalphMarkdown,
-  validateFrontmatter,
+  inspectDraftContent,
   renderRalphBody,
   renderIterationPrompt,
   shouldStopForCompletionPromise,
   type CommandDef,
   type CommandOutput,
-  type Frontmatter,
 } from "./ralph.ts";
 import { runCommands } from "./index.ts";
 import {
@@ -232,6 +230,83 @@ export function summarizeChangedFiles(changedFiles: string[]): string {
   return `${visible.join(", ")} (+${changedFiles.length - visible.length} more)`;
 }
 
+export type CompletionReadiness = {
+  ready: boolean;
+  reasons: string[];
+};
+
+function addReadinessReason(reasons: string[], reason: string): void {
+  if (!reasons.includes(reason)) {
+    reasons.push(reason);
+  }
+}
+
+function collectOpenQuestionsBlockingReasons(raw: string): string[] {
+  const reasons: string[] = [];
+  let currentPriority: "P0" | "P1" | undefined;
+  let currentPriorityDepth = 0;
+  let sawP0 = false;
+  let sawP1 = false;
+
+  for (const line of raw.split(/\r?\n/)) {
+    const priorityHeading = line.match(/^(#{1,6})\s+(P0|P1)\b/i);
+    if (priorityHeading) {
+      currentPriority = priorityHeading[2].toUpperCase() as "P0" | "P1";
+      currentPriorityDepth = priorityHeading[1].length;
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+/);
+    if (heading && currentPriority && heading[1].length <= currentPriorityDepth) {
+      currentPriority = undefined;
+      currentPriorityDepth = 0;
+      continue;
+    }
+
+    if (!currentPriority) continue;
+
+    const bullet = line.match(/^(?:[-*+]|\d+\.)\s+(.*)$/);
+    if (!bullet) continue;
+
+    const content = bullet[1].trim();
+    if (!content || /^\[[xX]\]\s*/.test(content)) continue;
+
+    if (currentPriority === "P0") sawP0 = true;
+    if (currentPriority === "P1") sawP1 = true;
+  }
+
+  if (sawP0) reasons.push("OPEN_QUESTIONS.md still has P0 items");
+  if (sawP1) reasons.push("OPEN_QUESTIONS.md still has P1 items");
+  return reasons;
+}
+
+export function validateCompletionReadiness(taskDir: string, requiredOutputs: string[]): CompletionReadiness {
+  const reasons: string[] = [];
+
+  for (const requiredOutput of requiredOutputs) {
+    const filePath = join(taskDir, requiredOutput);
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+      addReadinessReason(reasons, `Missing required output: ${requiredOutput}`);
+    }
+  }
+
+  const openQuestionsPath = join(taskDir, "OPEN_QUESTIONS.md");
+  if (!existsSync(openQuestionsPath) || !statSync(openQuestionsPath).isFile()) {
+    addReadinessReason(reasons, "Missing OPEN_QUESTIONS.md");
+  } else {
+    try {
+      const raw = readFileSync(openQuestionsPath, "utf8");
+      for (const reason of collectOpenQuestionsBlockingReasons(raw)) {
+        addReadinessReason(reasons, reason);
+      }
+    } catch {
+      addReadinessReason(reasons, "Missing OPEN_QUESTIONS.md");
+    }
+  }
+
+  return { ready: reasons.length === 0, reasons };
+}
+
 // --- Core Runner ---
 
 export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> {
@@ -258,7 +333,9 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
   let currentMaxIterations = initialMaxIterations;
   let currentTimeout = timeout;
   let currentCompletionPromise = initialCompletionPromise;
+  let currentRequiredOutputs: string[] = [];
   let currentGuardrails = initialGuardrails;
+  let completionGateFailureReasons: string[] = [];
   let noProgressStreak = 0;
   const iterations: IterationRecord[] = [];
   const startMs = Date.now();
@@ -301,17 +378,18 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       }
 
       const raw = readFileSync(ralphPath, "utf8");
-      const draftError = validateFrontmatter(parseRalphMarkdown(raw).frontmatter);
-      if (draftError) {
-        onNotify?.(`Invalid RALPH.md on iteration ${i}: ${draftError}`, "error");
+      const inspection = inspectDraftContent(raw);
+      if (inspection.error) {
+        onNotify?.(`Invalid RALPH.md on iteration ${i}: ${inspection.error}`, "error");
         finalStatus = "error";
         break;
       }
 
-      const { frontmatter: fm, body: rawBody } = parseRalphMarkdown(raw);
+      const { frontmatter: fm, body: rawBody } = inspection.parsed!;
       currentMaxIterations = fm.maxIterations;
       currentTimeout = fm.timeout;
       currentCompletionPromise = fm.completionPromise;
+      currentRequiredOutputs = fm.requiredOutputs ?? [];
       currentGuardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
 
       // Update status to running
@@ -339,7 +417,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
       // Render prompt
       const body = renderRalphBody(rawBody, commandsOutput, { iteration: i, name });
-      const prompt = renderIterationPrompt(body, i, currentMaxIterations);
+      const prompt = renderIterationPrompt(body, i, currentMaxIterations, currentCompletionPromise ? { completionPromise: currentCompletionPromise, requiredOutputs: currentRequiredOutputs, failureReasons: completionGateFailureReasons } : undefined);
 
       // Run RPC iteration
       onNotify?.(`Iteration ${i}/${currentMaxIterations} starting`, "info");
@@ -432,6 +510,20 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         }
       }
 
+      let completionGate: CompletionReadiness | undefined;
+      if (completionPromiseMatched && progress !== false) {
+        completionGate = validateCompletionReadiness(taskDir, currentRequiredOutputs);
+        if (!completionGate.ready) {
+          completionGateFailureReasons = completionGate.reasons;
+          onNotify?.(
+            `Completion gate blocked on iteration ${i}: ${completionGate.reasons.join("; ")}`,
+            "warning",
+          );
+        } else {
+          completionGateFailureReasons = [];
+        }
+      }
+
       // Build iteration record
       const iterRecord: IterationRecord = {
         iteration: i,
@@ -443,6 +535,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         changedFiles,
         noProgressStreak,
         completionPromiseMatched: completionPromiseMatched || undefined,
+        completionGate,
         snapshotTruncated,
         snapshotErrorCount,
       };
@@ -473,7 +566,11 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
             `Completion promise matched on iteration ${i}, but no durable progress was detected. Continuing.`,
             "warning",
           );
-          // Don't stop - continue iterating
+        } else if (completionGate && !completionGate.ready) {
+          onNotify?.(
+            `completion promise matched on iteration ${i}, but the completion gate failed. Continuing.`,
+            "warning",
+          );
         } else {
           if (progress === "unknown") {
             onNotify?.(

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { runRalphLoop } from "../src/runner.ts";
+import { runRalphLoop, validateCompletionReadiness } from "../src/runner.ts";
 import { readStatusFile, readIterationRecords, checkStopSignal, createStopSignal as createStopSignalFn } from "../src/runner-state.ts";
 import { generateDraft } from "../src/ralph.ts";
 import type { DraftTarget, CommandOutput, CommandDef } from "../src/ralph.ts";
@@ -260,6 +260,215 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("validateCompletionReadiness reports ready when required outputs exist and OPEN_QUESTIONS.md is clear", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nAll clear.\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]), { ready: true, reasons: [] });
+});
+
+test("validateCompletionReadiness reports blocking reasons for missing outputs and unresolved questions", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(
+    join(taskDir, "OPEN_QUESTIONS.md"),
+    "## P0\n- [ ] Decide the migration order\n\n## P1\n- [ ] Confirm the test plan\n",
+    "utf8",
+  );
+
+  const readiness = validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]);
+  assert.equal(readiness.ready, false);
+  assert.ok(readiness.reasons.includes("Missing required output: ARCHITECTURE.md"));
+  assert.ok(readiness.reasons.includes("OPEN_QUESTIONS.md still has P0 items"));
+  assert.ok(readiness.reasons.includes("OPEN_QUESTIONS.md still has P1 items"));
+});
+
+test("validateCompletionReadiness blocks on any markdown heading level used for P0 and P1 sections", (t) => {
+  const cases = [
+    {
+      label: "# P0",
+      content: "# P0\n- [ ] Decide the migration order\n",
+      expectedReason: "OPEN_QUESTIONS.md still has P0 items",
+    },
+    {
+      label: "### P1",
+      content: "### P1\n- [ ] Confirm the test plan\n",
+      expectedReason: "OPEN_QUESTIONS.md still has P1 items",
+    },
+    {
+      label: "nested subheading under ## P0",
+      content: "## P0\n### Notes\n- [ ] Decide the migration order\n",
+      expectedReason: "OPEN_QUESTIONS.md still has P0 items",
+    },
+  ] as const;
+
+  for (const { label, content, expectedReason } of cases) {
+    const taskDir = createTempDir();
+    t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), content, "utf8");
+
+    const readiness = validateCompletionReadiness(taskDir, []);
+    assert.equal(readiness.ready, false, label);
+    assert.ok(readiness.reasons.includes(expectedReason), label);
+  }
+});
+
+test("validateCompletionReadiness ignores checked items inside P0 and P1 sections", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(
+    join(taskDir, "OPEN_QUESTIONS.md"),
+    "# P0\n- [x] Decide the migration order\n\n### P1\n1. [X] Confirm the test plan\n",
+    "utf8",
+  );
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, []), { ready: true, reasons: [] });
+});
+
+test("validateCompletionReadiness ignores nested note bullets under checked items", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(
+    join(taskDir, "OPEN_QUESTIONS.md"),
+    "# P0\n- [x] Decide the migration order\n  - note: revisit after merge\n",
+    "utf8",
+  );
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, []), { ready: true, reasons: [] });
+});
+
+test("runRalphLoop does not stop on completion promise when required outputs are missing", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nAll clear.\n", "utf8");
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 2, completion_promise: "DONE", required_outputs: ["ARCHITECTURE.md"] }));
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 2,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status === "complete", false);
+    assert.equal(result.iterations.length, 2);
+    assert.equal(result.iterations[0].completionPromiseMatched, true);
+    assert.equal(result.iterations[0].completionGate?.ready, false);
+    assert.ok(result.iterations[0].completionGate?.reasons.includes("Missing required output: ARCHITECTURE.md"));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop does not stop on completion promise when OPEN_QUESTIONS.md still has P0 items", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "## P0\n- [ ] Decide the architecture\n", "utf8");
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 2, completion_promise: "DONE", required_outputs: ["ARCHITECTURE.md"] }));
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 2,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.notEqual(result.status, "complete");
+    assert.equal(result.iterations.length, 2);
+    assert.equal(result.iterations[0].completionGate?.ready, false);
+    assert.ok(result.iterations[0].completionGate?.reasons.includes("OPEN_QUESTIONS.md still has P0 items"));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop stops when the completion gate passes", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 3, completion_promise: "DONE", required_outputs: ["ARCHITECTURE.md"] }));
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 3,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "complete");
+    assert.equal(result.iterations.length, 1);
+    assert.equal(result.iterations[0].completionPromiseMatched, true);
+    assert.deepEqual(result.iterations[0].completionGate, { ready: true, reasons: [] });
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("runRalphLoop records iteration results to JSONL", async () => {
   const taskDir = createTempDir();
   try {
@@ -372,6 +581,59 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.equal(result.iterations.length, 1);
     // With progress but max_iterations reached, could be either max-iterations or complete
     assert.ok(["max-iterations", "no-progress-exhaustion", "complete", "error"].includes(result.status));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop fails closed when live RALPH.md reparse sees malformed raw required_outputs", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 3 }));
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const notifications: Array<{ message: string; level: string }> = [];
+    let completedIterations = 0;
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 3,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      onIterationComplete() {
+        completedIterations++;
+        if (completedIterations === 1) {
+          writeFileSync(
+            ralphPath,
+            `---\ncommands: []\nmax_iterations: 3\ntimeout: 5\nrequired_outputs: ARCHITECTURE.md\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nTask: Do something\n`,
+            "utf8",
+          );
+        }
+      },
+      onNotify(message, level) {
+        notifications.push({ message, level });
+      },
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "error");
+    assert.equal(result.iterations.length, 1);
+    assert.ok(
+      notifications.some((n) => n.message.includes("Invalid RALPH.md on iteration 2: Invalid RALPH frontmatter: required_outputs must be a YAML sequence")),
+    );
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }

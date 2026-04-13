@@ -197,7 +197,7 @@ In the `tool_result` hook, bash outputs are scanned for failure patterns. After 
 
 ### Completion promise
 
-When `completion_promise` is set (for example, `"DONE"`), the loop scans the agent's messages for `<promise>DONE</promise>` after each iteration. If found, the loop stops early.
+When `completion_promise` is set (for example, `"DONE"`), the loop scans the agent's messages for `<promise>DONE</promise>` after each iteration. If found, the loop only stops early once the completion gate passes: any configured required outputs must exist, and `OPEN_QUESTIONS.md` must have no remaining P0/P1 items.
 
 ### Iteration timeout
 

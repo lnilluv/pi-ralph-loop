@@ -260,6 +260,7 @@ test("iteration record captures all status fields", () => {
       changedFiles: ["notes/findings.md", "src/index.ts"],
       noProgressStreak: 0,
       completionPromiseMatched: true,
+      completionGate: { ready: false, reasons: ["Missing required output: ARCHITECTURE.md"] },
       snapshotTruncated: false,
       snapshotErrorCount: 0,
     };

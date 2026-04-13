@@ -26,6 +26,7 @@ export type IterationRecord = {
   changedFiles: string[];
   noProgressStreak: number;
   completionPromiseMatched?: boolean;
+  completionGate?: { ready: boolean; reasons: string[] };
   snapshotTruncated?: boolean;
   snapshotErrorCount?: number;
 };
