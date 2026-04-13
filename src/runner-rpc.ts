@@ -147,6 +147,12 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
 
     const cleanup = () => {
       clearTimeout(timeout);
+      // Close stdin so the subprocess knows no more commands are coming
+      try {
+        childProcess.stdin?.end();
+      } catch {
+        // already closed
+      }
     };
 
     const settle = (result: RpcSubprocessResult) => {
@@ -254,7 +260,6 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
 
     try {
       childProcess.stdin?.write(promptCommand + "\n");
-      childProcess.stdin?.end();
       promptSent = true;
     } catch (err) {
       settle({
