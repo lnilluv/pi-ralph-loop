@@ -52,6 +52,17 @@ export type RunnerConfig = {
   spawnCommand?: string;
   /** Override for the RPC spawn args, for testing */
   spawnArgs?: string[];
+  /** Model pattern for RPC subprocess, e.g. "openai-codex/gpt-5.4-mini" or "anthropic/claude-sonnet-4"
+   * Format: "provider/modelId" or "provider/modelId:thinkingLevel"
+   * The thinking level suffix (e.g. ":high") is sent via set_thinking_level.
+   */
+  modelPattern?: string;
+  /** Provider for set_model (overrides modelPattern provider) */
+  provider?: string;
+  /** ModelId for set_model (overrides modelPattern modelId) */
+  modelId?: string;
+  /** Thinking level for set_thinking_level: "off", "minimal", "low", "medium", "high", "xhigh" */
+  thinkingLevel?: string;
   /** Callbacks */
   onIterationStart?: (iteration: number, maxIterations: number) => void;
   onIterationComplete?: (record: IterationRecord) => void;
@@ -339,6 +350,10 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         timeoutMs: currentTimeout * 1000,
         spawnCommand,
         spawnArgs,
+        modelPattern: config.modelPattern,
+        provider: config.provider,
+        modelId: config.modelId,
+        thinkingLevel: config.thinkingLevel,
       });
 
       const iterEndMs = Date.now();

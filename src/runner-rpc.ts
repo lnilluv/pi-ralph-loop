@@ -18,10 +18,19 @@ export type RpcSubprocessConfig = {
   spawnArgs?: string[];
   /** Additional environment variables for the subprocess */
   env?: Record<string, string>;
-  /** Model pattern, e.g. "openai-codex/gpt-5.4" */
+  /** Model selection for RPC subprocess. Format: "provider/modelId" or "provider/modelId:thinkingLevel"
+   * Examples: "anthropic/claude-sonnet-4-20250514" or "openai-codex/gpt-5.4-mini:high"
+   * Parsed into set_model + set_thinking_level commands.
+   */
   modelPattern?: string;
-  /** Provider, e.g. "openai-codex" */
+  /** Explicit provider for set_model (overrides modelPattern provider) */
   provider?: string;
+  /** Explicit modelId for set_model (overrides modelPattern modelId) */
+  modelId?: string;
+  /** Thinking level for set_thinking_level: "off", "minimal", "low", "medium", "high", "xhigh".
+   * Also parsed from modelPattern suffix (e.g. ":high").
+   */
+  thinkingLevel?: string;
   /** Callback for observing events as they stream */
   onEvent?: (event: RpcEvent) => void;
 };
@@ -98,9 +107,31 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     spawnArgs,
     env,
     modelPattern,
-    provider,
+    provider: explicitProvider,
+    modelId: explicitModelId,
     onEvent,
   } = config;
+
+  // Parse modelPattern ("provider/modelId" or "provider/modelId:thinking") into provider and modelId
+  let modelProvider = explicitProvider;
+  let modelModelId = explicitModelId;
+  let thinkingLevel = config.thinkingLevel;
+  if (modelPattern && !explicitModelId) {
+    // Extract thinking level suffix (e.g. ":high")
+    const lastColonIdx = modelPattern.lastIndexOf(":");
+    const validThinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+    let patternWithoutThinking = modelPattern;
+    if (lastColonIdx > 0 && validThinkingLevels.has(modelPattern.slice(lastColonIdx + 1))) {
+      thinkingLevel = modelPattern.slice(lastColonIdx + 1);
+      patternWithoutThinking = modelPattern.slice(0, lastColonIdx);
+    }
+    
+    const slashIdx = patternWithoutThinking.indexOf("/");
+    if (slashIdx > 0) {
+      modelProvider = patternWithoutThinking.slice(0, slashIdx);
+      modelModelId = patternWithoutThinking.slice(slashIdx + 1);
+    }
+  }
 
   const args = spawnArgs ?? ["--mode", "rpc", "--no-session"];
   const subprocessEnv = { ...process.env, ...env };
@@ -128,6 +159,8 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     let agentEndMessages: unknown[] = [];
     let promptSent = false;
     let promptAcknowledged = false;
+    let modelSetAcknowledged = !(modelProvider && modelModelId); // true if no set_model needed
+    let thinkingLevelAcknowledged = !thinkingLevel; // true if no set_thinking_level needed
 
     const timeout = setTimeout(() => {
       if (settled) return;
@@ -194,6 +227,12 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
 
         if (event.type === "response") {
           const resp = event as { command?: string; success?: boolean };
+          if (resp.command === "set_model" && resp.success === true) {
+            modelSetAcknowledged = true;
+          }
+          if (resp.command === "set_thinking_level" && resp.success === true) {
+            thinkingLevelAcknowledged = true;
+          }
           if (resp.command === "prompt" && resp.success === true) {
             promptAcknowledged = true;
           }
@@ -251,24 +290,89 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       });
     });
 
-    // Send the prompt command
-    const promptCommand = JSON.stringify({
-      type: "prompt",
-      id: `ralph-${randomUUID()}`,
-      message: prompt,
-    });
-
-    try {
-      childProcess.stdin?.write(promptCommand + "\n");
-      promptSent = true;
-    } catch (err) {
-      settle({
-        success: false,
-        lastAssistantText,
-        agentEndMessages,
-        timedOut: false,
-        error: err instanceof Error ? err.message : String(err),
+    // Send set_model command if provider/model are specified
+    if (modelProvider && modelModelId) {
+      const setModelCommand = JSON.stringify({
+        type: "set_model",
+        provider: modelProvider,
+        modelId: modelModelId,
       });
+      try {
+        childProcess.stdin?.write(setModelCommand + "\n");
+      } catch (err) {
+        settle({
+          success: false,
+          lastAssistantText,
+          agentEndMessages,
+          timedOut: false,
+          error: `Failed to send set_model command: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return;
+      }
+    }
+
+    // Send set_thinking_level if specified
+    if (thinkingLevel) {
+      const setThinkingCommand = JSON.stringify({
+        type: "set_thinking_level",
+        level: thinkingLevel,
+      });
+      try {
+        childProcess.stdin?.write(setThinkingCommand + "\n");
+      } catch (err) {
+        settle({
+          success: false,
+          lastAssistantText,
+          agentEndMessages,
+          timedOut: false,
+          error: `Failed to send set_thinking_level command: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return;
+      }
+    }
+
+    // Wait for set_model acknowledgment before sending prompt
+    const sendPrompt = () => {
+      // Send the prompt command
+      const promptCommand = JSON.stringify({
+        type: "prompt",
+        id: `ralph-${randomUUID()}`,
+        message: prompt,
+      });
+
+      try {
+        childProcess.stdin?.write(promptCommand + "\n");
+        promptSent = true;
+      } catch (err) {
+        settle({
+          success: false,
+          lastAssistantText,
+          agentEndMessages,
+          timedOut: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
+    if (modelSetAcknowledged && thinkingLevelAcknowledged) {
+      sendPrompt();
+    } else {
+      // Poll for acknowledgments before sending prompt
+      const checkInterval = setInterval(() => {
+        if ((modelSetAcknowledged && thinkingLevelAcknowledged) || settled) {
+          clearInterval(checkInterval);
+          if (!settled && !promptSent) {
+            sendPrompt();
+          }
+        }
+      }, 50);
+      // Safety: send prompt after 5s even if acknowledgments never come
+      setTimeout(() => {
+        clearInterval(checkInterval);
+        if (!promptSent) {
+          sendPrompt();
+        }
+      }, 5000);
     }
   });
 }
