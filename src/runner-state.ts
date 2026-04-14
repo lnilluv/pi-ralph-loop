@@ -582,7 +582,13 @@ export function readIterationRecords(taskDir: string): IterationRecord[] {
     return raw
       .split("\n")
       .filter((line) => line.trim())
-      .map((line) => JSON.parse(line) as IterationRecord);
+      .flatMap((line) => {
+        try {
+          return [JSON.parse(line) as IterationRecord];
+        } catch {
+          return [];
+        }
+      });
   } catch {
     return [];
   }

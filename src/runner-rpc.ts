@@ -416,22 +416,19 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     if (modelSetAcknowledged && thinkingLevelAcknowledged) {
       sendPrompt();
     } else {
-      // Poll for acknowledgments before sending prompt
-      const checkInterval = setInterval(() => {
-        if ((modelSetAcknowledged && thinkingLevelAcknowledged) || settled) {
-          clearInterval(checkInterval);
-          if (!settled && !promptSent) {
-            sendPrompt();
-          }
+      const waitForAcknowledgements = async () => {
+        const deadline = Date.now() + 5000;
+        while (!settled && !promptSent && Date.now() < deadline) {
+          if (modelSetAcknowledged && thinkingLevelAcknowledged) break;
+          await new Promise<void>((resolveWait) => setTimeout(resolveWait, 50));
         }
-      }, 50);
-      // Safety: send prompt after 5s even if acknowledgments never come
-      setTimeout(() => {
-        clearInterval(checkInterval);
-        if (!promptSent) {
+      };
+
+      void waitForAcknowledgements().then(() => {
+        if (!settled && !promptSent) {
           sendPrompt();
         }
-      }, 5000);
+      });
     }
   });
 }

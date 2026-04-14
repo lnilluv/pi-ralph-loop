@@ -132,6 +132,46 @@ type RegisterRalphCommandServices = {
   runRalphLoopFn?: typeof runRalphLoop;
 };
 
+type StopTargetSource = "session" | "registry" | "status";
+
+type StopTarget = {
+  cwd: string;
+  taskDir: string;
+  ralphPath: string;
+  loopToken: string;
+  currentIteration: number;
+  maxIterations: number;
+  startedAt: string;
+  source: StopTargetSource;
+};
+
+type ToolEvent = {
+  toolName?: string;
+  toolCallId?: string;
+  input?: {
+    path?: string;
+    command?: string;
+  };
+  isError?: boolean;
+  success?: boolean;
+};
+
+type AgentEndEvent = {
+  messages?: CommandSessionEntry[];
+  error?: unknown;
+};
+
+type ToolResultEvent = {
+  toolName?: string;
+  content: Array<{ type: string; text?: string }>;
+};
+
+type BeforeAgentStartEvent = {
+  systemPrompt: string;
+};
+
+type EventContext = Pick<CommandContext, "sessionManager">;
+
 
 function validateFrontmatter(fm: Frontmatter, ctx: Pick<CommandContext, "ui">): boolean {
   const error = validateFrontmatterMessage(fm);
@@ -839,6 +879,111 @@ async function draftFromTask(
   return target.ralphPath;
 }
 
+function resolveSessionStopTarget(ctx: Pick<CommandContext, "cwd" | "sessionManager">, now: string): {
+  target?: StopTarget;
+  persistedSessionState?: ActiveLoopState;
+} {
+  if (loopState.active) {
+    return {
+      target: {
+        cwd: loopState.cwd || ctx.cwd,
+        taskDir: loopState.taskDir,
+        ralphPath: loopState.ralphPath,
+        loopToken: loopState.loopToken ?? "",
+        currentIteration: loopState.iteration,
+        maxIterations: loopState.maxIterations,
+        startedAt: now,
+        source: "session",
+      },
+    };
+  }
+
+  const persistedSessionState = readActiveLoopState(ctx);
+  if (
+    !persistedSessionState ||
+    typeof persistedSessionState.taskDir !== "string" ||
+    persistedSessionState.taskDir.length === 0 ||
+    typeof persistedSessionState.loopToken !== "string" ||
+    persistedSessionState.loopToken.length === 0 ||
+    typeof persistedSessionState.iteration !== "number" ||
+    typeof persistedSessionState.maxIterations !== "number"
+  ) {
+    return { persistedSessionState };
+  }
+
+  return {
+    persistedSessionState,
+    target: {
+      cwd: typeof persistedSessionState.cwd === "string" && persistedSessionState.cwd.length > 0 ? persistedSessionState.cwd : ctx.cwd,
+      taskDir: persistedSessionState.taskDir,
+      ralphPath: join(persistedSessionState.taskDir, "RALPH.md"),
+      loopToken: persistedSessionState.loopToken,
+      currentIteration: persistedSessionState.iteration,
+      maxIterations: persistedSessionState.maxIterations,
+      startedAt: now,
+      source: "session",
+    },
+  };
+}
+
+function materializeRegistryStopTarget(entry: ActiveLoopRegistryEntry): StopTarget {
+  return {
+    cwd: entry.cwd,
+    taskDir: entry.taskDir,
+    ralphPath: entry.ralphPath,
+    loopToken: entry.loopToken,
+    currentIteration: entry.currentIteration,
+    maxIterations: entry.maxIterations,
+    startedAt: entry.startedAt,
+    source: "registry",
+  };
+}
+
+function applyStopTarget(
+  pi: ExtensionAPI,
+  ctx: Pick<CommandContext, "cwd" | "ui">,
+  target: StopTarget,
+  now: string,
+  persistedSessionState?: ActiveLoopState,
+): void {
+  createStopSignal(target.taskDir);
+
+  const registryCwd = target.cwd;
+  const existingEntry = readActiveLoopRegistry(registryCwd).find((entry) => entry.taskDir === target.taskDir);
+  const registryEntry: ActiveLoopRegistryEntry = existingEntry
+    ? {
+        ...existingEntry,
+        taskDir: target.taskDir,
+        ralphPath: target.ralphPath,
+        cwd: registryCwd,
+        updatedAt: now,
+      }
+    : {
+        taskDir: target.taskDir,
+        ralphPath: target.ralphPath,
+        cwd: registryCwd,
+        loopToken: target.loopToken,
+        status: "running",
+        currentIteration: target.currentIteration,
+        maxIterations: target.maxIterations,
+        startedAt: target.startedAt,
+        updatedAt: now,
+      };
+  writeActiveLoopRegistryEntry(registryCwd, registryEntry);
+  recordActiveLoopStopRequest(registryCwd, target.taskDir, now);
+
+  if (target.source === "session") {
+    loopState.stopRequested = true;
+    if (loopState.active) {
+      persistLoopState(pi, toPersistedLoopState(loopState, { active: true, stopRequested: true }));
+    } else if (persistedSessionState?.active) {
+      persistLoopState(pi, { ...persistedSessionState, stopRequested: true });
+    }
+  }
+
+  ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
+}
+
 let loopState: LoopState = defaultLoopState();
 const RALPH_EXTENSION_REGISTERED = Symbol.for("pi-ralph-loop.registered");
 
@@ -879,7 +1024,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   const clearPendingIteration = (loopToken: string, iteration: number) => {
     pendingIterations.delete(getLoopIterationKey(loopToken, iteration));
   };
-  const resolvePendingIteration = (ctx: Pick<CommandContext, "sessionManager">, event: any) => {
+  const resolvePendingIteration = (ctx: EventContext, event: AgentEndEvent) => {
     const state = resolveActiveIterationState(ctx);
     if (!state) return;
     const pendingKey = getLoopIterationKey(state.loopToken, state.iteration);
@@ -888,20 +1033,20 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     pendingIterations.delete(pendingKey);
     const error = event.error instanceof Error ? event.error : event.error ? new Error(String(event.error)) : undefined;
     pending.completion.resolve({
-      messages: Array.isArray(event.messages) ? event.messages : [],
+      messages: event.messages ?? [],
       observedTaskDirWrites: new Set(pending.observedTaskDirWrites),
       error,
     });
   };
-  const recordPendingToolPath = (ctx: Pick<CommandContext, "sessionManager">, event: any) => {
+  const recordPendingToolPath = (ctx: EventContext, event: ToolEvent) => {
     const pending = getPendingIteration(ctx);
     if (!pending) return;
     if (event.toolName !== "write" && event.toolName !== "edit") return;
     const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-    const filePath = (event.input as { path?: string } | undefined)?.path ?? "";
+    const filePath = event.input?.path ?? "";
     if (toolCallId && filePath) pending.toolCallPaths.set(toolCallId, filePath);
   };
-  const recordSuccessfulTaskDirWrite = (ctx: Pick<CommandContext, "sessionManager">, event: any) => {
+  const recordSuccessfulTaskDirWrite = (ctx: EventContext, event: ToolEvent) => {
     const pending = getPendingIteration(ctx);
     if (!pending) return;
     if (event.toolName !== "write" && event.toolName !== "edit") return;
@@ -1143,7 +1288,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     return handleExistingInspection(parsed.value);
   }
 
-  pi.on("tool_call", async (event: any, ctx: any) => {
+  pi.on("tool_call", async (event: ToolEvent, ctx: EventContext) => {
     const persisted = resolveActiveLoopState(ctx);
     if (!persisted) return;
 
@@ -1182,19 +1327,19 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     recordPendingToolPath(ctx, event);
   });
 
-  pi.on("tool_execution_start", async (event: any, ctx: any) => {
+  pi.on("tool_execution_start", async (event: ToolEvent, ctx: EventContext) => {
     recordPendingToolPath(ctx, event);
   });
 
-  pi.on("tool_execution_end", async (event: any, ctx: any) => {
+  pi.on("tool_execution_end", async (event: ToolEvent, ctx: EventContext) => {
     recordSuccessfulTaskDirWrite(ctx, event);
   });
 
-  pi.on("agent_end", async (event: any, ctx: any) => {
+  pi.on("agent_end", async (event: AgentEndEvent, ctx: EventContext) => {
     resolvePendingIteration(ctx, event);
   });
 
-  pi.on("before_agent_start", async (event: any, ctx: any) => {
+  pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: EventContext) => {
     const persisted = resolveActiveLoopState(ctx);
     if (!persisted) return;
     const summaries = persisted?.iterationSummaries ?? [];
@@ -1230,13 +1375,12 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     };
   });
 
-  pi.on("tool_result", async (event: any, ctx: any) => {
+  pi.on("tool_result", async (event: ToolResultEvent, ctx: EventContext) => {
     const persisted = resolveActiveLoopState(ctx);
-    if (!persisted) return;
     if (!persisted) return;
 
     if (event.toolName !== "bash") return;
-    const output = event.content.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text ?? "" : "")).join("");
+    const output = event.content.map((c) => (c.type === "text" ? c.text ?? "" : "")).join("");
     if (!shouldWarnForBashFailure(output)) return;
 
     const state = resolveActiveIterationState(ctx);
@@ -1289,104 +1433,12 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
-      type StopTarget = {
-        cwd: string;
-        taskDir: string;
-        ralphPath: string;
-        loopToken: string;
-        currentIteration: number;
-        maxIterations: number;
-        startedAt: string;
-        source: "session" | "registry" | "status";
-      };
-
       const now = new Date().toISOString();
       const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
-      const inProcessSessionTarget: StopTarget | undefined = loopState.active
-        ? {
-            cwd: loopState.cwd || ctx.cwd,
-            taskDir: loopState.taskDir,
-            ralphPath: loopState.ralphPath,
-            loopToken: loopState.loopToken ?? "",
-            currentIteration: loopState.iteration,
-            maxIterations: loopState.maxIterations,
-            startedAt: now,
-            source: "session",
-          }
-        : undefined;
-      const persistedSessionState = inProcessSessionTarget ? undefined : readActiveLoopState(ctx);
-      const sessionTarget: StopTarget | undefined =
-        persistedSessionState &&
-        typeof persistedSessionState.taskDir === "string" &&
-        persistedSessionState.taskDir.length > 0 &&
-        typeof persistedSessionState.loopToken === "string" &&
-        persistedSessionState.loopToken.length > 0 &&
-        typeof persistedSessionState.iteration === "number" &&
-        typeof persistedSessionState.maxIterations === "number"
-          ? {
-              cwd: typeof persistedSessionState.cwd === "string" && persistedSessionState.cwd.length > 0 ? persistedSessionState.cwd : ctx.cwd,
-              taskDir: persistedSessionState.taskDir,
-              ralphPath: join(persistedSessionState.taskDir, "RALPH.md"),
-              loopToken: persistedSessionState.loopToken,
-              currentIteration: persistedSessionState.iteration,
-              maxIterations: persistedSessionState.maxIterations,
-              startedAt: now,
-              source: "session",
-            }
-          : inProcessSessionTarget;
-
-      const materializeRegistryTarget = (entry: ActiveLoopRegistryEntry): StopTarget => ({
-        cwd: entry.cwd,
-        taskDir: entry.taskDir,
-        ralphPath: entry.ralphPath,
-        loopToken: entry.loopToken,
-        currentIteration: entry.currentIteration,
-        maxIterations: entry.maxIterations,
-        startedAt: entry.startedAt,
-        source: "registry",
-      });
-
-      const stopTarget = (target: StopTarget): void => {
-        createStopSignal(target.taskDir);
-
-        const registryCwd = target.cwd;
-        const existingEntry = readActiveLoopRegistry(registryCwd).find((entry) => entry.taskDir === target.taskDir);
-        const registryEntry: ActiveLoopRegistryEntry = existingEntry
-          ? {
-              ...existingEntry,
-              taskDir: target.taskDir,
-              ralphPath: target.ralphPath,
-              cwd: registryCwd,
-              updatedAt: now,
-            }
-          : {
-              taskDir: target.taskDir,
-              ralphPath: target.ralphPath,
-              cwd: registryCwd,
-              loopToken: target.loopToken,
-              status: "running",
-              currentIteration: target.currentIteration,
-              maxIterations: target.maxIterations,
-              startedAt: target.startedAt,
-              updatedAt: now,
-            };
-        writeActiveLoopRegistryEntry(registryCwd, registryEntry);
-        recordActiveLoopStopRequest(registryCwd, target.taskDir, now);
-
-        if (target.source === "session") {
-          loopState.stopRequested = true;
-          if (loopState.active) {
-            persistLoopState(pi, toPersistedLoopState(loopState, { active: true, stopRequested: true }));
-          } else if (persistedSessionState?.active) {
-            persistLoopState(pi, { ...persistedSessionState, stopRequested: true });
-          }
-        }
-
-        ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
-      };
+      const { target: sessionTarget, persistedSessionState } = resolveSessionStopTarget(ctx, now);
 
       if (sessionTarget && !parsed.value) {
-        stopTarget(sessionTarget);
+        applyStopTarget(pi, ctx, sessionTarget, now, persistedSessionState);
         return;
       }
 
@@ -1411,13 +1463,13 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
         const taskDir = dirname(inspection.ralphPath);
         if (sessionTarget && sessionTarget.taskDir === taskDir) {
-          stopTarget(sessionTarget);
+          applyStopTarget(pi, ctx, sessionTarget, now, persistedSessionState);
           return;
         }
 
         const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === taskDir || entry.ralphPath === inspection.ralphPath);
         if (registryTarget) {
-          stopTarget(materializeRegistryTarget(registryTarget));
+          applyStopTarget(pi, ctx, materializeRegistryStopTarget(registryTarget), now);
           return;
         }
 
@@ -1432,7 +1484,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
             (entry) => entry.taskDir === taskDir && entry.loopToken === statusFile.loopToken,
           );
           if (statusRegistryTarget) {
-            stopTarget(materializeRegistryTarget(statusRegistryTarget));
+            applyStopTarget(pi, ctx, materializeRegistryStopTarget(statusRegistryTarget), now);
             return;
           }
         }
@@ -1442,7 +1494,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
 
       if (sessionTarget) {
-        stopTarget(sessionTarget);
+        applyStopTarget(pi, ctx, sessionTarget, now, persistedSessionState);
         return;
       }
 
@@ -1456,7 +1508,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
-      stopTarget(materializeRegistryTarget(activeEntries[0]));
+      applyStopTarget(pi, ctx, materializeRegistryStopTarget(activeEntries[0]), now);
     },
   });
 }

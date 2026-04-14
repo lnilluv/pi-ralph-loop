@@ -817,6 +817,14 @@ function parseExplicitPathRuntimeArgs(rawTail: string): { runtimeArgs: RuntimeAr
   return { runtimeArgs };
 }
 
+function parseExplicitPathCommandArgs(valueWithArgs: string): CommandArgs {
+  const argMatch = valueWithArgs.match(/(?:^|\s)--arg(?:\s|=|[^\s=]*=|$)/);
+  const argIndex = argMatch?.index ?? valueWithArgs.length;
+  const value = argMatch ? valueWithArgs.slice(0, argIndex).trim() : valueWithArgs.trim();
+  const parsedArgs = parseExplicitPathRuntimeArgs(argMatch ? valueWithArgs.slice(argIndex).trim() : "");
+  return { mode: "path", value, runtimeArgs: parsedArgs.runtimeArgs, error: parsedArgs.error ?? undefined };
+}
+
 export function parseCommandArgs(raw: string): CommandArgs {
   const cleaned = raw.trim();
 
@@ -835,20 +843,10 @@ export function parseCommandArgs(raw: string): CommandArgs {
     return { mode: "task", value, runtimeArgs: [], error: undefined };
   }
   if (cleaned.startsWith("--path=")) {
-    const valueWithArgs = cleaned.slice("--path=".length).trimStart();
-    const argMatch = valueWithArgs.match(/(?:^|\s)--arg(?:\s|=|[^\s=]*=|$)/);
-    const argIndex = argMatch?.index ?? valueWithArgs.length;
-    const value = argMatch ? valueWithArgs.slice(0, argIndex).trim() : valueWithArgs.trim();
-    const parsedArgs = parseExplicitPathRuntimeArgs(argMatch ? valueWithArgs.slice(argIndex).trim() : "");
-    return { mode: "path", value, runtimeArgs: parsedArgs.runtimeArgs, error: parsedArgs.error ?? undefined };
+    return parseExplicitPathCommandArgs(cleaned.slice("--path=".length).trimStart());
   }
   if (cleaned.startsWith("--path ")) {
-    const valueWithArgs = cleaned.slice("--path ".length).trimStart();
-    const argMatch = valueWithArgs.match(/(?:^|\s)--arg(?:\s|=|[^\s=]*=|$)/);
-    const argIndex = argMatch?.index ?? valueWithArgs.length;
-    const value = argMatch ? valueWithArgs.slice(0, argIndex).trim() : valueWithArgs.trim();
-    const parsedArgs = parseExplicitPathRuntimeArgs(argMatch ? valueWithArgs.slice(argIndex).trim() : "");
-    return { mode: "path", value, runtimeArgs: parsedArgs.runtimeArgs, error: parsedArgs.error ?? undefined };
+    return parseExplicitPathCommandArgs(cleaned.slice("--path ".length).trimStart());
   }
   return { mode: "auto", value: cleaned, runtimeArgs: [], error: undefined };
 }

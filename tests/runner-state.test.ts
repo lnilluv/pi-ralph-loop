@@ -192,6 +192,29 @@ test("readIterationRecords returns empty array when no file exists", () => {
   }
 });
 
+test("readIterationRecords skips corrupted JSONL lines without discarding valid entries", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    writeFileSync(
+      join(taskDir, ".ralph-runner", "iterations.jsonl"),
+      [
+        JSON.stringify(makeIterationRecord({ iteration: 1, changedFiles: ["one.md"] })),
+        "{not json",
+        JSON.stringify(makeIterationRecord({ iteration: 2, progress: false, changedFiles: [], noProgressStreak: 1 })),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const records = readIterationRecords(taskDir);
+    assert.equal(records.length, 2);
+    assert.equal(records[0].iteration, 1);
+    assert.equal(records[1].iteration, 2);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("appendIterationRecord creates iterations.jsonl if missing", () => {
   const taskDir = createTempDir();
   try {
