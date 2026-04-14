@@ -25,16 +25,11 @@ If you need to replace the entire RPC invocation, use `--loop-rpc-command` or `P
 
 The harness writes fresh artifact bundles on demand; it does not depend on checked-in baseline snapshots.
 
-## Running Ralphify later
+## Alternate implementation
 
-To compare against Ralphify, point the harness at the Ralphify RPC command and switch the implementation flag:
+The harness can also replay a supplied compatible RPC command with `--implementation ralphify` or `--implementation both`.
 
-```bash
-PI_RALPH_PARITY_RALPHIFY_RPC_COMMAND='pi --mode rpc --no-extensions -e /path/to/ralphify/src/index.ts --model openai-codex/gpt-5.4-mini:high' \
-python3 parity/harness.py --implementation ralphify --fixture research --fixture migrate
-```
-
-If the Ralphify flow needs a different prompt command, override `PI_RALPH_PARITY_RALPHIFY_PROMPT_TEMPLATE`.
+If the alternate flow needs a different prompt command, override `PI_RALPH_PARITY_RALPHIFY_PROMPT_TEMPLATE`.
 
 ## Useful environment variables
 
