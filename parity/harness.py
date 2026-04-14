@@ -16,11 +16,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
-DEFAULT_MODEL = os.environ.get("PI_RALPH_PARITY_MODEL", "openai-codex/gpt-5.4-mini:high")
-DEFAULT_LOOP_RPC_COMMAND = os.environ.get(
-    "PI_RALPH_PARITY_LOOP_RPC_COMMAND",
-    f"pi --mode rpc --no-extensions -e {shlex.quote(str(REPO_ROOT / 'src' / 'index.ts'))} --model {shlex.quote(DEFAULT_MODEL)}",
-)
+DEFAULT_MODEL = os.environ.get("PI_RALPH_PARITY_MODEL")
+DEFAULT_LOOP_RPC_COMMAND = os.environ.get("PI_RALPH_PARITY_LOOP_RPC_COMMAND")
 DEFAULT_RALPHIFY_RPC_COMMAND = os.environ.get("PI_RALPH_PARITY_RALPHIFY_RPC_COMMAND", "")
 DEFAULT_LOOP_PROMPT_TEMPLATE = os.environ.get("PI_RALPH_PARITY_LOOP_PROMPT_TEMPLATE", "/ralph --path {ralph_path}")
 DEFAULT_RALPHIFY_PROMPT_TEMPLATE = os.environ.get(
@@ -129,6 +126,20 @@ def create_bundle_root(explicit_root: str | None) -> Path:
         root.mkdir(parents=True, exist_ok=True)
         return root
     return Path(tempfile.mkdtemp(prefix="pi-ralph-parity-")).resolve()
+
+
+def build_loop_rpc_command(model: str | None) -> list[str]:
+    command = [
+        "pi",
+        "--mode",
+        "rpc",
+        "--no-extensions",
+        "-e",
+        str(REPO_ROOT / "src" / "index.ts"),
+    ]
+    if model:
+        command.extend(["--model", model])
+    return command
 
 
 def run_git(args: list[str]) -> str:
@@ -425,9 +436,14 @@ def main() -> int:
         help="Reuse this artifact root instead of creating a fresh temp dir.",
     )
     parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Model to pin for the built-in pi-ralph-loop command. If omitted, pi uses the currently active model.",
+    )
+    parser.add_argument(
         "--loop-rpc-command",
         default=DEFAULT_LOOP_RPC_COMMAND,
-        help="RPC command used for pi-ralph-loop.",
+        help="Full RPC command override for pi-ralph-loop. When set, this replaces the built-in pi command entirely.",
     )
     parser.add_argument(
         "--ralphify-rpc-command",
@@ -465,7 +481,11 @@ def main() -> int:
     env = os.environ.copy()
     env["PI_CODING_AGENT_DIR"] = agent_info["destination"]
 
-    loop_command = parse_command(args.loop_rpc_command)
+    loop_command = (
+        parse_command(args.loop_rpc_command)
+        if args.loop_rpc_command
+        else build_loop_rpc_command(args.model)
+    )
     ralphify_command = parse_command(args.ralphify_rpc_command) if args.ralphify_rpc_command else None
 
     runs: list[dict[str, Any]] = []

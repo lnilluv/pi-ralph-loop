@@ -7,7 +7,7 @@ This directory holds the checked-in parity fixtures and the harness used to repl
 - `research/` — a frozen Factory.ai public-surface research pass backed by checked-in snapshot files.
 - `migrate/` — a deterministic migration-style task with helper scripts and a golden/verifier check.
 
-## Baseline command
+## Replay command
 
 From the repo root:
 
@@ -17,14 +17,13 @@ python3 parity/harness.py --implementation pi-ralph-loop --fixture research --fi
 
 The harness creates a fresh temp artifact root by default, runs each selected fixture in its own copied workspace, and prints the absolute artifact root path when it finishes.
 
-## Checked-in baseline
+## Model selection
 
-The checked-in baseline evidence is named for the commit it covers: `a941a79830a2110ecf0ec69fe28419f04d49627a`.
+By default the parity harness uses the currently active pi model. Set `--model` or `PI_RALPH_PARITY_MODEL` to pin a specific model, including models chosen from `/scoped-models`.
 
-- Pointer file: `parity/baselines/a941a79830a2110ecf0ec69fe28419f04d49627a.json`
-- Evidence bundle: `parity/baselines/a941a79830a2110ecf0ec69fe28419f04d49627a/`
+If you need to replace the entire RPC invocation, use `--loop-rpc-command` or `PI_RALPH_PARITY_LOOP_RPC_COMMAND`.
 
-`parity/latest-baseline.json` points at that snapshot.
+The harness writes fresh artifact bundles on demand; it does not depend on checked-in baseline snapshots.
 
 ## Running Ralphify later
 
@@ -40,8 +39,8 @@ If the Ralphify flow needs a different prompt command, override `PI_RALPH_PARITY
 ## Useful environment variables
 
 - `PI_RALPH_PARITY_ROOT` — reuse a specific artifact root instead of creating a fresh temp directory.
-- `PI_RALPH_PARITY_MODEL` — override the default model used by the built-in `pi-ralph-loop` command.
-- `PI_RALPH_PARITY_LOOP_RPC_COMMAND` — replace the default `pi-ralph-loop` RPC command.
+- `PI_RALPH_PARITY_MODEL` — pin a model for the built-in `pi-ralph-loop` command.
+- `PI_RALPH_PARITY_LOOP_RPC_COMMAND` — replace the built-in `pi-ralph-loop` RPC command entirely.
 - `PI_RALPH_PARITY_RALPHIFY_RPC_COMMAND` — set the Ralphify RPC command.
 - `PI_RALPH_PARITY_LOOP_PROMPT_TEMPLATE` — override the prompt command for `pi-ralph-loop`.
 - `PI_RALPH_PARITY_RALPHIFY_PROMPT_TEMPLATE` — override the prompt command for Ralphify.

@@ -240,7 +240,7 @@ The extension validates `RALPH.md` frontmatter before starting and on each re-pa
 
 ## Parity harness
 
-Checked-in parity fixtures and the replay harness live in `parity/`. See `parity/README.md` for the exact rerun command, artifact layout, and environment variables.
+Checked-in parity fixtures and the replay harness live in `parity/`. The harness uses the active pi model by default and can pin a specific model with `--model` or `PI_RALPH_PARITY_MODEL`. See `parity/README.md` for the exact rerun command, artifact layout, and environment variables.
 
 ## License
 

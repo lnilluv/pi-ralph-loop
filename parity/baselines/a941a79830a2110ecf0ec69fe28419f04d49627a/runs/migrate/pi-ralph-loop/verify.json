@@ -1,9 +1,0 @@
-{
-  "command": [
-    "bash",
-    "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task/scripts/verify.sh"
-  ],
-  "cwd": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task",
-  "passed": true,
-  "returncode": 0
-}
