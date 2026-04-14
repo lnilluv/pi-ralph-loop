@@ -851,7 +851,16 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   const draftPlanFactory = services.createDraftPlan ?? createDraftPlanService;
   const isLoopSession = (ctx: Pick<CommandContext, "sessionManager">): boolean => resolveActiveLoopState(ctx) !== undefined;
   const appendLoopProofEntry = (customType: string, data: Record<string, unknown>): void => {
-    pi.appendEntry?.(customType, data);
+    try {
+      pi.appendEntry?.(customType, data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      try {
+        process.stderr.write(`Ralph proof logging failed for ${customType}: ${message}\n`);
+      } catch {
+        // Best-effort surfacing only.
+      }
+    }
   };
   const getPendingIteration = (ctx: Pick<CommandContext, "sessionManager">): PendingIterationState | undefined => {
     const state = resolveActiveIterationState(ctx);

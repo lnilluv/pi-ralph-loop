@@ -2922,6 +2922,16 @@ test("/ralph subprocess child surfaces proof appendEntry failures", { concurrenc
   });
   t.after(restoreEnv);
 
+  const stderrWrites: string[] = [];
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  (process.stderr as any).write = (chunk: unknown) => {
+    stderrWrites.push(String(chunk));
+    return true;
+  };
+  t.after(() => {
+    (process.stderr as any).write = originalStderrWrite;
+  });
+
   const harness = createHarness({
     appendEntry: () => {
       throw new Error("append failed");
@@ -2929,13 +2939,17 @@ test("/ralph subprocess child surfaces proof appendEntry failures", { concurrenc
   });
   const beforeAgentStart = harness.event("before_agent_start");
 
-  await assert.rejects(
+  await assert.doesNotReject(
     beforeAgentStart(
       { systemPrompt: "Base prompt" },
       { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } },
     ),
-    /append failed/,
   );
+
+  const stderrOutput = stderrWrites.join("");
+  assert.match(stderrOutput, /Ralph proof logging failed/);
+  assert.match(stderrOutput, /ralph-steering-injected/);
+  assert.match(stderrOutput, /ralph-loop-context-injected/);
 });
 
 test("/ralph subprocess child injects durable loop context into before_agent_start when session entries are empty", { concurrency: false }, async (t) => {
