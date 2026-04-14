@@ -53,7 +53,7 @@ Smart drafting sends the selected repo excerpts from the current repo context to
 
 ## How it works
 
-Each iteration re-reads `RALPH.md`, runs the configured commands, injects their output into `{{ commands.<name> }}` placeholders, and sends the task to a fresh `pi --mode rpc` subprocess instead of keeping a long-lived in-process session. Failed command output appears in the next iteration, which keeps the loop self-healing.
+Each iteration re-reads `RALPH.md`, runs the configured commands, injects their output into `{{ commands.<name> }}` placeholders, and sends the task to a fresh `pi --mode rpc` subprocess instead of keeping a long-lived in-process session. If `RALPH_PROGRESS.md` exists at the task root, Ralph injects it into every prompt as a short writable memory and ignores its churn when deciding whether the loop made durable progress. Failed command output appears in the next iteration, which keeps the loop self-healing.
 
 ### Subprocess runner
 
@@ -105,11 +105,13 @@ The runner hashes task-directory files before and after each iteration and diffs
 Use these when you want to skip heuristics:
 
 ```text
-/ralph --path my-task
+/ralph --path my-task --arg owner=Ada
 /ralph --task "reverse engineer the billing flow"
 /ralph-draft --path my-task
 /ralph-draft --task "fix flaky auth tests"
 ```
+
+`--arg` is for reusable templates that already declare runtime parameters. It is applied only when `/ralph` runs an existing `RALPH.md`; `/ralph-draft` leaves arg placeholders untouched for now.
 
 ### Interactive review
 
@@ -119,6 +121,8 @@ Draft flows require an interactive UI because the extension uses a Mission Brief
 
 ```md
 ---
+args:
+  - owner
 commands:
   - name: tests
     run: npm test
@@ -127,6 +131,7 @@ commands:
     run: npm run lint
     timeout: 60
 max_iterations: 25
+inter_iteration_delay: 0
 timeout: 300
 completion_promise: "DONE"
 guardrails:
@@ -159,7 +164,10 @@ Strengthened body-and-commands drafts keep the deterministic baseline exact: com
 | `commands[].name` | string | required | Must match `^\w[\w-]*$`; key for `{{ commands.<name> }}` |
 | `commands[].run` | string | required | Shell command |
 | `commands[].timeout` | number | `60` | Seconds before kill; greater than 0 and at most 300 seconds, and must be `<= timeout` |
+| `args` | string[] | `[]` | Declared runtime parameters for reusable templates |
+| `args[]` | string | required | Must match `^\w[\w-]*$`; key for `{{ args.<name> }}` |
 | `max_iterations` | integer | `50` | Stop after N iterations; must be 1-50 |
+| `inter_iteration_delay` | integer | `0` | Wait N seconds between completed iterations; must be a non-negative integer |
 | `timeout` | number | `300` | Per-iteration timeout in seconds; must be greater than 0 and at most 300; stops the loop if the agent is stuck |
 | `completion_promise` | string | — | Agent signals completion by sending `<promise>DONE</promise>`; loop breaks on match |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns to block in bash |
@@ -170,10 +178,12 @@ Strengthened body-and-commands drafts keep the deterministic baseline exact: com
 | Placeholder | Description |
 |-------------|-------------|
 | `{{ commands.<name> }}` | Output from the command named `<name>` |
+| `{{ args.<name> }}` | Runtime value supplied with `--arg name=value` during `/ralph` |
 | `{{ ralph.iteration }}` | Current 1-based iteration number |
 | `{{ ralph.name }}` | Directory name containing the `RALPH.md` |
+| `{{ ralph.max_iterations }}` | Top-level iteration limit from the current frontmatter |
 
-HTML comments (`<!-- ... -->`) are stripped from the prompt body after placeholder resolution, so you can annotate your `RALPH.md` freely. Generated drafts also escape literal `<!--` and `-->` in the visible task line, and the leading metadata comment is URL-encoded so task text can safely contain comment-like sequences.
+HTML comments (`<!-- ... -->`) are stripped from the prompt body after placeholder resolution, so you can annotate your `RALPH.md` freely. `args` are resolved at runtime during `/ralph` runs only; the template file is never rewritten with supplied values. Generated drafts also escape literal `<!--` and `-->` in the visible task line, and the leading metadata comment is URL-encoded so task text can safely contain comment-like sequences.
 
 ## Commands
 

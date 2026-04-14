@@ -15,6 +15,7 @@ import {
   ensureRunnerDir,
   readIterationRecords,
   readStatusFile,
+  writeIterationTranscript,
   writeStatusFile,
 } from "../src/runner-state.ts";
 
@@ -293,6 +294,37 @@ test("runner status follows expected lifecycle", () => {
     writeStatusFile(taskDir, makeStatusFile({ taskDir, status: "complete", loopToken: token, currentIteration: 3 }));
     assert.equal(readStatusFile(taskDir)?.status, "complete");
     assert.equal(readStatusFile(taskDir)?.currentIteration, 3);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("writeIterationTranscript writes a human-reviewable markdown transcript", () => {
+  const taskDir = createTempDir();
+  try {
+    const transcriptPath = writeIterationTranscript(taskDir, {
+      record: makeIterationRecord({
+        iteration: 2,
+        status: "complete",
+        progress: true,
+        changedFiles: ["notes/findings.md", "src/index.ts"],
+        noProgressStreak: 0,
+      }),
+      prompt: "Rendered prompt for iteration 2",
+      commandOutputs: [{ name: "tests", output: "all green" }],
+      assistantText: "Finished the task.",
+    });
+
+    assert.ok(transcriptPath.includes(".ralph-runner/transcripts"));
+    const raw = readFileSync(transcriptPath, "utf8");
+    assert.ok(raw.includes("Iteration 2"));
+    assert.ok(raw.includes("Status: complete"));
+    assert.ok(raw.includes("Rendered prompt for iteration 2"));
+    assert.ok(raw.includes("tests"));
+    assert.ok(raw.includes("all green"));
+    assert.ok(raw.includes("Finished the task."));
+    assert.ok(raw.includes("notes/findings.md"));
+    assert.ok(raw.includes("src/index.ts"));
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }

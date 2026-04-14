@@ -3,16 +3,33 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import registerRalphCommands from "../src/index.ts";
+import registerRalphCommands, { runCommands } from "../src/index.ts";
 import { SECRET_PATH_POLICY_TOKEN } from "../src/secret-paths.ts";
 import { generateDraft, parseRalphMarkdown, slugifyTask, validateFrontmatter, type DraftPlan, type DraftTarget } from "../src/ralph.ts";
 import type { StrengthenDraftRuntime } from "../src/ralph-draft-llm.ts";
 import type { RunnerConfig, RunnerResult } from "../src/runner.ts";
 import { runRalphLoop as realRunRalphLoop, captureTaskDirectorySnapshot, assessTaskDirectoryProgress, summarizeChangedFiles } from "../src/runner.ts";
-import type { IterationRecord } from "../src/runner-state.ts";
+import { appendIterationRecord, writeStatusFile, type IterationRecord, type RunnerStatusFile } from "../src/runner-state.ts";
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-loop-index-"));
+}
+
+function setRunnerEnv(values: Record<string, string>): () => void {
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(values)) {
+    previous.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+  return () => {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  };
 }
 
 function createTarget(cwd: string, task: string): DraftTarget {
@@ -100,7 +117,7 @@ function createHarness(options?: {
   // Default mock runner that simulates iterations using the test context's
   // waitForIdle and directory snapshot detection
   const defaultRunLoopFn = async (config: RunnerConfig): Promise<RunnerResult> => {
-    const { ralphPath, maxIterations, onIterationStart, onIterationComplete, onStatusChange, onNotify, runCommandsFn, pi } = config;
+    const { ralphPath, cwd, maxIterations, onIterationStart, onIterationComplete, onStatusChange, onNotify, runCommandsFn, pi } = config;
     const iterations: IterationRecord[] = [];
     let noProgressStreak = 0;
     let finalStatus: RunnerResult["status"] = "max-iterations";
@@ -149,7 +166,7 @@ function createHarness(options?: {
       const runtimeCtx = resolveRuntimeCtx();
 
       if (runCommandsFn && pi) {
-        await runCommandsFn(fm.commands, currentGuardrails.blockCommands, pi);
+        await runCommandsFn(fm.commands, currentGuardrails.blockCommands, pi, cwd, dirname(ralphPath));
       }
 
       const snapshotBefore = captureTaskDirectorySnapshot(ralphPath);
@@ -352,6 +369,179 @@ function createRuntimeSession(entries: Array<any>, sessionFile: string, waitForI
     },
   };
 }
+
+test("registerRalphCommands is idempotent for the same extension API instance", () => {
+  const registeredCommands: string[] = [];
+  const registeredEvents: string[] = [];
+  const pi = {
+    on: (eventName: string) => {
+      registeredEvents.push(eventName);
+    },
+    registerCommand: (name: string) => {
+      registeredCommands.push(name);
+    },
+    appendEntry: () => undefined,
+    sendUserMessage: () => undefined,
+    exec: async () => ({ killed: false, stdout: "", stderr: "" }),
+  } as any;
+
+  registerRalphCommands(pi, {} as any);
+  registerRalphCommands(pi, {} as any);
+
+  assert.deepEqual(registeredCommands, ["ralph", "ralph-draft", "ralph-stop"]);
+  assert.deepEqual(registeredEvents, [
+    "tool_call",
+    "tool_execution_start",
+    "tool_execution_end",
+    "agent_end",
+    "before_agent_start",
+    "tool_result",
+  ]);
+});
+
+test("runCommands keeps plain frontmatter commands in the repo cwd", async () => {
+  const repoCwd = createTempDir();
+  const taskDir = join(repoCwd, "task");
+  mkdirSync(taskDir, { recursive: true });
+  try {
+    const originalCwd = process.cwd();
+    const observed: Array<{ tool: string; args: string[]; options?: { cwd?: string }; cwdAtExec: string }> = [];
+    const pi = {
+      exec: async (tool: string, args: string[], options?: { cwd?: string }) => {
+        observed.push({ tool, args, options, cwdAtExec: process.cwd() });
+        return { killed: false, stdout: "", stderr: "" };
+      },
+    } as any;
+
+    await runCommands(
+      [
+        { name: "npm test", run: "npm test", timeout: 1 },
+        { name: "git log", run: "git log --oneline", timeout: 1 },
+      ],
+      [],
+      pi,
+      {},
+      repoCwd,
+      taskDir,
+    );
+
+    assert.equal(observed.length, 2);
+    assert.deepEqual(observed.map(({ options }) => options?.cwd), [repoCwd, repoCwd]);
+    assert.equal(observed[0].cwdAtExec, originalCwd);
+    assert.equal(process.cwd(), originalCwd);
+  } finally {
+    rmSync(repoCwd, { recursive: true, force: true });
+  }
+});
+
+test("runCommands runs ./-prefixed frontmatter commands from the task directory", async () => {
+  const repoCwd = createTempDir();
+  const taskDir = join(repoCwd, "task");
+  mkdirSync(taskDir, { recursive: true });
+  try {
+    const originalCwd = process.cwd();
+    const observed: Array<{ tool: string; args: string[]; options?: { cwd?: string }; cwdAtExec: string }> = [];
+    const pi = {
+      exec: async (tool: string, args: string[], options?: { cwd?: string }) => {
+        observed.push({ tool, args, options, cwdAtExec: process.cwd() });
+        return { killed: false, stdout: "", stderr: "" };
+      },
+    } as any;
+
+    await runCommands([{ name: "build", run: "  ./scripts/build", timeout: 1 }], [], pi, {}, repoCwd, taskDir);
+
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0].tool, "bash");
+    assert.equal(observed[0].options?.cwd, taskDir);
+    assert.equal(observed[0].cwdAtExec, originalCwd);
+    assert.equal(process.cwd(), originalCwd);
+  } finally {
+    rmSync(repoCwd, { recursive: true, force: true });
+  }
+});
+
+test("runCommands uses the semantic command form to choose taskDir for templated ./-prefixed args", async () => {
+  const repoCwd = createTempDir();
+  const taskDir = join(repoCwd, "task");
+  mkdirSync(taskDir, { recursive: true });
+  try {
+    const originalCwd = process.cwd();
+    const observed: Array<{ tool: string; args: string[]; options?: { cwd?: string }; cwdAtExec: string }> = [];
+    const pi = {
+      exec: async (tool: string, args: string[], options?: { cwd?: string }) => {
+        observed.push({ tool, args, options, cwdAtExec: process.cwd() });
+        return { killed: false, stdout: "", stderr: "" };
+      },
+    } as any;
+
+    await runCommands(
+      [{ name: "check", run: "{{ args.tool }} --flag", timeout: 1 }],
+      [],
+      pi,
+      { tool: "./scripts/check.sh" },
+      repoCwd,
+      taskDir,
+    );
+
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0].tool, "bash");
+    assert.equal(observed[0].args[1], "'./scripts/check.sh' --flag");
+    assert.equal(observed[0].options?.cwd, taskDir);
+    assert.equal(observed[0].cwdAtExec, originalCwd);
+    assert.equal(process.cwd(), originalCwd);
+  } finally {
+    rmSync(repoCwd, { recursive: true, force: true });
+  }
+});
+
+test("/ralph-stop writes the durable stop flag from persisted active loop state after reload", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "persisted-loop-task");
+  mkdirSync(taskDir, { recursive: true });
+  const persistedState = {
+    active: true,
+    loopToken: "persisted-loop-token",
+    cwd,
+    taskDir,
+    iteration: 3,
+    maxIterations: 5,
+    noProgressStreak: 0,
+    iterationSummaries: [],
+    guardrails: { blockCommands: [], protectedFiles: [] },
+    stopRequested: false,
+  };
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-stop");
+  let ctx: any;
+  ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: createSessionManager([
+      {
+        type: "custom",
+        customType: "ralph-loop-state",
+        data: persistedState,
+      },
+    ], "session-a"),
+    getRuntimeCtx: () => ctx,
+  };
+
+  await handler("", ctx);
+
+  assert.equal(existsSync(join(taskDir, ".ralph-runner", "stop.flag")), true);
+  assert.ok(notifications.some(({ message }) => message.includes("Ralph loop stopping after current iteration")));
+  assert.equal(notifications.some(({ message }) => message.includes("No active ralph loop")), false);
+});
 
 test("/ralph reverse engineer this app with an injected llm-strengthened draft still shows review before start", async (t) => {
   const cwd = createTempDir();
@@ -601,6 +791,227 @@ test("/ralph --path existing-task/RALPH.md bypasses the drafting pipeline", asyn
   await handler(`--path ${existingRalphPath}`, ctx);
 
   assert.equal(draftCalls.length, 0);
+});
+
+test("/ralph --path existing-task/RALPH.md with args resolves them safely at runtime", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "arg-task");
+  const ralphPath = join(taskDir, "RALPH.md");
+  mkdirSync(taskDir, { recursive: true });
+  writeFileSync(
+    ralphPath,
+    [
+      "---",
+      "args:",
+      "  - owner",
+      "commands:",
+      "  - name: greet",
+      "    run: echo {{ args.owner }}",
+      "    timeout: 1",
+      "max_iterations: 1",
+      "timeout: 1",
+      "guardrails:",
+      "  block_commands: []",
+      "  protected_files: []",
+      "---",
+      "Hello {{ args.owner }}",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const execCalls: string[] = [];
+  let observedRuntimeArgs: Record<string, string> | undefined;
+  const harness = createHarness({
+    exec: async (_tool: string, args: string[]) => {
+      execCalls.push(args.join(" "));
+      return { killed: false, stdout: "hello Ada", stderr: "" };
+    },
+    runRalphLoopFn: async (config: RunnerConfig) => {
+      observedRuntimeArgs = config.runtimeArgs;
+      await config.runCommandsFn?.(
+        [{ name: "greet", run: "echo {{ args.owner }}", timeout: 1 }],
+        [],
+        config.pi,
+        config.cwd,
+        dirname(config.ralphPath),
+      );
+      return {
+        status: "complete",
+        iterations: [
+          {
+            iteration: 1,
+            status: "complete",
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            durationMs: 0,
+            progress: false,
+            changedFiles: [],
+            noProgressStreak: 0,
+          },
+        ],
+        totalDurationMs: 0,
+      };
+    },
+  });
+
+  const handler = harness.handler("ralph");
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => ({ cancelled: true }),
+    waitForIdle: async () => undefined,
+  };
+
+  await handler(`--path ${ralphPath} --arg owner=Ada`, ctx);
+
+  assert.equal(Object.getPrototypeOf(observedRuntimeArgs), null);
+  assert.deepEqual({ ...observedRuntimeArgs }, { owner: "Ada" });
+  assert.deepEqual(execCalls, ["-c echo 'Ada'"]);
+  assert.equal(notifications.some(({ message }) => message.includes("Invalid RALPH.md")), false);
+});
+
+test("/ralph --path existing-task/RALPH.md rejects missing and extra args", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "arg-task");
+  const ralphPath = join(taskDir, "RALPH.md");
+  mkdirSync(taskDir, { recursive: true });
+  writeFileSync(
+    ralphPath,
+    [
+      "---",
+      "args:",
+      "  - owner",
+      "commands:",
+      "  - name: greet",
+      "    run: echo {{ args.owner }}",
+      "    timeout: 1",
+      "max_iterations: 1",
+      "timeout: 1",
+      "guardrails:",
+      "  block_commands: []",
+      "  protected_files: []",
+      "---",
+      "Hello {{ args.owner }}",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const harness = createHarness({
+    runRalphLoopFn: async () => {
+      throw new Error("loop should not start when args are invalid");
+    },
+  });
+  const handler = harness.handler("ralph");
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => ({ cancelled: true }),
+    waitForIdle: async () => undefined,
+  };
+
+  await handler(`--path ${ralphPath}`, ctx);
+  await handler(`--path ${ralphPath} --arg extra=value`, ctx);
+
+  assert.deepEqual(notifications, [
+    { level: "error", message: "Missing required arg: owner" },
+    { level: "error", message: "Undeclared arg: extra" },
+  ]);
+});
+
+test("/ralph --task ... --arg ... is rejected", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const harness = createHarness({
+    runRalphLoopFn: async () => {
+      throw new Error("loop should not start");
+    },
+  });
+  const handler = harness.handler("ralph");
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => ({ cancelled: true }),
+    waitForIdle: async () => undefined,
+  };
+
+  await handler("--task reverse engineer auth --arg owner=Ada", ctx);
+
+  assert.deepEqual(notifications, [
+    { level: "error", message: "--arg is only supported with /ralph --path" },
+  ]);
+});
+
+test("/ralph-draft rejects runtime args for now", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const harness = createHarness({
+    runRalphLoopFn: async () => {
+      throw new Error("loop should not start");
+    },
+  });
+  const handler = harness.handler("ralph-draft");
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => ({ cancelled: true }),
+    waitForIdle: async () => undefined,
+  };
+
+  await handler("--path task-folder --arg owner=Ada", ctx);
+
+  assert.deepEqual(notifications, [
+    { level: "error", message: "--arg is only supported with /ralph --path" },
+  ]);
 });
 
 test("/ralph rejects raw invalid completion_promise values before parsing loop state", async (t) => {
@@ -1124,6 +1535,53 @@ test("tool_call scopes guardrails to the session with the active persisted Ralph
   assert.deepEqual(activeResult, { block: true, reason: `ralph: ${protectedPath} is protected` });
 });
 
+test("tool_call blocks when durable status is restrictive even if env contract is permissive", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "task");
+  mkdirSync(taskDir, { recursive: true });
+  const durableStatus: RunnerStatusFile = {
+    loopToken: "loop-status-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd: taskDir,
+    status: "running",
+    currentIteration: 2,
+    maxIterations: 4,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: { blockCommands: ["git\\s+push"], protectedFiles: ["src/generated/**"] },
+  };
+  writeStatusFile(taskDir, durableStatus);
+
+  const harness = createHarness();
+  const toolCall = harness.event("tool_call");
+  const restoreEnv = setRunnerEnv({
+    RALPH_RUNNER_TASK_DIR: taskDir,
+    RALPH_RUNNER_CWD: taskDir,
+    RALPH_RUNNER_LOOP_TOKEN: "loop-status-token",
+    RALPH_RUNNER_CURRENT_ITERATION: "2",
+    RALPH_RUNNER_MAX_ITERATIONS: "4",
+    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
+    RALPH_RUNNER_GUARDRAILS: JSON.stringify({ blockCommands: [], protectedFiles: [] }),
+  });
+
+  try {
+    const result = await toolCall({ toolName: "write", input: { path: "src/generated/output.ts" } }, {
+      sessionManager: {
+        getEntries: () => [],
+        getSessionFile: () => "session-a",
+      },
+    });
+
+    assert.equal(result?.block, true);
+  } finally {
+    restoreEnv();
+  }
+});
+
+
 test("/ralph still resolves completion_promise after runtime session rebinding", { concurrency: false }, async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -1549,6 +2007,60 @@ test("/ralph does not count pre-agent command mutations as durable progress", as
 
   const finalState = latestLoopState(entries);
   assert.equal(existsSync(join(target.dirPath, "command-log.txt")), true);
+  assert.equal(finalState?.iterationSummaries?.[0]?.progress, false);
+  assert.deepEqual(finalState?.iterationSummaries?.[0]?.changedFiles, []);
+  assert.equal(finalState?.iterationSummaries?.[0]?.noProgressStreak, 1);
+  assert.ok(notifications.some(({ message }) => message.includes("Iteration 1 made no durable progress")));
+});
+
+test("/ralph does not count RALPH_PROGRESS.md churn as durable progress", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const task = "Fix flaky auth tests";
+  const target = createTarget(cwd, task);
+  const draft = generateDraft(task, target, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    lintCommand: "npm run lint",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  mkdirSync(target.dirPath, { recursive: true });
+  writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness({
+    exec: async () => {
+      writeFileSync(join(target.dirPath, "RALPH_PROGRESS.md"), "rolling note\n", "utf8");
+      return { killed: false, stdout: "ok", stderr: "" };
+    },
+  });
+  const entries = harness.appendedEntries;
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => {
+        throw new Error("should not prompt");
+      },
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => entries, getSessionFile: () => "session-a" },
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+
+  await handler(`--path ${target.ralphPath}`, ctx);
+
+  const finalState = latestLoopState(entries);
   assert.equal(finalState?.iterationSummaries?.[0]?.progress, false);
   assert.deepEqual(finalState?.iterationSummaries?.[0]?.changedFiles, []);
   assert.equal(finalState?.iterationSummaries?.[0]?.noProgressStreak, 1);
@@ -2325,4 +2837,285 @@ test("tool_call keeps explicit protected-file globs working", async () => {
 
   const allowed = await toolCall({ toolName: "write", input: { path: "src/app.ts" } }, ctx);
   assert.equal(allowed, undefined);
+});
+
+test("/ralph subprocess child resolves guardrails from durable runner state when session entries are empty", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "subprocess-child-task");
+  mkdirSync(taskDir, { recursive: true });
+  writeStatusFile(taskDir, {
+    loopToken: "subprocess-loop-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: { blockCommands: ["git\\s+push"], protectedFiles: ["src/generated/**"] },
+  });
+
+  const restoreEnv = setRunnerEnv({
+    RALPH_RUNNER_TASK_DIR: taskDir,
+    RALPH_RUNNER_CWD: cwd,
+    RALPH_RUNNER_LOOP_TOKEN: "subprocess-loop-token",
+    RALPH_RUNNER_CURRENT_ITERATION: "1",
+    RALPH_RUNNER_MAX_ITERATIONS: "5",
+    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
+    RALPH_RUNNER_GUARDRAILS: JSON.stringify({ blockCommands: ["git\\s+push"], protectedFiles: ["src/generated/**"] }),
+  });
+  t.after(restoreEnv);
+
+  const harness = createHarness();
+  const toolCall = harness.event("tool_call");
+  const result = await toolCall(
+    { toolName: "bash", input: { command: "git push origin main" } },
+    { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } },
+  );
+
+  assert.deepEqual(result, { block: true, reason: "ralph: blocked (git\\s+push)" });
+});
+
+test("/ralph subprocess child injects durable loop context into before_agent_start when session entries are empty", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "subprocess-child-task");
+  mkdirSync(taskDir, { recursive: true });
+  writeStatusFile(taskDir, {
+    loopToken: "subprocess-loop-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 2,
+    maxIterations: 4,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  appendIterationRecord(taskDir, {
+    iteration: 1,
+    status: "complete",
+    startedAt: new Date(Date.now() - 1000).toISOString(),
+    completedAt: new Date().toISOString(),
+    durationMs: 1000,
+    progress: true,
+    changedFiles: ["notes/findings.md"],
+    noProgressStreak: 0,
+    snapshotTruncated: false,
+    snapshotErrorCount: 0,
+    loopToken: "subprocess-loop-token",
+  } as any);
+
+  const restoreEnv = setRunnerEnv({
+    RALPH_RUNNER_TASK_DIR: taskDir,
+    RALPH_RUNNER_CWD: cwd,
+    RALPH_RUNNER_LOOP_TOKEN: "subprocess-loop-token",
+    RALPH_RUNNER_CURRENT_ITERATION: "2",
+    RALPH_RUNNER_MAX_ITERATIONS: "4",
+    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
+    RALPH_RUNNER_GUARDRAILS: JSON.stringify({ blockCommands: [], protectedFiles: [] }),
+  });
+  t.after(restoreEnv);
+
+  const harness = createHarness();
+  const beforeAgentStart = harness.event("before_agent_start");
+  const result = await beforeAgentStart(
+    { systemPrompt: "Base prompt" },
+    { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } },
+  );
+
+  assert.ok(result);
+  assert.match(result.systemPrompt, /## Ralph Loop Context/);
+  assert.match(result.systemPrompt, /Iteration 2\/4/);
+  assert.match(result.systemPrompt, /Task directory: \.\/subprocess-child-task/);
+  assert.match(result.systemPrompt, /Previous iterations:\n- Iteration 1: 1s — durable progress \(notes\/findings\.md\); no-progress streak: 0/);
+  assert.match(result.systemPrompt, /Last iteration durable progress: notes\/findings\.md\./);
+});
+
+test("/ralph subprocess child scopes durable history to the current loop token", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "subprocess-child-task");
+  mkdirSync(taskDir, { recursive: true });
+  writeStatusFile(taskDir, {
+    loopToken: "current-loop-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 2,
+    maxIterations: 5,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  appendIterationRecord(taskDir, {
+    loopToken: "stale-loop-token",
+    iteration: 1,
+    status: "complete",
+    startedAt: new Date(Date.now() - 2000).toISOString(),
+    completedAt: new Date(Date.now() - 1000).toISOString(),
+    durationMs: 1000,
+    progress: true,
+    changedFiles: ["stale/findings.md"],
+    noProgressStreak: 0,
+  } as any);
+  appendIterationRecord(taskDir, {
+    loopToken: "current-loop-token",
+    iteration: 2,
+    status: "complete",
+    startedAt: new Date(Date.now() - 1000).toISOString(),
+    completedAt: new Date().toISOString(),
+    durationMs: 1000,
+    progress: true,
+    changedFiles: ["current/findings.md"],
+    noProgressStreak: 0,
+  } as any);
+
+  const restoreEnv = setRunnerEnv({
+    RALPH_RUNNER_TASK_DIR: taskDir,
+    RALPH_RUNNER_CWD: cwd,
+    RALPH_RUNNER_LOOP_TOKEN: "current-loop-token",
+    RALPH_RUNNER_CURRENT_ITERATION: "2",
+    RALPH_RUNNER_MAX_ITERATIONS: "5",
+    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
+    RALPH_RUNNER_GUARDRAILS: JSON.stringify({ blockCommands: [], protectedFiles: [] }),
+  });
+  t.after(restoreEnv);
+
+  const harness = createHarness();
+  const beforeAgentStart = harness.event("before_agent_start");
+  const result = await beforeAgentStart(
+    { systemPrompt: "Base prompt" },
+    { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } },
+  );
+
+  assert.ok(result);
+  assert.match(result.systemPrompt, /## Ralph Loop Context/);
+  assert.match(result.systemPrompt, /Iteration 2\/5/);
+  assert.match(result.systemPrompt, /Previous iterations:/);
+  assert.match(result.systemPrompt, /Iteration 2: 1s — durable progress \(current\/findings\.md\); no-progress streak: 0/);
+  assert.doesNotMatch(result.systemPrompt, /stale\/findings\.md/);
+});
+
+test("/ralph subprocess child fails closed on malformed durable status files", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "subprocess-child-task");
+  mkdirSync(taskDir, { recursive: true });
+  writeStatusFile(taskDir, {
+    loopToken: "malformed-loop-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: null,
+  } as any);
+
+  const restoreEnv = setRunnerEnv({
+    RALPH_RUNNER_TASK_DIR: taskDir,
+    RALPH_RUNNER_CWD: cwd,
+    RALPH_RUNNER_LOOP_TOKEN: "malformed-loop-token",
+    RALPH_RUNNER_CURRENT_ITERATION: "1",
+    RALPH_RUNNER_MAX_ITERATIONS: "5",
+    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
+    RALPH_RUNNER_GUARDRAILS: JSON.stringify({ blockCommands: ["git\\s+push"], protectedFiles: ["src/generated/**"] }),
+  });
+  t.after(restoreEnv);
+
+  const harness = createHarness();
+  const toolCall = harness.event("tool_call");
+  const result = await toolCall(
+    { toolName: "bash", input: { command: "git push origin main" } },
+    { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } },
+  );
+
+  assert.deepEqual(result, { block: true, reason: "ralph: invalid loop contract" });
+});
+
+test("/ralph subprocess child fails closed when the env loop contract is malformed", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "subprocess-child-task");
+  mkdirSync(taskDir, { recursive: true });
+
+  const restoreEnv = setRunnerEnv({
+    RALPH_RUNNER_TASK_DIR: taskDir,
+    RALPH_RUNNER_CWD: cwd,
+    RALPH_RUNNER_LOOP_TOKEN: "env-contract-loop-token",
+    RALPH_RUNNER_CURRENT_ITERATION: "1",
+    RALPH_RUNNER_MAX_ITERATIONS: "5",
+    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
+    RALPH_RUNNER_GUARDRAILS: "not-json",
+  });
+  t.after(restoreEnv);
+
+  const harness = createHarness();
+  const toolCall = harness.event("tool_call");
+  const result = await toolCall(
+    { toolName: "bash", input: { command: "git push origin main" } },
+    { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } },
+  );
+
+  assert.deepEqual(result, { block: true, reason: "ralph: invalid loop contract" });
+});
+
+test("/ralph subprocess child steers repeated bash failures from durable runner state", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "subprocess-child-task");
+  mkdirSync(taskDir, { recursive: true });
+  writeStatusFile(taskDir, {
+    loopToken: "subprocess-loop-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 3,
+    maxIterations: 4,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+
+  const restoreEnv = setRunnerEnv({
+    RALPH_RUNNER_TASK_DIR: taskDir,
+    RALPH_RUNNER_CWD: cwd,
+    RALPH_RUNNER_LOOP_TOKEN: "subprocess-loop-token",
+    RALPH_RUNNER_CURRENT_ITERATION: "3",
+    RALPH_RUNNER_MAX_ITERATIONS: "4",
+    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
+    RALPH_RUNNER_GUARDRAILS: JSON.stringify({ blockCommands: [], protectedFiles: [] }),
+  });
+  t.after(restoreEnv);
+
+  const harness = createHarness();
+  const toolResult = harness.event("tool_result");
+  const ctx = { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } };
+  const failureEvent = {
+    toolName: "bash",
+    content: [{ type: "text", text: "ERROR: command failed" }],
+  };
+
+  assert.equal(await toolResult(failureEvent, ctx), undefined);
+  assert.equal(await toolResult(failureEvent, ctx), undefined);
+  assert.deepEqual(await toolResult(failureEvent, ctx), {
+    content: [
+      { type: "text", text: "ERROR: command failed" },
+      { type: "text", text: "\n\n⚠️ ralph: 3+ failures this iteration. Stop and describe the root cause before retrying." },
+    ],
+  });
 });

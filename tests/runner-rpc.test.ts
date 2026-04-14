@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { parseRpcEvent, runRpcIteration } from "../src/runner-rpc.ts";
@@ -159,6 +160,65 @@ echo '{"type":"agent_end","messages":[]}'
     assert.equal(result.success, true);
     assert.equal(result.lastAssistantText, "");
     assert.equal(result.agentEndMessages.length, 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration passes explicit extension loading and task-dir env into the subprocess", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const taskDir = join(cwd, "task-dir");
+    const argsFile = join(cwd, "args.txt");
+    const envFile = join(cwd, "env.txt");
+    const mockScript = await writeMockScript(cwd, "mock-pi-capture.sh", `#!/bin/bash
+printf '%s\n' "$@" > "${argsFile}"
+printf 'taskDir=%s\n' "\${RALPH_RUNNER_TASK_DIR}" > "${envFile}"
+printf 'cwd=%s\n' "\${RALPH_RUNNER_CWD}" >> "${envFile}"
+printf 'loopToken=%s\n' "\${RALPH_RUNNER_LOOP_TOKEN}" >> "${envFile}"
+printf 'currentIteration=%s\n' "\${RALPH_RUNNER_CURRENT_ITERATION}" >> "${envFile}"
+printf 'maxIterations=%s\n' "\${RALPH_RUNNER_MAX_ITERATIONS}" >> "${envFile}"
+printf 'noProgressStreak=%s\n' "\${RALPH_RUNNER_NO_PROGRESS_STREAK}" >> "${envFile}"
+printf 'guardrails=%s\n' "\${RALPH_RUNNER_GUARDRAILS}" >> "${envFile}"
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const guardrails = { blockCommands: ["git\\s+push"], protectedFiles: ["src/generated/**"] };
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: mockScript,
+      env: {
+        RALPH_RUNNER_TASK_DIR: taskDir,
+        RALPH_RUNNER_CWD: cwd,
+        RALPH_RUNNER_LOOP_TOKEN: "test-loop-token",
+        RALPH_RUNNER_CURRENT_ITERATION: "2",
+        RALPH_RUNNER_MAX_ITERATIONS: "5",
+        RALPH_RUNNER_NO_PROGRESS_STREAK: "1",
+        RALPH_RUNNER_GUARDRAILS: JSON.stringify(guardrails),
+      },
+    });
+
+    assert.equal(result.success, true);
+    assert.deepEqual(readFileSync(argsFile, "utf8").trim().split("\n"), [
+      "--mode",
+      "rpc",
+      "--no-session",
+      "-e",
+      fileURLToPath(new URL("../src/index.ts", import.meta.url)),
+    ]);
+    assert.deepEqual(readFileSync(envFile, "utf8").trim().split("\n"), [
+      `taskDir=${taskDir}`,
+      `cwd=${cwd}`,
+      `loopToken=test-loop-token`,
+      `currentIteration=2`,
+      `maxIterations=5`,
+      `noProgressStreak=1`,
+      `guardrails=${JSON.stringify(guardrails)}`,
+    ]);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

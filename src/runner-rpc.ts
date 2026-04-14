@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 // --- Types ---
 
@@ -133,7 +134,8 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     }
   }
 
-  const args = spawnArgs ?? ["--mode", "rpc", "--no-session"];
+  const extensionPath = fileURLToPath(new URL("./index.ts", import.meta.url));
+  const args = spawnArgs ?? ["--mode", "rpc", "--no-session", "-e", extensionPath];
   const subprocessEnv = { ...process.env, ...env };
 
   let childProcess: ReturnType<typeof spawn>;
@@ -262,6 +264,16 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
         agentEndMessages,
         timedOut: false,
         error: err.message,
+      });
+    });
+    childProcess.stdin?.on("error", (err: Error & { code?: string }) => {
+      if (settled) return;
+      settle({
+        success: false,
+        lastAssistantText,
+        agentEndMessages,
+        timedOut: false,
+        error: err.code === "EPIPE" ? "Subprocess closed stdin before prompt could be sent" : err.message,
       });
     });
 

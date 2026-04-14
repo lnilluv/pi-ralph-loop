@@ -6,8 +6,10 @@ import {
   renderRalphBody,
   renderIterationPrompt,
   shouldStopForCompletionPromise,
+  validateRuntimeArgs,
   type CommandDef,
   type CommandOutput,
+  type RuntimeArgs,
 } from "./ralph.ts";
 import { runCommands } from "./index.ts";
 import {
@@ -22,6 +24,7 @@ import {
   ensureRunnerDir,
   readIterationRecords,
   readStatusFile,
+  writeIterationTranscript,
   writeStatusFile,
 } from "./runner-state.ts";
 import {
@@ -67,9 +70,17 @@ export type RunnerConfig = {
   onStatusChange?: (status: RunnerStatus) => void;
   onNotify?: (message: string, level: "info" | "warning" | "error") => void;
   /** Extension API for running commands */
-  runCommandsFn?: (commands: CommandDef[], blockPatterns: string[], pi: unknown) => Promise<CommandOutput[]>;
+  runCommandsFn?: (
+    commands: CommandDef[],
+    blockPatterns: string[],
+    pi: unknown,
+    cwd?: string,
+    taskDir?: string,
+  ) => Promise<CommandOutput[]>;
   /** Extension API reference for running commands */
   pi?: unknown;
+  /** Runtime args resolved from RALPH frontmatter */
+  runtimeArgs?: RuntimeArgs;
 };
 
 export type RunnerResult = {
@@ -96,6 +107,9 @@ const SNAPSHOT_MAX_FILES = 200;
 const SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
 const SNAPSHOT_POST_IDLE_POLL_INTERVAL_MS = 20;
 const SNAPSHOT_POST_IDLE_POLL_WINDOW_MS = 100;
+const RALPH_PROGRESS_FILE = "RALPH_PROGRESS.md";
+const RALPH_PROGRESS_MAX_CHARS = 4096;
+const INTER_ITERATION_DELAY_POLL_INTERVAL_MS = 100;
 
 export type WorkspaceSnapshot = {
   files: Map<string, string>;
@@ -114,6 +128,47 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function readProgressMemory(taskDir: string): string | undefined {
+  const progressPath = join(taskDir, RALPH_PROGRESS_FILE);
+  if (!existsSync(progressPath)) return undefined;
+  try {
+    const raw = readFileSync(progressPath, "utf8");
+    if (raw.length <= RALPH_PROGRESS_MAX_CHARS) return raw;
+    return `${raw.slice(0, RALPH_PROGRESS_MAX_CHARS)}\n[truncated]`;
+  } catch {
+    return undefined;
+  }
+}
+
+function renderProgressMemoryPrompt(progressMemory: string): string {
+  return [
+    "[RALPH_PROGRESS.md]",
+    "Use this file for a short rolling memory. Keep it short and overwrite in place.",
+    "",
+    progressMemory,
+  ].join("\n");
+}
+
+async function waitForInterIterationDelay(taskDir: string, delaySeconds: number): Promise<boolean> {
+  const delayMs = delaySeconds * 1000;
+  if (delayMs <= 0) return false;
+
+  const pollIntervalMs = Math.min(INTER_ITERATION_DELAY_POLL_INTERVAL_MS, delayMs);
+  let remainingMs = delayMs;
+
+  while (remainingMs > 0) {
+    if (checkStopSignal(taskDir)) {
+      clearStopSignal(taskDir);
+      return true;
+    }
+    const sleepMs = Math.min(pollIntervalMs, remainingMs);
+    await delay(sleepMs);
+    remainingMs -= sleepMs;
+  }
+
+  return false;
+}
+
 function normalizeSnapshotPath(filePath: string): string {
   return filePath.split("\\").join("/");
 }
@@ -124,6 +179,8 @@ export function captureTaskDirectorySnapshot(ralphPath: string): WorkspaceSnapsh
   let truncated = false;
   let bytesRead = 0;
   let errorCount = 0;
+
+  const progressMemoryPath = join(taskDir, RALPH_PROGRESS_FILE);
 
   const walk = (dirPath: string) => {
     let entries;
@@ -145,7 +202,7 @@ export function captureTaskDirectorySnapshot(ralphPath: string): WorkspaceSnapsh
         walk(fullPath);
         continue;
       }
-      if (!entry.isFile() || fullPath === ralphPath) continue;
+      if (!entry.isFile() || fullPath === ralphPath || fullPath === progressMemoryPath) continue;
       if (files.size >= SNAPSHOT_MAX_FILES) {
         truncated = true;
         return;
@@ -195,8 +252,8 @@ export async function assessTaskDirectoryProgress(
 ): Promise<ProgressAssessment> {
   let after = captureTaskDirectorySnapshot(ralphPath);
   let changedFiles = diffTaskDirectorySnapshots(before, after);
-  const snapshotTruncated = before.truncated || after.truncated;
-  const snapshotErrorCount = before.errorCount + after.errorCount;
+  let snapshotTruncated = before.truncated || after.truncated;
+  let snapshotErrorCount = before.errorCount + after.errorCount;
 
   if (changedFiles.length > 0) {
     return { progress: true, changedFiles, snapshotTruncated, snapshotErrorCount };
@@ -210,6 +267,8 @@ export async function assessTaskDirectoryProgress(
     await delay(Math.min(SNAPSHOT_POST_IDLE_POLL_INTERVAL_MS, remainingMs));
     after = captureTaskDirectorySnapshot(ralphPath);
     changedFiles = diffTaskDirectorySnapshots(before, after);
+    snapshotTruncated ||= after.truncated;
+    snapshotErrorCount += after.errorCount;
     if (changedFiles.length > 0) {
       return { progress: true, changedFiles, snapshotTruncated, snapshotErrorCount };
     }
@@ -325,7 +384,9 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     onNotify,
     runCommandsFn,
     pi,
+    runtimeArgs: initialRuntimeArgs = {},
   } = config;
+  const runtimeArgs = initialRuntimeArgs;
 
   const taskDir = dirname(ralphPath);
   const name = basename(taskDir);
@@ -334,6 +395,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
   let currentTimeout = timeout;
   let currentCompletionPromise = initialCompletionPromise;
   let currentRequiredOutputs: string[] = [];
+  let currentInterIterationDelay = 0;
   let currentGuardrails = initialGuardrails;
   let completionGateFailureReasons: string[] = [];
   let noProgressStreak = 0;
@@ -386,10 +448,17 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       }
 
       const { frontmatter: fm, body: rawBody } = inspection.parsed!;
+      const runtimeValidationError = validateRuntimeArgs(fm, rawBody, fm.commands, runtimeArgs);
+      if (runtimeValidationError) {
+        onNotify?.(`Invalid RALPH.md on iteration ${i}: ${runtimeValidationError}`, "error");
+        finalStatus = "error";
+        break;
+      }
       currentMaxIterations = fm.maxIterations;
       currentTimeout = fm.timeout;
       currentCompletionPromise = fm.completionPromise;
       currentRequiredOutputs = fm.requiredOutputs ?? [];
+      currentInterIterationDelay = fm.interIterationDelay;
       currentGuardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
 
       // Update status to running
@@ -409,15 +478,25 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
       // Run commands
       const commandsOutput: CommandOutput[] = runCommandsFn && pi
-        ? await runCommandsFn(fm.commands, currentGuardrails.blockCommands, pi)
+        ? await runCommandsFn(fm.commands, currentGuardrails.blockCommands, pi, cwd, taskDir)
         : [];
 
       // Before snapshot
       const snapshotBefore = captureTaskDirectorySnapshot(ralphPath);
 
       // Render prompt
-      const body = renderRalphBody(rawBody, commandsOutput, { iteration: i, name });
-      const prompt = renderIterationPrompt(body, i, currentMaxIterations, currentCompletionPromise ? { completionPromise: currentCompletionPromise, requiredOutputs: currentRequiredOutputs, failureReasons: completionGateFailureReasons } : undefined);
+      const body = renderRalphBody(rawBody, commandsOutput, { iteration: i, name, maxIterations: currentMaxIterations }, runtimeArgs);
+      const progressMemory = readProgressMemory(taskDir);
+      const promptBody = progressMemory !== undefined ? `${renderProgressMemoryPrompt(progressMemory)}\n\n${body}` : body;
+      const prompt = renderIterationPrompt(promptBody, i, currentMaxIterations, currentCompletionPromise ? { completionPromise: currentCompletionPromise, requiredOutputs: currentRequiredOutputs, failureReasons: completionGateFailureReasons } : undefined);
+      const writeIterationTranscriptSafe = (record: IterationRecord, assistantText?: string, note?: string) => {
+        try {
+          writeIterationTranscript(taskDir, { record, prompt, commandOutputs: commandsOutput, assistantText, note });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          onNotify?.(`Failed to write iteration transcript for iteration ${record.iteration}: ${message}`, "warning");
+        }
+      };
 
       // Run RPC iteration
       onNotify?.(`Iteration ${i}/${currentMaxIterations} starting`, "info");
@@ -428,6 +507,15 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         timeoutMs: currentTimeout * 1000,
         spawnCommand,
         spawnArgs,
+        env: {
+          RALPH_RUNNER_TASK_DIR: taskDir,
+          RALPH_RUNNER_CWD: cwd,
+          RALPH_RUNNER_LOOP_TOKEN: loopToken,
+          RALPH_RUNNER_CURRENT_ITERATION: String(i),
+          RALPH_RUNNER_MAX_ITERATIONS: String(currentMaxIterations),
+          RALPH_RUNNER_NO_PROGRESS_STREAK: String(noProgressStreak),
+          RALPH_RUNNER_GUARDRAILS: JSON.stringify(currentGuardrails),
+        },
         modelPattern: config.modelPattern,
         provider: config.provider,
         modelId: config.modelId,
@@ -447,9 +535,17 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           progress: false,
           changedFiles: [],
           noProgressStreak: noProgressStreak + 1,
+          loopToken,
         };
         iterations.push(iterRecord);
         appendIterationRecord(taskDir, iterRecord);
+        writeIterationTranscriptSafe(
+          iterRecord,
+          undefined,
+          rpcResult.timedOut
+            ? `Timed out after ${currentTimeout}s waiting for the RPC subprocess.`
+            : `RPC subprocess error: ${rpcResult.error ?? "unknown"}`,
+        );
 
         if (rpcResult.timedOut) {
           onNotify?.(`Iteration ${i} timed out after ${currentTimeout}s`, "warning");
@@ -534,6 +630,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         progress,
         changedFiles,
         noProgressStreak,
+        loopToken,
         completionPromiseMatched: completionPromiseMatched || undefined,
         completionGate,
         snapshotTruncated,
@@ -541,6 +638,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       };
       iterations.push(iterRecord);
       appendIterationRecord(taskDir, iterRecord);
+      writeIterationTranscriptSafe(iterRecord, rpcResult.lastAssistantText);
 
       // Notify progress
       if (progress === true) {
@@ -589,6 +687,14 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       }
 
       onNotify?.(`Iteration ${i} complete (${Math.round((iterEndMs - iterStartMs) / 1000)}s)`, "info");
+
+      if (i < currentMaxIterations && currentInterIterationDelay > 0) {
+        const stoppedDuringDelay = await waitForInterIterationDelay(taskDir, currentInterIterationDelay);
+        if (stoppedDuringDelay) {
+          finalStatus = "stopped";
+          break;
+        }
+      }
     }
 
     // Determine final status if loop completed without break

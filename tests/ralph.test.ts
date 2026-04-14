@@ -26,6 +26,8 @@ import {
   renderIterationPrompt,
   renderRalphBody,
   resolvePlaceholders,
+  resolveCommandRun,
+  runtimeArgEntriesToMap,
   slugifyTask,
   shouldValidateExistingDraft,
   validateDraftContent,
@@ -80,6 +82,14 @@ function makeFixRequest() {
   );
 }
 
+function makeFixRequestWithArgs(args: readonly string[]) {
+  const request = makeFixRequest();
+  return {
+    ...request,
+    baselineDraft: request.baselineDraft.replace(`commands:\n`, `args:\n  - ${args.join("\n  - ")}\ncommands:\n`),
+  };
+}
+
 function makeFixRequestWithCompletionPromise(completionPromise: string) {
   const request = makeFixRequest();
   return {
@@ -101,12 +111,13 @@ test("parseRalphMarkdown falls back to default frontmatter when no frontmatter i
 
 test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => {
   const parsed = parseRalphMarkdown(
-    "\uFEFF---\r\ncommands:\r\n  - name: build\r\n    run: npm test\r\n    timeout: 15\r\nmax_iterations: 3\r\ntimeout: 12.5\r\nrequired_outputs:\r\n  - docs/ARCHITECTURE.md\r\ncompletion_promise: done\r\nguardrails:\r\n  block_commands:\r\n    - rm .*\r\n  protected_files:\r\n    - src/**\r\n---\r\nBody\r\n",
+    "\uFEFF---\r\ncommands:\r\n  - name: build\r\n    run: npm test\r\n    timeout: 15\r\nmax_iterations: 3\r\ninter_iteration_delay: 7\r\ntimeout: 12.5\r\nrequired_outputs:\r\n  - docs/ARCHITECTURE.md\r\ncompletion_promise: done\r\nguardrails:\r\n  block_commands:\r\n    - rm .*\r\n  protected_files:\r\n    - src/**\r\n---\r\nBody\r\n",
   );
 
   assert.deepEqual(parsed.frontmatter, {
     commands: [{ name: "build", run: "npm test", timeout: 15 }],
     maxIterations: 3,
+    interIterationDelay: 7,
     timeout: 12.5,
     completionPromise: "done",
     requiredOutputs: ["docs/ARCHITECTURE.md"],
@@ -116,8 +127,29 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
   assert.equal(parsed.body, "Body\n");
 });
 
-test("validateFrontmatter accepts valid input and rejects invalid bounds, names, and globs", () => {
+test("parseRalphMarkdown parses declared args as runtime parameters", () => {
+  const parsed = parseRalphMarkdown(
+    "---\nargs:\n  - owner\n  - mode\ncommands: []\nmax_iterations: 1\ntimeout: 1\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody\n",
+  );
+
+  assert.deepEqual(parsed.frontmatter.args, ["owner", "mode"]);
+  assert.equal(validateFrontmatter(parsed.frontmatter), null);
+});
+
+test("validateFrontmatter accepts valid input and rejects invalid bounds, names, args, and globs", () => {
   assert.equal(validateFrontmatter(defaultFrontmatter()), null);
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), args: ["owner"] }),
+    null,
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), args: ["owner", "owner"] }),
+    "Invalid args: names must be unique",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), args: ["build now"] }),
+    "Invalid arg name: build now must match ^\\w[\\w-]*$",
+  );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), maxIterations: 0 }),
     "Invalid max_iterations: must be between 1 and 50",
@@ -125,6 +157,18 @@ test("validateFrontmatter accepts valid input and rejects invalid bounds, names,
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), maxIterations: 51 }),
     "Invalid max_iterations: must be between 1 and 50",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), interIterationDelay: 3 }),
+    null,
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), interIterationDelay: -1 }),
+    "Invalid inter_iteration_delay: must be a non-negative integer",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), interIterationDelay: 1.5 }),
+    "Invalid inter_iteration_delay: must be a non-negative integer",
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), timeout: 0 }),
@@ -428,6 +472,43 @@ test("runCommands skips blocked commands before shelling out", async () => {
   assert.deepEqual(calls, ["-c echo ok"]);
 });
 
+test("runCommands resolves args before shelling out", async () => {
+  const calls: string[] = [];
+  const pi = {
+    exec: async (_tool: string, args: string[]) => {
+      calls.push(args.join(" "));
+      return { killed: false, stdout: "ok", stderr: "" };
+    },
+  } as any;
+
+  const outputs = await runCommands(
+    [{ name: "greet", run: "echo {{ args.owner }}", timeout: 1 }],
+    [],
+    pi,
+    { owner: "Ada" },
+  );
+
+  assert.deepEqual(outputs, [{ name: "greet", output: "ok" }]);
+  assert.deepEqual(calls, ["-c echo 'Ada'"]);
+});
+
+test("runCommands blocks anchored guardrails even when the first token comes from an arg", async () => {
+  const pi = {
+    exec: async () => {
+      throw new Error("should not execute blocked command");
+    },
+  } as any;
+
+  const outputs = await runCommands(
+    [{ name: "blocked", run: "{{ args.tool }} hello", timeout: 1 }],
+    ["^printf\\b"],
+    pi,
+    { tool: "printf" },
+  );
+
+  assert.deepEqual(outputs, [{ name: "blocked", output: "[blocked by guardrail: ^printf\\b]" }]);
+});
+
 test("legacy RALPH.md drafts bypass the generated-draft validation gate", () => {
   assert.equal(shouldValidateExistingDraft("Task body"), false);
 
@@ -439,18 +520,50 @@ test("legacy RALPH.md drafts bypass the generated-draft validation gate", () => 
   assert.equal(shouldValidateExistingDraft(draft.content), true);
 });
 
-test("render helpers expand placeholders and strip comments", () => {
+test("inspectDraftContent rejects malformed args frontmatter shapes", () => {
+  const invalid = inspectDraftContent(["---", "args: owner", "commands: []", "max_iterations: 1", "timeout: 1", "guardrails:", "  block_commands: []", "  protected_files: []", "---", "Body"].join("\n"));
+
+  assert.equal(invalid.error, "Invalid RALPH frontmatter: args must be a YAML sequence");
+});
+
+test("inspectDraftContent rejects malformed inter_iteration_delay frontmatter shapes", () => {
+  const invalid = inspectDraftContent(["---", "commands: []", "max_iterations: 1", "inter_iteration_delay: true", "timeout: 1", "guardrails:", "  block_commands: []", "  protected_files: []", "---", "Body"].join("\n"));
+
+  assert.equal(invalid.error, "Invalid RALPH frontmatter: inter_iteration_delay must be a YAML number");
+});
+
+test("render helpers expand placeholders, keep body text plain, and shell-quote command args", () => {
   const outputs = [{ name: "build", output: "done" }];
 
   assert.equal(
-    resolvePlaceholders("{{ commands.build }} {{ ralph.iteration }} {{ ralph.name }} {{ commands.missing }}", outputs, {
+    resolvePlaceholders("{{ commands.build }} {{ ralph.iteration }} {{ ralph.name }} {{ ralph.max_iterations }} {{ args.owner }} {{ commands.missing }}", outputs, {
       iteration: 7,
       name: "ralph",
-    }),
-    "done 7 ralph ",
+      maxIterations: 12,
+    }, { owner: "Ada" }),
+    "done 7 ralph 12 Ada ",
   );
-  assert.equal(renderRalphBody("keep<!-- hidden -->{{ ralph.name }}", [], { iteration: 1, name: "ralph" }), "keepralph");
+  assert.equal(
+    renderRalphBody("keep<!-- hidden -->{{ args.owner }}{{ ralph.name }}", [], { iteration: 1, name: "ralph", maxIterations: 1 }, { owner: "Ada; echo injected" }),
+    "keepAda; echo injectedralph",
+  );
+  assert.equal(resolveCommandRun("npm run {{ args.script }}", { script: "test" }), "npm run 'test'");
+  assert.equal(resolveCommandRun("echo {{ args.owner }}", { owner: "Ada; echo injected" }), "echo 'Ada; echo injected'");
+  assert.throws(() => resolveCommandRun("npm run {{ args.missing }}", { script: "test" }), /Missing required arg: missing/);
   assert.equal(renderIterationPrompt("Body", 2, 5), "[ralph: iteration 2/5]\n\nBody");
+});
+
+test("resolvePlaceholders leaves command output placeholders literal", () => {
+  const outputs = [{ name: "build", output: "echo {{ args.owner }}" }];
+
+  assert.equal(
+    resolvePlaceholders("{{ commands.build }} {{ args.owner }}", outputs, {
+      iteration: 7,
+      name: "ralph",
+      maxIterations: 12,
+    }, { owner: "Ada" }),
+    "echo {{ args.owner }} Ada",
+  );
 });
 
 test("renderIterationPrompt includes completion-gate reminders and previous failure reasons", () => {
@@ -467,11 +580,49 @@ test("renderIterationPrompt includes completion-gate reminders and previous fail
   assert.match(prompt, /Emit <promise>DONE<\/promise> only when the gate is truly satisfied\./);
 });
 
-test("parseCommandArgs handles explicit task/path flags and auto mode", () => {
-  assert.deepEqual(parseCommandArgs("--task reverse engineer auth"), { mode: "task", value: "reverse engineer auth" });
-  assert.deepEqual(parseCommandArgs("--path my-task"), { mode: "path", value: "my-task" });
-  assert.deepEqual(parseCommandArgs("--task=fix flaky tests"), { mode: "task", value: "fix flaky tests" });
-  assert.deepEqual(parseCommandArgs("  reverse engineer this app  "), { mode: "auto", value: "reverse engineer this app" });
+test("parseCommandArgs handles explicit path args, leaves task text alone, and rejects task args", () => {
+  assert.deepEqual(parseCommandArgs("--path my-task"), { mode: "path", value: "my-task", runtimeArgs: [], error: undefined });
+  assert.deepEqual(parseCommandArgs("--path my-task --arg owner=Ada --arg mode=fix"), {
+    mode: "path",
+    value: "my-task",
+    runtimeArgs: [
+      { name: "owner", value: "Ada" },
+      { name: "mode", value: "fix" },
+    ],
+    error: undefined,
+  });
+  assert.deepEqual(parseCommandArgs("  reverse engineer this app  "), { mode: "auto", value: "reverse engineer this app", runtimeArgs: [], error: undefined });
+  assert.deepEqual(parseCommandArgs("reverse engineer --arg name=value literally"), {
+    mode: "auto",
+    value: "reverse engineer --arg name=value literally",
+    runtimeArgs: [],
+    error: undefined,
+  });
+  assert.equal(parseCommandArgs("--task reverse engineer auth --arg owner=Ada").error, "--arg is only supported with /ralph --path");
+});
+
+test("parseCommandArgs rejects malformed explicit-path args", () => {
+  assert.equal(parseCommandArgs("--path my-task --arg owner=").error, "Invalid --arg entry: value is required");
+  assert.equal(parseCommandArgs("--path my-task --arg =Ada").error, "Invalid --arg entry: name is required");
+  assert.equal(
+    parseCommandArgs("--path my-task --arg owner=Ada Lovelace").error,
+    "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
+  );
+  assert.equal(
+    parseCommandArgs("--path my-task --arg owner=Ada extra text").error,
+    "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
+  );
+});
+
+test("runtimeArgEntriesToMap preserves special arg names and command substitution can read them", () => {
+  const parsed = parseCommandArgs("--path my-task --arg __proto__=safe");
+  assert.equal(parsed.error, undefined);
+
+  const mapped = runtimeArgEntriesToMap(parsed.runtimeArgs);
+  assert.equal(mapped.error, undefined);
+  assert.equal(Object.getPrototypeOf(mapped.runtimeArgs), null);
+  assert.deepEqual(Object.keys(mapped.runtimeArgs), ["__proto__"]);
+  assert.equal(resolveCommandRun("echo {{ args.__proto__ }}", mapped.runtimeArgs), "echo 'safe'");
 });
 
 test("explicit path mode stays path-centric and does not offer task fallback", async () => {
@@ -787,6 +938,7 @@ test("generated drafts reparse as valid RALPH files", () => {
       { name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20 },
     ],
     maxIterations: 12,
+    interIterationDelay: 0,
     timeout: 300,
     completionPromise: undefined,
     requiredOutputs: [],
@@ -868,6 +1020,66 @@ test("normalizeStrengthenedDraft keeps deterministic frontmatter in body-only mo
     task: "Fix flaky auth tests",
     mode: "fix",
   });
+});
+
+test("normalizeStrengthenedDraft keeps declared args placeholders in body-only mode", () => {
+  const request = makeFixRequestWithArgs(["owner"]);
+  const baseline = parseRalphMarkdown(request.baselineDraft);
+  const strengthenedDraft = makeStrengthenedDraft(
+    [
+      "args:",
+      "  - mode",
+      "commands:",
+      "  - name: tests",
+      "    run: npm test",
+      "    timeout: 20",
+      "max_iterations: 25",
+      "timeout: 300",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nUse {{ args.owner }} to scope the fix.",
+  );
+
+  const normalized = normalizeStrengthenedDraft(request, strengthenedDraft, "body-only");
+  const reparsed = parseRalphMarkdown(normalized.content);
+
+  const { args: _args, ...baselineFrontmatter } = baseline.frontmatter;
+  assert.deepEqual(reparsed.frontmatter, baselineFrontmatter);
+  assert.equal(reparsed.body.trimStart(), "Task: Fix flaky auth tests\n\nUse {{ args.owner }} to scope the fix.");
+});
+
+test("normalizeStrengthenedDraft falls back to the baseline body when body-only args placeholders are undeclared", () => {
+  const request = makeFixRequestWithArgs(["owner"]);
+  const baseline = parseRalphMarkdown(request.baselineDraft);
+  const strengthenedDraft = makeStrengthenedDraft(
+    [
+      "args:",
+      "  - mode",
+      "commands:",
+      "  - name: tests",
+      "    run: npm test",
+      "    timeout: 20",
+      "max_iterations: 25",
+      "timeout: 300",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nUse {{ args.mode }} to scope the fix.",
+  );
+
+  const normalized = normalizeStrengthenedDraft(request, strengthenedDraft, "body-only");
+  const reparsed = parseRalphMarkdown(normalized.content);
+
+  const { args: _args, ...baselineFrontmatter } = baseline.frontmatter;
+  assert.deepEqual(reparsed.frontmatter, baselineFrontmatter);
+  assert.equal(reparsed.body.trimStart(), baseline.body.trimStart());
 });
 
 test("normalizeStrengthenedDraft falls back to the baseline body when body-only frontmatter is invalid", () => {
@@ -1177,6 +1389,72 @@ test("acceptStrengthenedDraft rejects placeholder drift, increased limits, and c
   );
 });
 
+test("acceptStrengthenedDraft rejects args placeholders in strengthened bodies", () => {
+  const request = makeFixRequest();
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "args:",
+          "  - owner",
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        "Task: Fix flaky auth tests\n\nUse {{ args.owner }} and {{ commands.tests }}.",
+      ),
+    ),
+    null,
+  );
+});
+
+test("acceptStrengthenedDraft rejects args frontmatter drift", () => {
+  const request = makeFixRequestWithArgs(["owner"]);
+  const body = "Task: Fix flaky auth tests\n\nKeep the change small.";
+
+  assert.equal(
+    acceptStrengthenedDraft(
+      request,
+      makeStrengthenedDraft(
+        [
+          "args:",
+          "  - owner",
+          "  - mode",
+          "commands:",
+          "  - name: git-log",
+          "    run: git log --oneline -10",
+          "    timeout: 20",
+          "  - name: tests",
+          "    run: npm test",
+          "    timeout: 20",
+          "max_iterations: 20",
+          "timeout: 120",
+          "guardrails:",
+          "  block_commands:",
+          "    - 'git\\s+push'",
+          "  protected_files:",
+          `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+        ],
+        body,
+      ),
+    ),
+    null,
+  );
+});
+
 test("acceptStrengthenedDraft rejects changed guardrails and missing secret-path protection", () => {
   const request = makeFixRequest();
   const body = "Task: Fix flaky auth tests\n\nKeep the change small.";
@@ -1460,7 +1738,7 @@ test("generated draft metadata survives task text containing HTML comment marker
   assert.equal(validateDraftContent(draft.content), null);
   assert.match(draft.content, /Task: Reverse engineer the parser &lt;!-- tricky --&gt; and document the edge case/);
   assert.match(parsed.body, /Task: Reverse engineer the parser &lt;!-- tricky --&gt; and document the edge case/);
-  const rendered = renderRalphBody(parsed.body, [], { iteration: 1, name: "ralph" });
+  const rendered = renderRalphBody(parsed.body, [], { iteration: 1, name: "ralph", maxIterations: 1 });
   assert.match(rendered, /Task: Reverse engineer the parser &lt;!-- tricky --&gt; and document the edge case/);
   assert.doesNotMatch(rendered, /<!-- tricky -->/);
 });

@@ -7,14 +7,19 @@ export type CommandDef = { name: string; run: string; timeout: number };
 export type DraftSource = "deterministic" | "llm-strengthened" | "fallback";
 export type DraftStrengtheningScope = "body-only" | "body-and-commands";
 export type CommandIntent = CommandDef & { source: "heuristic" | "repo-signal" };
+export type RuntimeArg = { name: string; value: string };
+export type RuntimeArgs = Record<string, string>;
 export type Frontmatter = {
   commands: CommandDef[];
+  args?: string[];
   maxIterations: number;
+  interIterationDelay: number;
   timeout: number;
   completionPromise?: string;
   requiredOutputs?: string[];
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
   invalidCommandEntries?: number[];
+  invalidArgEntries?: number[];
 };
 export type ParsedRalph = { frontmatter: Frontmatter; body: string };
 export type CommandOutput = { name: string; output: string };
@@ -23,9 +28,12 @@ export type RalphTargetResolution = {
   absoluteTarget: string;
   markdownPath: string;
 };
-export type CommandArgs =
-  | { mode: "path" | "task"; value: string }
-  | { mode: "auto"; value: string };
+export type CommandArgs = {
+  mode: "path" | "task" | "auto";
+  value: string;
+  runtimeArgs: RuntimeArg[];
+  error?: string;
+};
 export type ExistingTargetInspection =
   | { kind: "run"; ralphPath: string }
   | { kind: "invalid-markdown"; path: string }
@@ -132,6 +140,21 @@ function toStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)) : [];
 }
 
+function parseStringArray(value: unknown): { values: string[]; invalidEntries?: number[] } {
+  if (!Array.isArray(value)) return { values: [] };
+
+  const invalidEntries: number[] = [];
+  const values = value.flatMap((item, index) => {
+    if (typeof item !== "string") {
+      invalidEntries.push(index);
+      return [];
+    }
+    return [item];
+  });
+
+  return { values, invalidEntries: invalidEntries.length > 0 ? invalidEntries : undefined };
+}
+
 function isUniversalProtectedGlob(pattern: string): boolean {
   const trimmed = pattern.trim().replace(/\/+$/, "");
   if (!trimmed) return true;
@@ -189,6 +212,23 @@ function validateRawRequiredOutputsShape(rawFrontmatter: UnknownRecord): string 
   return null;
 }
 
+function validateRawArgsShape(rawFrontmatter: UnknownRecord): string | null {
+  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "args")) {
+    return null;
+  }
+
+  const args = rawFrontmatter.args;
+  if (!Array.isArray(args)) {
+    return "Invalid RALPH frontmatter: args must be a YAML sequence";
+  }
+  for (const [index, arg] of args.entries()) {
+    if (typeof arg !== "string") {
+      return `Invalid RALPH frontmatter: args[${index}] must be a YAML string`;
+    }
+  }
+  return null;
+}
+
 function validateRawCommandEntryShape(command: unknown, index: number): string | null {
   if (!isRecord(command)) {
     return `Invalid RALPH frontmatter: commands[${index}] must be a YAML mapping`;
@@ -226,11 +266,24 @@ function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | nu
     }
   }
 
+  if (Object.prototype.hasOwnProperty.call(rawFrontmatter, "args")) {
+    const argsError = validateRawArgsShape(rawFrontmatter);
+    if (argsError) {
+      return argsError;
+    }
+  }
+
   if (
     Object.prototype.hasOwnProperty.call(rawFrontmatter, "max_iterations") &&
     (typeof rawFrontmatter.max_iterations !== "number" || !Number.isFinite(rawFrontmatter.max_iterations))
   ) {
     return "Invalid RALPH frontmatter: max_iterations must be a YAML number";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(rawFrontmatter, "inter_iteration_delay") &&
+    (typeof rawFrontmatter.inter_iteration_delay !== "number" || !Number.isFinite(rawFrontmatter.inter_iteration_delay))
+  ) {
+    return "Invalid RALPH frontmatter: inter_iteration_delay must be a YAML number";
   }
   if (
     Object.prototype.hasOwnProperty.call(rawFrontmatter, "timeout") &&
@@ -430,7 +483,7 @@ function escapeHtmlCommentMarkers(text: string): string {
 }
 
 export function defaultFrontmatter(): Frontmatter {
-  return { commands: [], maxIterations: 50, timeout: 300, requiredOutputs: [], guardrails: { blockCommands: [], protectedFiles: [] } };
+  return { commands: [], maxIterations: 50, interIterationDelay: 0, timeout: 300, requiredOutputs: [], guardrails: { blockCommands: [], protectedFiles: [] } };
 }
 
 export function parseRalphMarkdown(raw: string): ParsedRalph {
@@ -448,12 +501,15 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
     }
     return [parsed];
   });
+  const parsedArgs = parseStringArray(yaml.args);
   const guardrails = isRecord(yaml.guardrails) ? yaml.guardrails : {};
 
   return {
     frontmatter: {
       commands,
+      ...(parsedArgs.values.length > 0 ? { args: parsedArgs.values } : {}),
       maxIterations: Number(yaml.max_iterations ?? 50),
+      interIterationDelay: Number(yaml.inter_iteration_delay ?? 0),
       timeout: Number(yaml.timeout ?? 300),
       completionPromise:
         typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
@@ -463,6 +519,7 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
         protectedFiles: toStringArray(guardrails.protected_files),
       },
       invalidCommandEntries: invalidCommandEntries.length > 0 ? invalidCommandEntries : undefined,
+      ...(parsedArgs.invalidEntries ? { invalidArgEntries: parsedArgs.invalidEntries } : {}),
     },
     body: match[2] ?? "",
   };
@@ -472,14 +529,34 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
   if ((fm.invalidCommandEntries?.length ?? 0) > 0) {
     return `Invalid command entry at index ${fm.invalidCommandEntries![0]}`;
   }
+  if ((fm.invalidArgEntries?.length ?? 0) > 0) {
+    return `Invalid args entry at index ${fm.invalidArgEntries![0]}`;
+  }
   if (!Number.isFinite(fm.maxIterations) || !Number.isInteger(fm.maxIterations) || fm.maxIterations < 1 || fm.maxIterations > 50) {
     return "Invalid max_iterations: must be between 1 and 50";
+  }
+  if (!Number.isFinite(fm.interIterationDelay) || !Number.isInteger(fm.interIterationDelay) || fm.interIterationDelay < 0) {
+    return "Invalid inter_iteration_delay: must be a non-negative integer";
   }
   if (!Number.isFinite(fm.timeout) || fm.timeout <= 0 || fm.timeout > 300) {
     return "Invalid timeout: must be greater than 0 and at most 300";
   }
   if (fm.completionPromise !== undefined && !isSafeCompletionPromise(fm.completionPromise)) {
     return "Invalid completion_promise: must be a single-line string without line breaks or angle brackets";
+  }
+  const args = fm.args ?? [];
+  const seenArgNames = new Set<string>();
+  for (const arg of args) {
+    if (!arg.trim()) {
+      return "Invalid arg: name is required";
+    }
+    if (!/^\w[\w-]*$/.test(arg)) {
+      return `Invalid arg name: ${arg} must match ^\\w[\\w-]*$`;
+    }
+    if (seenArgNames.has(arg)) {
+      return "Invalid args: names must be unique";
+    }
+    seenArgNames.add(arg);
   }
   for (const output of fm.requiredOutputs ?? []) {
     const requiredOutputError = validateRequiredOutputEntry(output);
@@ -548,6 +625,12 @@ export function acceptStrengthenedDraft(request: DraftRequest, strengthenedDraft
     return null;
   }
 
+  const baselineArgs = baseline.parsed.frontmatter.args ?? [];
+  const strengthenedArgs = strengthened.parsed.frontmatter.args ?? [];
+  if (baselineArgs.join("\n") !== strengthenedArgs.join("\n")) {
+    return null;
+  }
+
   const baselineCompletion = parseCompletionPromiseValue(baseline.rawFrontmatter);
   const strengthenedCompletion = parseCompletionPromiseValue(strengthened.rawFrontmatter);
   if (baselineCompletion.invalid || strengthenedCompletion.invalid) {
@@ -593,6 +676,10 @@ export function acceptStrengthenedDraft(request: DraftRequest, strengthenedDraft
     }
   }
 
+  if (collectArgPlaceholderNames(strengthened.parsed.body).length > 0) {
+    return null;
+  }
+
   return renderDraftPlan(request.task, request.mode, request.target, strengthened.parsed.frontmatter, "llm-strengthened", strengthened.parsed.body);
 }
 
@@ -607,13 +694,173 @@ export function findBlockedCommandPattern(command: string, blockPatterns: string
   return undefined;
 }
 
+function hasRuntimeArgToken(text: string): boolean {
+  return /(?:^|\s)--arg(?:\s|=)/.test(text);
+}
+
+function parseRuntimeArgEntry(token: string): { entry?: RuntimeArg; error?: string } {
+  const equalsIndex = token.indexOf("=");
+  if (equalsIndex < 0) {
+    return { error: "Invalid --arg entry: name=value is required" };
+  }
+
+  const name = token.slice(0, equalsIndex).trim();
+  const value = token.slice(equalsIndex + 1);
+  if (!name) {
+    return { error: "Invalid --arg entry: name is required" };
+  }
+  if (!value) {
+    return { error: "Invalid --arg entry: value is required" };
+  }
+
+  return { entry: { name, value } };
+}
+
+function parseExplicitPathRuntimeArgs(rawTail: string): { runtimeArgs: RuntimeArg[]; error?: string } {
+  const runtimeArgs: RuntimeArg[] = [];
+  const trimmed = rawTail.trim();
+  if (!trimmed) {
+    return { runtimeArgs };
+  }
+
+  const tokens = trimmed.split(/\s+/);
+  for (let index = 0; index < tokens.length; index += 2) {
+    if (tokens[index] !== "--arg") {
+      return {
+        runtimeArgs,
+        error: "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
+      };
+    }
+
+    const assignment = tokens[index + 1];
+    if (!assignment) {
+      return { runtimeArgs, error: "Invalid --arg entry: name=value is required" };
+    }
+
+    const parsed = parseRuntimeArgEntry(assignment);
+    if (parsed.error) {
+      return { runtimeArgs, error: parsed.error };
+    }
+
+    const entry = parsed.entry;
+    if (!entry) {
+      return { runtimeArgs, error: "Invalid --arg entry: name=value is required" };
+    }
+
+    if (runtimeArgs.some((existing) => existing.name === entry.name)) {
+      return { runtimeArgs, error: `Duplicate --arg: ${entry.name}` };
+    }
+
+    runtimeArgs.push(entry);
+  }
+
+  return { runtimeArgs };
+}
+
 export function parseCommandArgs(raw: string): CommandArgs {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith("--task=")) return { mode: "task", value: trimmed.slice("--task=".length).trim() };
-  if (trimmed.startsWith("--path=")) return { mode: "path", value: trimmed.slice("--path=".length).trim() };
-  if (trimmed.startsWith("--task ")) return { mode: "task", value: trimmed.slice("--task ".length).trim() };
-  if (trimmed.startsWith("--path ")) return { mode: "path", value: trimmed.slice("--path ".length).trim() };
-  return { mode: "auto", value: trimmed };
+  const cleaned = raw.trim();
+
+  if (cleaned.startsWith("--task=")) {
+    const value = cleaned.slice("--task=".length).trim();
+    if (hasRuntimeArgToken(value)) {
+      return { mode: "task", value, runtimeArgs: [], error: "--arg is only supported with /ralph --path" };
+    }
+    return { mode: "task", value, runtimeArgs: [], error: undefined };
+  }
+  if (cleaned.startsWith("--task ")) {
+    const value = cleaned.slice("--task ".length).trim();
+    if (hasRuntimeArgToken(value)) {
+      return { mode: "task", value, runtimeArgs: [], error: "--arg is only supported with /ralph --path" };
+    }
+    return { mode: "task", value, runtimeArgs: [], error: undefined };
+  }
+  if (cleaned.startsWith("--path=")) {
+    const valueWithArgs = cleaned.slice("--path=".length).trimStart();
+    const argMatch = valueWithArgs.match(/(?:^|\s)--arg(?:\s|$)/);
+    const argIndex = argMatch?.index ?? valueWithArgs.length;
+    const value = argMatch ? valueWithArgs.slice(0, argIndex).trim() : valueWithArgs.trim();
+    const parsedArgs = parseExplicitPathRuntimeArgs(argMatch ? valueWithArgs.slice(argIndex).trim() : "");
+    return { mode: "path", value, runtimeArgs: parsedArgs.runtimeArgs, error: parsedArgs.error ?? undefined };
+  }
+  if (cleaned.startsWith("--path ")) {
+    const valueWithArgs = cleaned.slice("--path ".length).trimStart();
+    const argMatch = valueWithArgs.match(/(?:^|\s)--arg(?:\s|$)/);
+    const argIndex = argMatch?.index ?? valueWithArgs.length;
+    const value = argMatch ? valueWithArgs.slice(0, argIndex).trim() : valueWithArgs.trim();
+    const parsedArgs = parseExplicitPathRuntimeArgs(argMatch ? valueWithArgs.slice(argIndex).trim() : "");
+    return { mode: "path", value, runtimeArgs: parsedArgs.runtimeArgs, error: parsedArgs.error ?? undefined };
+  }
+  return { mode: "auto", value: cleaned, runtimeArgs: [], error: undefined };
+}
+
+export function runtimeArgEntriesToMap(entries: RuntimeArg[]): { runtimeArgs: RuntimeArgs; error?: string } {
+  const runtimeArgs = Object.create(null) as RuntimeArgs;
+  for (const entry of entries) {
+    if (!entry.name.trim()) {
+      return { runtimeArgs, error: "Invalid --arg entry: name is required" };
+    }
+    if (!entry.value.trim()) {
+      return { runtimeArgs, error: "Invalid --arg entry: value is required" };
+    }
+    if (!/^\w[\w-]*$/.test(entry.name)) {
+      return { runtimeArgs, error: `Invalid --arg name: ${entry.name} must match ^\\w[\\w-]*$` };
+    }
+    if (Object.prototype.hasOwnProperty.call(runtimeArgs, entry.name)) {
+      return { runtimeArgs, error: `Duplicate --arg: ${entry.name}` };
+    }
+    runtimeArgs[entry.name] = entry.value;
+  }
+  return { runtimeArgs };
+}
+
+function collectArgPlaceholderNames(source: string): string[] {
+  const names = new Set<string>();
+  for (const match of source.matchAll(/\{\{\s*args\.(\w[\w-]*)\s*\}\}/g)) {
+    names.add(match[1]);
+  }
+  return [...names];
+}
+
+function validateBodyArgsAgainstContract(body: string, declaredArgs: string[] | undefined): string | null {
+  const declaredSet = new Set(declaredArgs ?? []);
+  for (const name of collectArgPlaceholderNames(body)) {
+    if (!declaredSet.has(name)) {
+      return `Undeclared arg placeholder: ${name}`;
+    }
+  }
+  return null;
+}
+
+export function validateRuntimeArgs(frontmatter: Frontmatter, body: string, commands: CommandDef[], runtimeArgs: RuntimeArgs): string | null {
+  const declaredArgs = frontmatter.args ?? [];
+  const declaredSet = new Set(declaredArgs);
+
+  for (const name of Object.keys(runtimeArgs)) {
+    if (!declaredSet.has(name)) {
+      return `Undeclared arg: ${name}`;
+    }
+  }
+
+  for (const name of declaredArgs) {
+    if (!Object.prototype.hasOwnProperty.call(runtimeArgs, name)) {
+      return `Missing required arg: ${name}`;
+    }
+  }
+
+  for (const name of collectArgPlaceholderNames(body)) {
+    if (!declaredSet.has(name)) {
+      return `Undeclared arg placeholder: ${name}`;
+    }
+  }
+  for (const command of commands) {
+    for (const name of collectArgPlaceholderNames(command.run)) {
+      if (!declaredSet.has(name)) {
+        return `Undeclared arg placeholder: ${name}`;
+      }
+    }
+  }
+
+  return null;
 }
 
 export function looksLikePath(value: string): boolean {
@@ -829,6 +1076,7 @@ function buildDraftFrontmatter(mode: DraftMode, commands: CommandDef[]): Frontma
   return {
     commands,
     maxIterations: mode === "analysis" ? 12 : mode === "migration" ? 30 : 25,
+    interIterationDelay: 0,
     timeout: 300,
     requiredOutputs: [],
     guardrails,
@@ -869,6 +1117,7 @@ function renderDraftPlan(task: string, mode: DraftMode, target: DraftTarget, fro
   const frontmatterLines = [
     ...renderCommandsYaml(frontmatter.commands),
     `max_iterations: ${frontmatter.maxIterations}`,
+    `inter_iteration_delay: ${frontmatter.interIterationDelay}`,
     `timeout: ${frontmatter.timeout}`,
     ...(requiredOutputs.length > 0
       ? ["required_outputs:", ...requiredOutputs.map((output) => `  - ${yamlQuote(output)}`)]
@@ -920,7 +1169,11 @@ export function normalizeStrengthenedDraft(request: DraftRequest, strengthenedDr
   const strengthened = parseStrictRalphMarkdown(strengthenedDraft);
 
   if (scope === "body-only") {
-    if ("error" in strengthened || validateFrontmatter(strengthened.parsed.frontmatter)) {
+    if (
+      "error" in strengthened ||
+      validateFrontmatter(strengthened.parsed.frontmatter) ||
+      validateBodyArgsAgainstContract(strengthened.parsed.body, baseline.frontmatter.args)
+    ) {
       return renderDraftPlan(request.task, request.mode, request.target, baseline.frontmatter, "llm-strengthened", baseline.body);
     }
 
@@ -1058,16 +1311,48 @@ export function shouldStopForCompletionPromise(text: string, expected: string): 
   return extractCompletionPromise(text) === expected.trim();
 }
 
-export function resolvePlaceholders(body: string, outputs: CommandOutput[], ralph: { iteration: number; name: string }): string {
-  const map = new Map(outputs.map((o) => [o.name, o.output]));
-  return body
-    .replace(/\{\{\s*commands\.(\w[\w-]*)\s*\}\}/g, (_, name) => map.get(name) ?? "")
-    .replace(/\{\{\s*ralph\.iteration\s*\}\}/g, String(ralph.iteration))
-    .replace(/\{\{\s*ralph\.name\s*\}\}/g, ralph.name);
+function shellQuote(value: string): string {
+  return "'" + value.split("'").join("'\\''") + "'";
 }
 
-export function renderRalphBody(body: string, outputs: CommandOutput[], ralph: { iteration: number; name: string }): string {
-  return resolvePlaceholders(body, outputs, ralph).replace(/<!--[\s\S]*?-->/g, "");
+export function replaceArgsPlaceholders(text: string, runtimeArgs: RuntimeArgs, shellSafe = false): string {
+  return text.replace(/\{\{\s*args\.(\w[\w-]*)\s*\}\}/g, (_, name) => {
+    if (!Object.prototype.hasOwnProperty.call(runtimeArgs, name)) {
+      throw new Error(`Missing required arg: ${name}`);
+    }
+    const value = runtimeArgs[name];
+    return shellSafe ? shellQuote(value) : value;
+  });
+}
+
+export function resolvePlaceholders(
+  body: string,
+  outputs: CommandOutput[],
+  ralph: { iteration: number; name: string; maxIterations: number },
+  runtimeArgs: RuntimeArgs = {},
+): string {
+  const map = new Map(outputs.map((o) => [o.name, o.output]));
+  const resolved = replaceArgsPlaceholders(
+    body
+      .replace(/\{\{\s*ralph\.iteration\s*\}\}/g, String(ralph.iteration))
+      .replace(/\{\{\s*ralph\.name\s*\}\}/g, ralph.name)
+      .replace(/\{\{\s*ralph\.max_iterations\s*\}\}/g, String(ralph.maxIterations)),
+    runtimeArgs,
+  );
+  return resolved.replace(/\{\{\s*commands\.(\w[\w-]*)\s*\}\}/g, (_, name) => map.get(name) ?? "");
+}
+
+export function resolveCommandRun(run: string, runtimeArgs: RuntimeArgs): string {
+  return replaceArgsPlaceholders(run, runtimeArgs, true);
+}
+
+export function renderRalphBody(
+  body: string,
+  outputs: CommandOutput[],
+  ralph: { iteration: number; name: string; maxIterations: number },
+  runtimeArgs: RuntimeArgs = {},
+): string {
+  return resolvePlaceholders(body, outputs, ralph, runtimeArgs).replace(/<!--[\s\S]*?-->/g, "");
 }
 
 export function renderIterationPrompt(
