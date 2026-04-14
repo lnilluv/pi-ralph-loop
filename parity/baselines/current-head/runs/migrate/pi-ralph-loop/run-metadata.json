@@ -1,0 +1,54 @@
+{
+  "command": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--no-extensions",
+    "-e",
+    "/Users/pryda/Documents/repos/pi-ralph-loop/.worktrees/ralphify-parity/src/index.ts",
+    "--model",
+    "github-copilot/gpt-5.4-mini"
+  ],
+  "finished_at": "2026-04-14T11:30:28Z",
+  "fixture": "migrate",
+  "implementation": "pi-ralph-loop",
+  "inventory": {
+    "after_count": 12,
+    "before_count": 7
+  },
+  "prompt": "/ralph --path /private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task/RALPH.md",
+  "session": {
+    "returncode": -15,
+    "status": {
+      "completedAt": "2026-04-14T11:30:27.832Z",
+      "currentIteration": 1,
+      "cwd": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task",
+      "guardrails": {
+        "blockCommands": [],
+        "protectedFiles": []
+      },
+      "loopToken": "9213d35d-a88e-48e7-8c22-d59acd2bae4a",
+      "maxIterations": 2,
+      "ralphPath": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task/RALPH.md",
+      "startedAt": "2026-04-14T11:29:29.846Z",
+      "status": "complete",
+      "taskDir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task",
+      "timeout": 300
+    },
+    "stderr_lines": 0,
+    "stdout_lines": 12,
+    "termination_reason": "terminal-status:complete"
+  },
+  "started_at": "2026-04-14T11:29:29Z",
+  "task_dir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task",
+  "termination_reason": "terminal-status:complete",
+  "verifier": {
+    "command": [
+      "bash",
+      "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task/scripts/verify.sh"
+    ],
+    "cwd": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/migrate/pi-ralph-loop/task",
+    "passed": true,
+    "returncode": 0
+  }
+}

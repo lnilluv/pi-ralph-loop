@@ -1,0 +1,88 @@
+{
+  "files": [
+    {
+      "path": "INSTALL_FLOW.md",
+      "sha256": "c14d948d479f76068b6cb75186a126e302138068d8ef7ef3f8f7bbb6ad0402cd",
+      "size": 726
+    },
+    {
+      "path": "MISSIONS_FINDINGS.md",
+      "sha256": "68e028fae2525f541ea610e930a8fd382727fa68733f5c2f3fe88bcef60f66b0",
+      "size": 575
+    },
+    {
+      "path": "OPEN_QUESTIONS.md",
+      "sha256": "64e22bba1a5f4514d2a4734b590e6c79cbdda7c2f9d174ad5b1980823be09805",
+      "size": 29
+    },
+    {
+      "path": "RALPH.md",
+      "sha256": "c69efedef36d551ec13053b7accba059a59e2f4c0c085edec102d3e41ba276f9",
+      "size": 1613
+    },
+    {
+      "path": "claim-evidence-checklist.md",
+      "sha256": "c6e214321a9760661a5054461cdbd7eb30a5eea22699877db7a6179a0e1b527e",
+      "size": 1120
+    },
+    {
+      "path": "evidence/INDEX.md",
+      "sha256": "76f2d0cbe56213f9fdbcf9deaf34eee59800b97a7f4294326e40412d85254896",
+      "size": 353
+    },
+    {
+      "path": "evidence/raw/app-factory-ai-cli.md",
+      "sha256": "2e05c955f02a7f363cb34eab1bd16a2c35e0aee8d720fb7d15eec9b926c7bb95",
+      "size": 327
+    },
+    {
+      "path": "evidence/raw/docs-factory-ai-cli-features-missions.md",
+      "sha256": "588ca106d5d2ea42f908745c39d517594f6c61e0fe8cd3b8660257aab5002b75",
+      "size": 379
+    },
+    {
+      "path": "evidence/raw/factory-ai-news-missions.md",
+      "sha256": "8cdfbe84f96c1521f114172204f7be41b64b24dea6c90e15be3f2a279a3b0cfc",
+      "size": 378
+    },
+    {
+      "path": "expected-outputs.md",
+      "sha256": "47cea6604acca801473fa4bf304df7628e32fb1e177623114834688af1c0e99d",
+      "size": 551
+    },
+    {
+      "path": "scripts/show-snapshots.sh",
+      "sha256": "ec99441bb5a0835e350908c0fb3425fe8a7a9d625dd71b844a522b4f05f4f957",
+      "size": 265
+    },
+    {
+      "path": "scripts/verify.sh",
+      "sha256": "d21efc8a8c57bff1a3f0302d18aa0515868418c1d5bb4e55aa6f4082a8919dfd",
+      "size": 1293
+    },
+    {
+      "path": "snapshots/app-factory-ai-cli.md",
+      "sha256": "2e05c955f02a7f363cb34eab1bd16a2c35e0aee8d720fb7d15eec9b926c7bb95",
+      "size": 327
+    },
+    {
+      "path": "snapshots/docs-factory-ai-cli-features-missions.md",
+      "sha256": "588ca106d5d2ea42f908745c39d517594f6c61e0fe8cd3b8660257aab5002b75",
+      "size": 379
+    },
+    {
+      "path": "snapshots/factory-ai-news-missions.md",
+      "sha256": "8cdfbe84f96c1521f114172204f7be41b64b24dea6c90e15be3f2a279a3b0cfc",
+      "size": 378
+    },
+    {
+      "path": "source-manifest.md",
+      "sha256": "58e38ef2899debc748f7b1d724c493e2ad186311171fa3098a5a459105541a33",
+      "size": 1100
+    }
+  ],
+  "fixture": "research",
+  "fixture_dir": "/Users/pryda/Documents/repos/pi-ralph-loop/.worktrees/ralphify-parity/parity/fixtures/research",
+  "implementation": "pi-ralph-loop",
+  "task_dir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha/runs/research/pi-ralph-loop/task"
+}

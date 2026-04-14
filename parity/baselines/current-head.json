@@ -1,142 +1,23 @@
 {
-  "agent": {
-    "copied_files": [
-      "auth.json",
-      "models.json",
-      "agent-models.json"
-    ],
-    "destination": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/agent",
-    "source": "/Users/pryda/.pi/agent"
-  },
-  "bundle_root": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p",
-  "created_at": "2026-04-14T11:18:42Z",
-  "fixtures": [
-    "research",
-    "migrate"
-  ],
-  "implementation": "pi-ralph-loop",
-  "loop_rpc_command": [
-    "pi",
-    "--mode",
-    "rpc",
-    "--no-extensions",
-    "-e",
-    "/Users/pryda/Documents/repos/pi-ralph-loop/.worktrees/ralphify-parity/src/index.ts",
-    "--model",
-    "github-copilot/gpt-5.4-mini"
-  ],
-  "ralphify_rpc_command": null,
-  "repo_head": "6aee1d129f063412d2530353ed6f98cc4d99fa48",
-  "repo_root": "/Users/pryda/Documents/repos/pi-ralph-loop/.worktrees/ralphify-parity",
-  "repo_status": "",
-  "runs": [
-    {
-      "command": [
-        "pi",
-        "--mode",
-        "rpc",
-        "--no-extensions",
-        "-e",
-        "/Users/pryda/Documents/repos/pi-ralph-loop/.worktrees/ralphify-parity/src/index.ts",
-        "--model",
-        "github-copilot/gpt-5.4-mini"
-      ],
-      "finished_at": "2026-04-14T11:17:57Z",
-      "fixture": "research",
-      "implementation": "pi-ralph-loop",
-      "inventory": {
-        "after_count": 20,
-        "before_count": 16
-      },
-      "prompt": "/ralph --path /private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/research/pi-ralph-loop/task/RALPH.md",
-      "session": {
-        "returncode": -15,
-        "status": {
-          "completedAt": "2026-04-14T11:17:55.814Z",
-          "currentIteration": 2,
-          "cwd": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/research/pi-ralph-loop/task",
-          "guardrails": {
-            "blockCommands": [],
-            "protectedFiles": []
-          },
-          "loopToken": "ec3933d3-8847-485e-bdf0-84ff1e6a269a",
-          "maxIterations": 2,
-          "ralphPath": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/research/pi-ralph-loop/task/RALPH.md",
-          "startedAt": "2026-04-14T11:16:05.930Z",
-          "status": "complete",
-          "taskDir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/research/pi-ralph-loop/task",
-          "timeout": 300
-        },
-        "stderr_lines": 0,
-        "stdout_lines": 17,
-        "termination_reason": "terminal-status:complete"
-      },
-      "started_at": "2026-04-14T11:16:05Z",
-      "task_dir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/research/pi-ralph-loop/task",
-      "termination_reason": "terminal-status:complete",
-      "verifier": {
-        "command": [
-          "bash",
-          "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/research/pi-ralph-loop/task/scripts/verify.sh"
-        ],
-        "cwd": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/research/pi-ralph-loop/task",
-        "passed": true,
-        "returncode": 0
-      }
+  "artifact_root": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-bku01cha",
+  "baseline_manifest": "parity/baselines/current-head/manifest.json",
+  "repo_head": "a941a79830a2110ecf0ec69fe28419f04d49627a",
+  "runs": {
+    "migrate": {
+      "fixture_manifest": "parity/baselines/current-head/runs/migrate/pi-ralph-loop/fixture-manifest.json",
+      "inventory_after": "parity/baselines/current-head/runs/migrate/pi-ralph-loop/inventory-after.tsv",
+      "inventory_before": "parity/baselines/current-head/runs/migrate/pi-ralph-loop/inventory-before.tsv",
+      "run_metadata": "parity/baselines/current-head/runs/migrate/pi-ralph-loop/run-metadata.json",
+      "status": "parity/baselines/current-head/runs/migrate/pi-ralph-loop/status.json",
+      "verify": "parity/baselines/current-head/runs/migrate/pi-ralph-loop/verify.json"
     },
-    {
-      "command": [
-        "pi",
-        "--mode",
-        "rpc",
-        "--no-extensions",
-        "-e",
-        "/Users/pryda/Documents/repos/pi-ralph-loop/.worktrees/ralphify-parity/src/index.ts",
-        "--model",
-        "github-copilot/gpt-5.4-mini"
-      ],
-      "finished_at": "2026-04-14T11:18:42Z",
-      "fixture": "migrate",
-      "implementation": "pi-ralph-loop",
-      "inventory": {
-        "after_count": 12,
-        "before_count": 7
-      },
-      "prompt": "/ralph --path /private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/migrate/pi-ralph-loop/task/RALPH.md",
-      "session": {
-        "returncode": -15,
-        "status": {
-          "completedAt": "2026-04-14T11:18:40.966Z",
-          "currentIteration": 1,
-          "cwd": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/migrate/pi-ralph-loop/task",
-          "guardrails": {
-            "blockCommands": [],
-            "protectedFiles": []
-          },
-          "loopToken": "cddb3c7b-82d9-4d95-b55c-cbd6b255a349",
-          "maxIterations": 2,
-          "ralphPath": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/migrate/pi-ralph-loop/task/RALPH.md",
-          "startedAt": "2026-04-14T11:17:57.854Z",
-          "status": "complete",
-          "taskDir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/migrate/pi-ralph-loop/task",
-          "timeout": 300
-        },
-        "stderr_lines": 0,
-        "stdout_lines": 12,
-        "termination_reason": "terminal-status:complete"
-      },
-      "started_at": "2026-04-14T11:17:57Z",
-      "task_dir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/migrate/pi-ralph-loop/task",
-      "termination_reason": "terminal-status:complete",
-      "verifier": {
-        "command": [
-          "bash",
-          "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/migrate/pi-ralph-loop/task/scripts/verify.sh"
-        ],
-        "cwd": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-voyfkx_p/runs/migrate/pi-ralph-loop/task",
-        "passed": true,
-        "returncode": 0
-      }
+    "research": {
+      "fixture_manifest": "parity/baselines/current-head/runs/research/pi-ralph-loop/fixture-manifest.json",
+      "inventory_after": "parity/baselines/current-head/runs/research/pi-ralph-loop/inventory-after.tsv",
+      "inventory_before": "parity/baselines/current-head/runs/research/pi-ralph-loop/inventory-before.tsv",
+      "run_metadata": "parity/baselines/current-head/runs/research/pi-ralph-loop/run-metadata.json",
+      "status": "parity/baselines/current-head/runs/research/pi-ralph-loop/status.json",
+      "verify": "parity/baselines/current-head/runs/research/pi-ralph-loop/verify.json"
     }
-  ]
+  }
 }
