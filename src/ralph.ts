@@ -836,7 +836,7 @@ export function parseCommandArgs(raw: string): CommandArgs {
   }
   if (cleaned.startsWith("--path=")) {
     const valueWithArgs = cleaned.slice("--path=".length).trimStart();
-    const argMatch = valueWithArgs.match(/(?:^|\s)--arg/);
+    const argMatch = valueWithArgs.match(/(?:^|\s)--arg(?:\s|=|[^\s=]*=|$)/);
     const argIndex = argMatch?.index ?? valueWithArgs.length;
     const value = argMatch ? valueWithArgs.slice(0, argIndex).trim() : valueWithArgs.trim();
     const parsedArgs = parseExplicitPathRuntimeArgs(argMatch ? valueWithArgs.slice(argIndex).trim() : "");
@@ -844,7 +844,7 @@ export function parseCommandArgs(raw: string): CommandArgs {
   }
   if (cleaned.startsWith("--path ")) {
     const valueWithArgs = cleaned.slice("--path ".length).trimStart();
-    const argMatch = valueWithArgs.match(/(?:^|\s)--arg/);
+    const argMatch = valueWithArgs.match(/(?:^|\s)--arg(?:\s|=|[^\s=]*=|$)/);
     const argIndex = argMatch?.index ?? valueWithArgs.length;
     const value = argMatch ? valueWithArgs.slice(0, argIndex).trim() : valueWithArgs.trim();
     const parsedArgs = parseExplicitPathRuntimeArgs(argMatch ? valueWithArgs.slice(argIndex).trim() : "");

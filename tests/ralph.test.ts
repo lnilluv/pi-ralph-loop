@@ -598,6 +598,12 @@ test("parseCommandArgs handles explicit path args, leaves task text alone, and r
     runtimeArgs: [],
     error: undefined,
   });
+  assert.deepEqual(parseCommandArgs("--path my --argument task"), {
+    mode: "path",
+    value: "my --argument task",
+    runtimeArgs: [],
+    error: undefined,
+  });
   assert.equal(parseCommandArgs("--task reverse engineer auth --arg owner=Ada").error, "--arg is only supported with /ralph --path");
 });
 
