@@ -7,8 +7,10 @@ import test from "node:test";
 import {
   type ActiveLoopRegistryEntry,
   type IterationRecord,
+  type RunnerEvent,
   type RunnerStatusFile,
   appendIterationRecord,
+  appendRunnerEvent,
   checkStopSignal,
   clearRunnerDir,
   clearStopSignal,
@@ -17,6 +19,7 @@ import {
   listActiveLoopRegistryEntries,
   readActiveLoopRegistry,
   readIterationRecords,
+  readRunnerEvents,
   readStatusFile,
   recordActiveLoopStopObservation,
   recordActiveLoopStopRequest,
@@ -55,6 +58,18 @@ function makeIterationRecord(overrides: Partial<IterationRecord> = {}): Iteratio
     progress: true,
     changedFiles: ["notes.md"],
     noProgressStreak: 0,
+    ...overrides,
+  };
+}
+
+function makeCompletionRecord(overrides: Record<string, unknown> = {}) {
+  return {
+    promiseSeen: true,
+    durableProgressObserved: true,
+    gateChecked: true,
+    gatePassed: true,
+    gateBlocked: false,
+    blockingReasons: [],
     ...overrides,
   };
 }
@@ -190,6 +205,30 @@ test("appendIterationRecord creates iterations.jsonl if missing", () => {
   }
 });
 
+test("appendRunnerEvent and readRunnerEvents round-trip", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    const event = {
+      type: "completion.gate.blocked",
+      timestamp: new Date().toISOString(),
+      iteration: 2,
+      loopToken: "test-loop-token",
+      ready: false,
+      reasons: ["Missing required output: ARCHITECTURE.md"],
+    } satisfies Extract<RunnerEvent, { type: "completion.gate.blocked" }>;
+
+    appendRunnerEvent(taskDir, event);
+
+    const events = readRunnerEvents(taskDir);
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0], event);
+    assert.ok(existsSync(join(taskDir, ".ralph-runner", "events.jsonl")));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 // --- Stop signal ---
 
 test("createStopSignal and checkStopSignal", () => {
@@ -268,6 +307,14 @@ test("iteration record captures all status fields", () => {
       noProgressStreak: 0,
       completionPromiseMatched: true,
       completionGate: { ready: false, reasons: ["Missing required output: ARCHITECTURE.md"] },
+      completion: makeCompletionRecord({
+        promiseSeen: true,
+        durableProgressObserved: true,
+        gateChecked: true,
+        gatePassed: false,
+        gateBlocked: true,
+        blockingReasons: ["Missing required output: ARCHITECTURE.md"],
+      }),
       snapshotTruncated: false,
       snapshotErrorCount: 0,
     };
@@ -315,6 +362,16 @@ test("writeIterationTranscript writes a human-reviewable markdown transcript", (
         progress: true,
         changedFiles: ["notes/findings.md", "src/index.ts"],
         noProgressStreak: 0,
+        completionPromiseMatched: true,
+        completionGate: { ready: false, reasons: ["Missing required output: ARCHITECTURE.md"] },
+        completion: makeCompletionRecord({
+          promiseSeen: true,
+          durableProgressObserved: true,
+          gateChecked: true,
+          gatePassed: false,
+          gateBlocked: true,
+          blockingReasons: ["Missing required output: ARCHITECTURE.md"],
+        }),
       }),
       prompt: "Rendered prompt for iteration 2",
       commandOutputs: [{ name: "tests", output: "all green" }],
@@ -329,6 +386,11 @@ test("writeIterationTranscript writes a human-reviewable markdown transcript", (
     assert.ok(raw.includes("tests"));
     assert.ok(raw.includes("all green"));
     assert.ok(raw.includes("Finished the task."));
+    assert.ok(raw.includes("Completion promise seen: yes"));
+    assert.ok(raw.includes("Durable progress observed: yes"));
+    assert.ok(raw.includes("Completion gate checked: yes"));
+    assert.ok(raw.includes("Completion gate: blocked"));
+    assert.ok(raw.includes("Missing required output: ARCHITECTURE.md"));
     assert.ok(raw.includes("notes/findings.md"));
     assert.ok(raw.includes("src/index.ts"));
   } finally {

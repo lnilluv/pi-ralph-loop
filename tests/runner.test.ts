@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { assessTaskDirectoryProgress, captureTaskDirectorySnapshot, runRalphLoop, validateCompletionReadiness } from "../src/runner.ts";
-import { readStatusFile, readIterationRecords, checkStopSignal, createStopSignal as createStopSignalFn } from "../src/runner-state.ts";
+import { readStatusFile, readIterationRecords, readRunnerEvents, checkStopSignal, createStopSignal as createStopSignalFn, type RunnerEvent } from "../src/runner-state.ts";
 import { generateDraft } from "../src/ralph.ts";
 import type { DraftTarget, CommandOutput, CommandDef } from "../src/ralph.ts";
 
@@ -40,6 +40,14 @@ function makeMockPi() {
     sendUserMessage: () => undefined,
     exec: async () => ({ killed: false, stdout: "", stderr: "" }),
   };
+}
+
+function isRunnerEventType<T extends RunnerEvent["type"]>(type: T) {
+  return (event: RunnerEvent): event is Extract<RunnerEvent, { type: T }> => event.type === type;
+}
+
+function hasIteration(event: RunnerEvent): event is Extract<RunnerEvent, { iteration: number }> {
+  return "iteration" in event;
 }
 
 function makeMockSpawnScript(cwd: string, outputs: Array<{ text: string; promise?: string }>): string {
@@ -661,6 +669,136 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.equal(result.iterations.length, 1);
     assert.equal(result.iterations[0].completionPromiseMatched, true);
     assert.deepEqual(result.iterations[0].completionGate, { ready: true, reasons: [] });
+    assert.deepEqual(result.iterations[0].completion, {
+      promiseSeen: true,
+      durableProgressObserved: true,
+      gateChecked: true,
+      gatePassed: true,
+      gateBlocked: false,
+      blockingReasons: [],
+    });
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop records completion observability events when the completion gate is blocked", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 2, completion_promise: "DONE", required_outputs: ["ARCHITECTURE.md"] }));
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 2,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    const records = readIterationRecords(taskDir);
+    assert.equal(records.length >= 1, true);
+    assert.deepEqual(records[0].completion, {
+      promiseSeen: true,
+      durableProgressObserved: true,
+      gateChecked: true,
+      gatePassed: false,
+      gateBlocked: true,
+      blockingReasons: ["Missing required output: ARCHITECTURE.md"],
+    });
+
+    const events = readRunnerEvents(taskDir);
+    assert.deepEqual(
+      events.filter(hasIteration).filter((event) => event.iteration === 1).map((event) => event.type),
+      [
+        "iteration.started",
+        "durable.progress.observed",
+        "completion.promise.seen",
+        "completion.gate.checked",
+        "completion.gate.blocked",
+        "iteration.completed",
+      ],
+    );
+
+    const completionPromiseEvent = events.find(isRunnerEventType("completion.promise.seen")) as Extract<RunnerEvent, { type: "completion.promise.seen" }> | undefined;
+    assert.ok(completionPromiseEvent);
+    const { timestamp: _completionPromiseTimestamp, ...completionPromisePayload } = completionPromiseEvent!;
+    assert.deepEqual(completionPromisePayload, {
+      type: "completion.promise.seen",
+      iteration: 1,
+      loopToken: completionPromiseEvent!.loopToken,
+      completionPromise: "DONE",
+    });
+
+    const gateCheckedEvent = events.find(isRunnerEventType("completion.gate.checked")) as Extract<RunnerEvent, { type: "completion.gate.checked" }> | undefined;
+    assert.ok(gateCheckedEvent);
+    const { timestamp: _gateCheckedTimestamp, ...gateCheckedPayload } = gateCheckedEvent!;
+    assert.deepEqual(gateCheckedPayload, {
+      type: "completion.gate.checked",
+      iteration: 1,
+      loopToken: gateCheckedEvent!.loopToken,
+      ready: false,
+      reasons: ["Missing required output: ARCHITECTURE.md"],
+    });
+
+    const blockedEvent = events.find(isRunnerEventType("completion.gate.blocked")) as Extract<RunnerEvent, { type: "completion.gate.blocked" }> | undefined;
+    assert.ok(blockedEvent);
+    const { timestamp: _blockedTimestamp, ...blockedPayload } = blockedEvent!;
+    assert.deepEqual(blockedPayload, {
+      type: "completion.gate.blocked",
+      iteration: 1,
+      loopToken: blockedEvent!.loopToken,
+      ready: false,
+      reasons: ["Missing required output: ARCHITECTURE.md"],
+    });
+
+    const iterationCompletedEvent = events.find(isRunnerEventType("iteration.completed")) as Extract<RunnerEvent, { type: "iteration.completed" }> | undefined;
+    assert.ok(iterationCompletedEvent);
+    const { timestamp: _iterationCompletedTimestamp, ...iterationCompletedPayload } = iterationCompletedEvent!;
+    assert.deepEqual(iterationCompletedPayload, {
+      type: "iteration.completed",
+      iteration: 1,
+      loopToken: iterationCompletedEvent!.loopToken,
+      status: "complete",
+      progress: true,
+      changedFiles: ["notes/findings.md"],
+      noProgressStreak: 0,
+      completionPromiseMatched: true,
+      completionGate: {
+        ready: false,
+        reasons: ["Missing required output: ARCHITECTURE.md"],
+      },
+      completion: {
+        promiseSeen: true,
+        durableProgressObserved: true,
+        gateChecked: true,
+        gatePassed: false,
+        gateBlocked: true,
+        blockingReasons: ["Missing required output: ARCHITECTURE.md"],
+      },
+      snapshotTruncated: false,
+      snapshotErrorCount: 0,
+    });
+
+    assert.notEqual(result.status, "complete");
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
