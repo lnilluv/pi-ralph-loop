@@ -421,7 +421,9 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     startedAt: new Date().toISOString(),
     guardrails: { blockCommands: currentGuardrails.blockCommands, protectedFiles: currentGuardrails.protectedFiles },
   };
+  let latestRegistryStatus = initialStatus;
   const syncActiveLoopRegistry = (statusFile: RunnerStatusFile): void => {
+    latestRegistryStatus = statusFile;
     const existing = readActiveLoopRegistry(cwd).find((entry) => entry.taskDir === taskDir && entry.loopToken === loopToken);
     writeActiveLoopRegistryEntry(cwd, {
       taskDir,
@@ -437,6 +439,10 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       stopObservedAt: existing?.stopObservedAt,
     });
   };
+  const activeLoopHeartbeat = setInterval(() => {
+    syncActiveLoopRegistry(latestRegistryStatus);
+  }, 60_000);
+  activeLoopHeartbeat.unref?.();
   writeStatusFile(taskDir, initialStatus);
   syncActiveLoopRegistry(initialStatus);
   onStatusChange?.("initializing");
@@ -731,6 +737,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     onNotify?.(`Ralph runner failed: ${message}`, "error");
     finalStatus = "error";
   } finally {
+    clearInterval(activeLoopHeartbeat);
     // Write final status
     const completedAt = new Date().toISOString();
     const finalStatusFile: RunnerStatusFile = {

@@ -1249,6 +1249,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
 
       type StopTarget = {
+        cwd: string;
         taskDir: string;
         ralphPath: string;
         loopToken: string;
@@ -1262,6 +1263,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
       const inProcessSessionTarget: StopTarget | undefined = loopState.active
         ? {
+            cwd: loopState.cwd || ctx.cwd,
             taskDir: loopState.taskDir,
             ralphPath: loopState.ralphPath,
             loopToken: loopState.loopToken ?? "",
@@ -1281,6 +1283,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         typeof persistedSessionState.iteration === "number" &&
         typeof persistedSessionState.maxIterations === "number"
           ? {
+              cwd: typeof persistedSessionState.cwd === "string" && persistedSessionState.cwd.length > 0 ? persistedSessionState.cwd : ctx.cwd,
               taskDir: persistedSessionState.taskDir,
               ralphPath: join(persistedSessionState.taskDir, "RALPH.md"),
               loopToken: persistedSessionState.loopToken,
@@ -1292,6 +1295,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
           : inProcessSessionTarget;
 
       const materializeRegistryTarget = (entry: ActiveLoopRegistryEntry): StopTarget => ({
+        cwd: entry.cwd,
         taskDir: entry.taskDir,
         ralphPath: entry.ralphPath,
         loopToken: entry.loopToken,
@@ -1304,26 +1308,20 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       const stopTarget = (target: StopTarget): void => {
         createStopSignal(target.taskDir);
 
-        const existingEntry = readActiveLoopRegistry(ctx.cwd).find((entry) => entry.taskDir === target.taskDir);
+        const registryCwd = target.cwd;
+        const existingEntry = listActiveLoopRegistryEntries(registryCwd).find((entry) => entry.taskDir === target.taskDir);
         const registryEntry: ActiveLoopRegistryEntry = existingEntry
           ? {
               ...existingEntry,
               taskDir: target.taskDir,
               ralphPath: target.ralphPath,
-              cwd: ctx.cwd,
-              loopToken: target.loopToken,
-              status: existingEntry.loopToken === target.loopToken ? existingEntry.status : "running",
-              currentIteration: target.currentIteration,
-              maxIterations: target.maxIterations,
-              startedAt: existingEntry.loopToken === target.loopToken ? existingEntry.startedAt : target.startedAt,
+              cwd: registryCwd,
               updatedAt: now,
-              stopRequestedAt: existingEntry.loopToken === target.loopToken ? existingEntry.stopRequestedAt : undefined,
-              stopObservedAt: existingEntry.loopToken === target.loopToken ? existingEntry.stopObservedAt : undefined,
             }
           : {
               taskDir: target.taskDir,
               ralphPath: target.ralphPath,
-              cwd: ctx.cwd,
+              cwd: registryCwd,
               loopToken: target.loopToken,
               status: "running",
               currentIteration: target.currentIteration,
@@ -1331,8 +1329,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
               startedAt: target.startedAt,
               updatedAt: now,
             };
-        writeActiveLoopRegistryEntry(ctx.cwd, registryEntry);
-        recordActiveLoopStopRequest(ctx.cwd, target.taskDir, now);
+        writeActiveLoopRegistryEntry(registryCwd, registryEntry);
+        recordActiveLoopStopRequest(registryCwd, target.taskDir, now);
 
         if (target.source === "session") {
           loopState.stopRequested = true;
@@ -1371,29 +1369,31 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         }
 
         const taskDir = dirname(inspection.ralphPath);
+        if (sessionTarget && sessionTarget.taskDir === taskDir) {
+          stopTarget(sessionTarget);
+          return;
+        }
+
         const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === taskDir || entry.ralphPath === inspection.ralphPath);
         if (registryTarget) {
           stopTarget(materializeRegistryTarget(registryTarget));
           return;
         }
 
-        if (sessionTarget && sessionTarget.taskDir === taskDir) {
-          stopTarget(sessionTarget);
-          return;
-        }
-
         const statusFile = readStatusFile(taskDir);
-        if (statusFile && (statusFile.status === "running" || statusFile.status === "initializing")) {
-          stopTarget({
-            taskDir,
-            ralphPath: inspection.ralphPath,
-            loopToken: statusFile.loopToken,
-            currentIteration: statusFile.currentIteration,
-            maxIterations: statusFile.maxIterations,
-            startedAt: statusFile.startedAt,
-            source: "status",
-          });
-          return;
+        if (
+          statusFile &&
+          (statusFile.status === "running" || statusFile.status === "initializing") &&
+          typeof statusFile.cwd === "string" &&
+          statusFile.cwd.length > 0
+        ) {
+          const statusRegistryTarget = listActiveLoopRegistryEntries(statusFile.cwd).find(
+            (entry) => entry.taskDir === taskDir && entry.loopToken === statusFile.loopToken,
+          );
+          if (statusRegistryTarget) {
+            stopTarget(materializeRegistryTarget(statusRegistryTarget));
+            return;
+          }
         }
 
         ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, inspection.ralphPath)}.`, "warning");
