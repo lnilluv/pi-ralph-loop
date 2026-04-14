@@ -157,11 +157,7 @@ export async function runCommands(
     const blockedPattern = findBlockedCommandPattern(semanticRun, blockPatterns);
     const resolvedRun = resolveCommandRun(cmd.run, runtimeArgs);
     if (blockedPattern) {
-      try {
-        pi.appendEntry("ralph-blocked-command", { name: cmd.name, command: semanticRun, blockedPattern, cwd: repoCwd, taskDir });
-      } catch {
-        // Durable proof should never break command guardrails.
-      }
+      pi.appendEntry?.("ralph-blocked-command", { name: cmd.name, command: semanticRun, blockedPattern, cwd: repoCwd, taskDir });
       results.push({ name: cmd.name, output: `[blocked by guardrail: ${blockedPattern}]` });
       continue;
     }
@@ -855,11 +851,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   const draftPlanFactory = services.createDraftPlan ?? createDraftPlanService;
   const isLoopSession = (ctx: Pick<CommandContext, "sessionManager">): boolean => resolveActiveLoopState(ctx) !== undefined;
   const appendLoopProofEntry = (customType: string, data: Record<string, unknown>): void => {
-    try {
-      pi.appendEntry(customType, data);
-    } catch {
-      // Durable proof should never break the hook.
-    }
+    pi.appendEntry?.(customType, data);
   };
   const getPendingIteration = (ctx: Pick<CommandContext, "sessionManager">): PendingIterationState | undefined => {
     const state = resolveActiveIterationState(ctx);

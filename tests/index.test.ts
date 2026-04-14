@@ -504,6 +504,27 @@ test("runCommands uses the semantic command form to choose taskDir for templated
   }
 });
 
+test("runCommands surfaces blocked-command appendEntry failures", async () => {
+  const repoCwd = createTempDir();
+  const taskDir = join(repoCwd, "task");
+  mkdirSync(taskDir, { recursive: true });
+  try {
+    const pi = {
+      appendEntry: () => {
+        throw new Error("append failed");
+      },
+      exec: async () => ({ killed: false, stdout: "", stderr: "" }),
+    } as any;
+
+    await assert.rejects(
+      runCommands([{ name: "blocked", run: "git push origin main", timeout: 1 }], ["git\\s+push"], pi, {}, repoCwd, taskDir),
+      /append failed/,
+    );
+  } finally {
+    rmSync(repoCwd, { recursive: true, force: true });
+  }
+});
+
 test("/ralph-stop writes the durable stop flag from persisted active loop state after reload", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -2856,6 +2877,65 @@ test("tool_call keeps explicit protected-file globs working", async () => {
   assert.equal(proofEntries.filter((entry) => entry.customType === "ralph-blocked-write").length, 2);
   assert.ok(proofEntries.some((entry) => entry.data.toolName === "write" && entry.data.path === "src/generated/output.ts"));
   assert.ok(proofEntries.some((entry) => entry.data.toolName === "edit" && entry.data.path === "src/generated/output.ts"));
+});
+
+test("/ralph subprocess child surfaces proof appendEntry failures", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "subprocess-child-task");
+  mkdirSync(taskDir, { recursive: true });
+  writeStatusFile(taskDir, {
+    loopToken: "subprocess-loop-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 2,
+    maxIterations: 4,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  appendIterationRecord(taskDir, {
+    iteration: 1,
+    status: "complete",
+    startedAt: new Date(Date.now() - 1000).toISOString(),
+    completedAt: new Date().toISOString(),
+    durationMs: 1000,
+    progress: true,
+    changedFiles: ["notes/findings.md"],
+    noProgressStreak: 0,
+    snapshotTruncated: false,
+    snapshotErrorCount: 0,
+    loopToken: "subprocess-loop-token",
+  } as any);
+
+  const restoreEnv = setRunnerEnv({
+    RALPH_RUNNER_TASK_DIR: taskDir,
+    RALPH_RUNNER_CWD: cwd,
+    RALPH_RUNNER_LOOP_TOKEN: "subprocess-loop-token",
+    RALPH_RUNNER_CURRENT_ITERATION: "2",
+    RALPH_RUNNER_MAX_ITERATIONS: "4",
+    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
+    RALPH_RUNNER_GUARDRAILS: JSON.stringify({ blockCommands: [], protectedFiles: [] }),
+  });
+  t.after(restoreEnv);
+
+  const harness = createHarness({
+    appendEntry: () => {
+      throw new Error("append failed");
+    },
+  });
+  const beforeAgentStart = harness.event("before_agent_start");
+
+  await assert.rejects(
+    beforeAgentStart(
+      { systemPrompt: "Base prompt" },
+      { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } },
+    ),
+    /append failed/,
+  );
 });
 
 test("/ralph subprocess child injects durable loop context into before_agent_start when session entries are empty", { concurrency: false }, async (t) => {
