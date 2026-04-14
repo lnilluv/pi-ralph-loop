@@ -723,21 +723,71 @@ function parseExplicitPathRuntimeArgs(rawTail: string): { runtimeArgs: RuntimeAr
     return { runtimeArgs };
   }
 
-  const tokens = trimmed.split(/\s+/);
-  for (let index = 0; index < tokens.length; index += 2) {
-    if (tokens[index] !== "--arg") {
-      return {
-        runtimeArgs,
-        error: "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
-      };
+  const syntaxError = "Invalid --arg syntax: values must be a single token and no trailing text is allowed";
+  let index = 0;
+
+  while (index < trimmed.length) {
+    while (index < trimmed.length && /\s/.test(trimmed[index])) {
+      index += 1;
+    }
+    if (index >= trimmed.length) {
+      break;
     }
 
-    const assignment = tokens[index + 1];
-    if (!assignment) {
+    if (!trimmed.startsWith("--arg", index) || (trimmed[index + 5] !== undefined && !/\s/.test(trimmed[index + 5]))) {
+      return { runtimeArgs, error: syntaxError };
+    }
+    index += 5;
+
+    while (index < trimmed.length && /\s/.test(trimmed[index])) {
+      index += 1;
+    }
+    if (index >= trimmed.length) {
       return { runtimeArgs, error: "Invalid --arg entry: name=value is required" };
     }
 
-    const parsed = parseRuntimeArgEntry(assignment);
+    const nameStart = index;
+    while (index < trimmed.length && trimmed[index] !== "=" && !/\s/.test(trimmed[index])) {
+      index += 1;
+    }
+
+    const name = trimmed.slice(nameStart, index).trim();
+    if (!name) {
+      return { runtimeArgs, error: "Invalid --arg entry: name is required" };
+    }
+    if (index >= trimmed.length || trimmed[index] !== "=") {
+      return { runtimeArgs, error: "Invalid --arg entry: name=value is required" };
+    }
+    index += 1;
+
+    if (index >= trimmed.length || /\s/.test(trimmed[index])) {
+      return { runtimeArgs, error: "Invalid --arg entry: value is required" };
+    }
+
+    let value = "";
+    const quote = trimmed[index];
+    if (quote === "'" || quote === '"') {
+      index += 1;
+      while (index < trimmed.length && trimmed[index] !== quote) {
+        value += trimmed[index];
+        index += 1;
+      }
+      if (index >= trimmed.length) {
+        return { runtimeArgs, error: syntaxError };
+      }
+      index += 1;
+    } else {
+      while (index < trimmed.length && !/\s/.test(trimmed[index])) {
+        const char = trimmed[index];
+        if (char === "'" || char === '"') {
+          return { runtimeArgs, error: syntaxError };
+        }
+        value += char;
+        index += 1;
+      }
+    }
+
+    const parsed = parseRuntimeArgEntry(`${name}=${value}`);
     if (parsed.error) {
       return { runtimeArgs, error: parsed.error };
     }
@@ -752,6 +802,13 @@ function parseExplicitPathRuntimeArgs(rawTail: string): { runtimeArgs: RuntimeAr
     }
 
     runtimeArgs.push(entry);
+
+    while (index < trimmed.length && /\s/.test(trimmed[index])) {
+      index += 1;
+    }
+    if (index < trimmed.length && !trimmed.startsWith("--arg", index)) {
+      return { runtimeArgs, error: syntaxError };
+    }
   }
 
   return { runtimeArgs };
