@@ -1,4 +1,4 @@
-# pi-ralph
+# pi-ralph // CURRENTLY IN FULL RE-WORK
 
 Autonomous coding loops for pi with mid-turn supervision.
 
