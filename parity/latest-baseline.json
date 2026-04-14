@@ -1,26 +1,4 @@
 {
-  "artifact_root": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-n54xjiwu",
-  "command": "python3 parity/harness.py --implementation pi-ralph-loop --fixture research --fixture migrate",
-  "created_at": "2026-04-14T10:45:02Z",
-  "fixture_results": [
-    {
-      "fixture": "research",
-      "implementation": "pi-ralph-loop",
-      "session_returncode": -15,
-      "session_termination_reason": "terminal-status:no-progress-exhaustion",
-      "task_dir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-n54xjiwu/runs/research/pi-ralph-loop/task",
-      "termination_reason": "terminal-status:no-progress-exhaustion",
-      "verifier_passed": false
-    },
-    {
-      "fixture": "migrate",
-      "implementation": "pi-ralph-loop",
-      "session_returncode": -15,
-      "session_termination_reason": "terminal-status:complete",
-      "task_dir": "/private/var/folders/4q/2j87b64s3sz3hm3nf8lfkcqc0000gn/T/pi-ralph-parity-n54xjiwu/runs/migrate/pi-ralph-loop/task",
-      "termination_reason": "terminal-status:complete",
-      "verifier_passed": true
-    }
-  ],
-  "repo_sha": "c33f378da3d29fbce366422c30594dd7dfdb0030"
+  "baseline": "parity/baselines/current-head.json",
+  "repo_head": "current-head"
 }

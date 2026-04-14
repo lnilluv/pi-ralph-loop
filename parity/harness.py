@@ -130,6 +130,8 @@ def create_bundle_root(explicit_root: str | None) -> Path:
 def run_git(args: list[str]) -> str:
     result = subprocess.run(
         ["git", *args],
+        # Run the RPC session inside the copied task workspace so file writes stay
+        # isolated from the repository checkout.
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -353,7 +355,7 @@ def run_fixture(bundle_root: Path, fixture_name: str, implementation: str, rpc_c
     session_result = run_rpc_session(
         rpc_command,
         prompt,
-        REPO_ROOT,
+        task_dir,
         env,
         run_dir / "top-level-rpc.jsonl",
         run_dir / "top-level-stderr.log",
