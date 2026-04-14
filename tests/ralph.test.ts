@@ -632,6 +632,14 @@ test("parseCommandArgs rejects malformed explicit-path args", () => {
     "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
   );
   assert.equal(
+    parseCommandArgs("--path my-task --arg=name=value").error,
+    "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
+  );
+  assert.equal(
+    parseCommandArgs("--path my-task --argowner=Ada").error,
+    "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
+  );
+  assert.equal(
     parseCommandArgs('--path my-task --arg owner="Ada"extra').error,
     "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
   );
