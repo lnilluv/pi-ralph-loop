@@ -775,6 +775,9 @@ function parseExplicitPathRuntimeArgs(rawTail: string): { runtimeArgs: RuntimeAr
       if (index >= trimmed.length) {
         return { runtimeArgs, error: syntaxError };
       }
+      if (index + 1 < trimmed.length && !/\s/.test(trimmed[index + 1])) {
+        return { runtimeArgs, error: syntaxError };
+      }
       index += 1;
     } else {
       while (index < trimmed.length && !/\s/.test(trimmed[index])) {
