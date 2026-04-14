@@ -49,7 +49,7 @@ That saves the draft but does not launch the loop.
 
 ### Smart drafting
 
-Smart drafting sends the selected repo excerpts from the current repo context to the currently selected active pi model, including models chosen with `/model` or by cycling within `/scoped-models`. It excludes common secret-bearing paths from that context, and non-analysis drafts use the shared `policy:secret-bearing-paths` token so runtime write protection stays aligned with the same policy. It does not switch models automatically. When the active model is used to strengthen an existing draft, it now accepts validated body-and-commands drafts instead of body-only drafts. If no active authenticated model is available, drafting falls back to the deterministic path.
+Smart drafting sends the selected repo excerpts from the current repo context to the currently selected active pi model when you start `/ralph` interactively, including models chosen with `/model` or by cycling within `/scoped-models`. It excludes common secret-bearing paths from that context, and non-analysis drafts use the shared `policy:secret-bearing-paths` token so runtime write protection stays aligned with the same policy. It does not switch models automatically. When the active model is used to strengthen an existing draft, it now accepts validated body-and-commands drafts instead of body-only drafts. If no active authenticated model is available, drafting falls back to the deterministic path.
 
 ## How it works
 
@@ -105,13 +105,13 @@ The runner hashes task-directory files before and after each iteration and diffs
 Use these when you want to skip heuristics:
 
 ```text
-/ralph --path my-task --arg owner=Ada
+/ralph --path my-task --arg owner="Ada Lovelace"
 /ralph --task "reverse engineer the billing flow"
 /ralph-draft --path my-task
 /ralph-draft --task "fix flaky auth tests"
 ```
 
-`--arg` is for reusable templates that already declare runtime parameters. It is applied only when `/ralph` runs an existing `RALPH.md`; `/ralph-draft` leaves arg placeholders untouched for now.
+`--arg` is for reusable templates that already declare runtime parameters. It is applied only when `/ralph` runs an existing `RALPH.md`; `/ralph-draft` leaves arg placeholders untouched for now. It accepts quoted multiword values like `--arg owner="Ada Lovelace"`.
 
 ### Interactive review
 
