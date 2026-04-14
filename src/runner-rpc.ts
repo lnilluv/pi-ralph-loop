@@ -189,6 +189,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     let agentEndMessages: unknown[] = [];
     let promptSent = false;
     let promptAcknowledged = false;
+    let sawAgentEnd = false;
     let modelSetAcknowledged = !(modelProvider && modelModelId); // true if no set_model needed
     let thinkingLevelAcknowledged = !thinkingLevel; // true if no set_thinking_level needed
 
@@ -217,14 +218,18 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       }));
     }, timeoutMs);
 
-    const cleanup = () => {
-      clearTimeout(timeout);
+    const endStdin = () => {
       // Close stdin so the subprocess knows no more commands are coming
       try {
         childProcess.stdin?.end();
       } catch {
         // already closed
       }
+    };
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      endStdin();
     };
 
     const settle = (result: RpcSubprocessResult) => {
@@ -280,17 +285,11 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
 
         if (event.type === "agent_end") {
           const endEvent = event as { messages?: unknown[] };
+          sawAgentEnd = true;
           agentEndMessages = Array.isArray(endEvent.messages) ? endEvent.messages : [];
           lastAssistantText = extractAssistantText(agentEndMessages);
-
-          telemetry.exitedAt = telemetry.exitedAt ?? nowIso();
-          settle(buildResult({
-            success: true,
-            lastAssistantText,
-            agentEndMessages,
-            timedOut: false,
-          }));
-          return;
+          endStdin();
+          continue;
         }
       }
     });
@@ -324,25 +323,22 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       telemetry.exitCode = code;
       telemetry.exitSignal = signal;
 
-      // If the subprocess exited but we never got an agent_end
-      if (code !== 0 && code !== null) {
-        settle(buildResult({
-          success: false,
-          lastAssistantText,
-          agentEndMessages,
-          timedOut: false,
-          error: `Subprocess exited with code ${code}${stderrText ? `: ${stderrText.slice(0, 200)}` : ""}`,
-        }));
-        return;
-      }
+      const closeError =
+        code !== 0 && code !== null
+          ? `Subprocess exited with code ${code}${stderrText ? `: ${stderrText.slice(0, 200)}` : ""}`
+          : signal
+            ? `Subprocess exited due to signal ${signal}${stderrText ? `: ${stderrText.slice(0, 200)}` : ""}`
+            : sawAgentEnd
+              ? undefined
+              : "Subprocess exited without sending agent_end";
+      if (closeError) telemetry.error = closeError;
 
-      // Process exited normally but no agent_end received
       settle(buildResult({
-        success: agentEndMessages.length > 0,
+        success: sawAgentEnd && code === 0 && signal === null,
         lastAssistantText,
         agentEndMessages,
         timedOut: false,
-        error: agentEndMessages.length > 0 ? undefined : "Subprocess exited without sending agent_end",
+        error: closeError,
       }));
     });
 

@@ -85,6 +85,94 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRpcIteration captures close telemetry after agent_end", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-close.sh", `#!/bin/bash
+read line
+printf 'mock stderr\n' >&2
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+sleep 0.2
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.lastAssistantText, "done");
+    assert.ok(result.telemetry.exitedAt);
+    assert.equal(result.telemetry.exitCode, 0);
+    assert.equal(result.telemetry.exitSignal, null);
+    assert.equal(result.telemetry.error, undefined);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration records close-derived failure telemetry errors", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-close-failure.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+exit 7
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.ok(result.telemetry.exitedAt);
+    assert.equal(result.telemetry.exitCode, 7);
+    assert.equal(result.telemetry.exitSignal, null);
+    assert.match(result.telemetry.error ?? "", /Subprocess exited with code 7/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration closes stdin after agent_end so the subprocess can exit", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-wait-for-stdin-close.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+cat >/dev/null
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.lastAssistantText, "done");
+    assert.equal(result.telemetry.exitCode, 0);
+    assert.equal(result.telemetry.exitSignal, null);
+    assert.ok(result.telemetry.exitedAt);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runRpcIteration records timeout telemetry when subprocess takes too long", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {

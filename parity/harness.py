@@ -16,7 +16,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
-DEFAULT_MODEL = os.environ.get("PI_RALPH_PARITY_MODEL", "github-copilot/gpt-5.4-mini")
+DEFAULT_MODEL = os.environ.get("PI_RALPH_PARITY_MODEL", "openai-codex/gpt-5.4-mini:high")
 DEFAULT_LOOP_RPC_COMMAND = os.environ.get(
     "PI_RALPH_PARITY_LOOP_RPC_COMMAND",
     f"pi --mode rpc --no-extensions -e {shlex.quote(str(REPO_ROOT / 'src' / 'index.ts'))} --model {shlex.quote(DEFAULT_MODEL)}",

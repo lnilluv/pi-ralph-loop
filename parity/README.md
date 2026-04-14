@@ -31,7 +31,7 @@ The checked-in baseline evidence is named for the commit it covers: `a941a79830a
 To compare against Ralphify, point the harness at the Ralphify RPC command and switch the implementation flag:
 
 ```bash
-PI_RALPH_PARITY_RALPHIFY_RPC_COMMAND='pi --mode rpc --no-extensions -e /path/to/ralphify/src/index.ts --model github-copilot/gpt-5.4-mini' \
+PI_RALPH_PARITY_RALPHIFY_RPC_COMMAND='pi --mode rpc --no-extensions -e /path/to/ralphify/src/index.ts --model openai-codex/gpt-5.4-mini:high' \
 python3 parity/harness.py --implementation ralphify --fixture research --fixture migrate
 ```
 
