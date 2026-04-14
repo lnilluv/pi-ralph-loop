@@ -17,6 +17,15 @@ python3 parity/harness.py --implementation pi-ralph-loop --fixture research --fi
 
 The harness creates a fresh temp artifact root by default, runs each selected fixture in its own copied workspace, and prints the absolute artifact root path when it finishes.
 
+## Checked-in baseline
+
+The checked-in baseline evidence is named for the commit it covers: `a941a79830a2110ecf0ec69fe28419f04d49627a`.
+
+- Pointer file: `parity/baselines/a941a79830a2110ecf0ec69fe28419f04d49627a.json`
+- Evidence bundle: `parity/baselines/a941a79830a2110ecf0ec69fe28419f04d49627a/`
+
+`parity/latest-baseline.json` points at that snapshot.
+
 ## Running Ralphify later
 
 To compare against Ralphify, point the harness at the Ralphify RPC command and switch the implementation flag:

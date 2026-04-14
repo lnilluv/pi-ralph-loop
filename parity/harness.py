@@ -82,13 +82,17 @@ def write_inventory_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
     write_text(path, "\n".join(lines) + "\n")
 
 
-def read_status(task_dir: Path) -> dict[str, Any] | None:
+def read_status(task_dir: Path, error_context: list[dict[str, str]] | None = None) -> dict[str, Any] | None:
     status_path = task_dir / ".ralph-runner" / "status.json"
     if not status_path.exists():
         return None
     try:
         payload = json.loads(read_text(status_path))
-    except Exception:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        if error_context is not None:
+            entry = {"path": str(status_path), "error": f"{type(exc).__name__}: {exc}"}
+            if not error_context or error_context[-1] != entry:
+                error_context.append(entry)
         return None
     if isinstance(payload, dict):
         return payload
@@ -164,7 +168,7 @@ def stream_reader(stream, file_obj, store: list[str], last_output: list[float]) 
     finally:
         try:
             stream.close()
-        except Exception:
+        except (OSError, ValueError):
             pass
 
 
@@ -196,6 +200,8 @@ def run_rpc_session(
     stderr_lines: list[str] = []
     last_output = [time.time()]
     termination_reason = "timeout"
+    cleanup_errors: list[dict[str, str]] = []
+    status_errors: list[dict[str, str]] = []
     startup_grace_seconds = max(quiet_kill_seconds * 10, 30.0)
 
     stdout_file = stdout_path.open("w", encoding="utf-8")
@@ -221,7 +227,7 @@ def run_rpc_session(
                 termination_reason = "process-exited"
                 break
 
-            status_snapshot = read_status(task_dir)
+            status_snapshot = read_status(task_dir, status_errors)
             status_value = status_snapshot.get("status") if status_snapshot else None
             if status_value in TERMINAL_STATUSES:
                 termination_reason = f"terminal-status:{status_value}"
@@ -243,25 +249,26 @@ def run_rpc_session(
         if proc.poll() is None:
             try:
                 proc.terminate()
-            except Exception:
-                pass
+            except (ProcessLookupError, OSError) as exc:
+                cleanup_errors.append({"action": "terminate", "error": f"{type(exc).__name__}: {exc}"})
             try:
                 proc.wait(timeout=5)
-            except Exception:
+            except subprocess.TimeoutExpired as exc:
+                cleanup_errors.append({"action": "wait-after-terminate", "error": f"{type(exc).__name__}: {exc}"})
                 try:
                     proc.kill()
-                except Exception:
-                    pass
+                except (ProcessLookupError, OSError) as kill_exc:
+                    cleanup_errors.append({"action": "kill", "error": f"{type(kill_exc).__name__}: {kill_exc}"})
                 try:
                     proc.wait(timeout=5)
-                except Exception:
-                    pass
+                except subprocess.TimeoutExpired as wait_exc:
+                    cleanup_errors.append({"action": "wait-after-kill", "error": f"{type(wait_exc).__name__}: {wait_exc}"})
 
         if proc.stdin is not None:
             try:
                 proc.stdin.close()
-            except Exception:
-                pass
+            except (OSError, ValueError) as exc:
+                cleanup_errors.append({"action": "close-stdin", "error": f"{type(exc).__name__}: {exc}"})
 
         for thread in threads:
             thread.join(timeout=2)
@@ -274,6 +281,8 @@ def run_rpc_session(
         "stderr_lines": stderr_lines,
         "status": status_snapshot,
         "termination_reason": termination_reason,
+        "cleanup_errors": cleanup_errors,
+        "status_errors": status_errors,
         "command": command,
         "prompt": prompt,
     }
@@ -381,6 +390,8 @@ def run_fixture(bundle_root: Path, fixture_name: str, implementation: str, rpc_c
             "returncode": session_result["returncode"],
             "status": session_result["status"],
             "termination_reason": session_result["termination_reason"],
+            "cleanup_errors": session_result["cleanup_errors"],
+            "status_errors": session_result["status_errors"],
             "stdout_lines": len(session_result["stdout_lines"]),
             "stderr_lines": len(session_result["stderr_lines"]),
         },
