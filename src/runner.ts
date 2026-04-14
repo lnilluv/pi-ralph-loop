@@ -13,11 +13,14 @@ import {
 } from "./ralph.ts";
 import { runCommands } from "./index.ts";
 import {
+  type CompletionRecord,
   type IterationRecord,
   type ProgressState,
+  type RunnerEvent,
   type RunnerStatus,
   type RunnerStatusFile,
   appendIterationRecord,
+  appendRunnerEvent,
   checkStopSignal,
   clearRunnerDir,
   clearStopSignal,
@@ -129,6 +132,25 @@ export type ProgressAssessment = {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createCompletionRecord(): CompletionRecord {
+  return {
+    promiseSeen: false,
+    durableProgressObserved: false,
+    gateChecked: false,
+    gatePassed: false,
+    gateBlocked: false,
+    blockingReasons: [],
+  };
+}
+
+function logRunnerEvent(taskDir: string, event: RunnerEvent): void {
+  try {
+    appendRunnerEvent(taskDir, event);
+  } catch {
+    // Event logging should not break the runner.
+  }
 }
 
 function readProgressMemory(taskDir: string): string | undefined {
@@ -445,6 +467,18 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
   activeLoopHeartbeat.unref?.();
   writeStatusFile(taskDir, initialStatus);
   syncActiveLoopRegistry(initialStatus);
+  logRunnerEvent(taskDir, {
+    type: "runner.started",
+    timestamp: initialStatus.startedAt,
+    loopToken,
+    cwd,
+    taskDir,
+    status: "initializing",
+    maxIterations: currentMaxIterations,
+    timeout: currentTimeout,
+    completionPromise: currentCompletionPromise,
+    guardrails: currentGuardrails,
+  });
   onStatusChange?.("initializing");
   onNotify?.(`Ralph runner started: ${name} (max ${currentMaxIterations} iterations)`, "info");
 
@@ -505,6 +539,17 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       onIterationStart?.(i, currentMaxIterations);
 
       const iterStartMs = Date.now();
+      const completionRecord = currentCompletionPromise ? createCompletionRecord() : undefined;
+      logRunnerEvent(taskDir, {
+        type: "iteration.started",
+        timestamp: new Date(iterStartMs).toISOString(),
+        iteration: i,
+        loopToken,
+        status: "running",
+        maxIterations: currentMaxIterations,
+        timeout: currentTimeout,
+        completionPromise: currentCompletionPromise,
+      });
 
       // Run commands
       const commandsOutput: CommandOutput[] = runCommandsFn && pi
@@ -565,6 +610,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           progress: false,
           changedFiles: [],
           noProgressStreak: noProgressStreak + 1,
+          completion: completionRecord,
           loopToken,
         };
         iterations.push(iterRecord);
@@ -576,6 +622,18 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
             ? `Timed out after ${currentTimeout}s waiting for the RPC subprocess.`
             : `RPC subprocess error: ${rpcResult.error ?? "unknown"}`,
         );
+        logRunnerEvent(taskDir, {
+          type: "iteration.completed",
+          timestamp: new Date(iterEndMs).toISOString(),
+          iteration: i,
+          loopToken,
+          status: rpcResult.timedOut ? "timeout" : "error",
+          progress: iterRecord.progress,
+          changedFiles: iterRecord.changedFiles,
+          noProgressStreak: iterRecord.noProgressStreak,
+          completion: iterRecord.completion,
+          reason: rpcResult.timedOut ? "rpc-timeout" : "rpc-error",
+        });
 
         if (rpcResult.timedOut) {
           onNotify?.(`Iteration ${i} timed out after ${currentTimeout}s`, "warning");
@@ -599,6 +657,25 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         noProgressStreak += 1;
       }
       // "unknown" doesn't increment streak
+
+      if (completionRecord) {
+        completionRecord.durableProgressObserved = progress === true;
+        logRunnerEvent(taskDir, {
+          type:
+            progress === true
+              ? "durable.progress.observed"
+              : progress === false
+                ? "durable.progress.missing"
+                : "durable.progress.unknown",
+          timestamp: new Date(iterEndMs).toISOString(),
+          iteration: i,
+          loopToken,
+          progress,
+          changedFiles,
+          snapshotTruncated,
+          snapshotErrorCount,
+        });
+      }
 
       // Check completion promise
       let completionPromiseMatched = false;
@@ -630,6 +707,16 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
             }
             if (shouldStopForCompletionPromise(text, currentCompletionPromise)) {
               completionPromiseMatched = true;
+              if (completionRecord) {
+                completionRecord.promiseSeen = true;
+                logRunnerEvent(taskDir, {
+                  type: "completion.promise.seen",
+                  timestamp: new Date(iterEndMs).toISOString(),
+                  iteration: i,
+                  loopToken,
+                  completionPromise: currentCompletionPromise,
+                });
+              }
               break;
             }
           }
@@ -639,6 +726,28 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       let completionGate: CompletionReadiness | undefined;
       if (completionPromiseMatched && progress !== false) {
         completionGate = validateCompletionReadiness(taskDir, currentRequiredOutputs);
+        if (completionRecord) {
+          completionRecord.gateChecked = true;
+          completionRecord.gatePassed = completionGate.ready;
+          completionRecord.gateBlocked = !completionGate.ready;
+          completionRecord.blockingReasons = completionGate.reasons;
+          logRunnerEvent(taskDir, {
+            type: "completion.gate.checked",
+            timestamp: new Date(iterEndMs).toISOString(),
+            iteration: i,
+            loopToken,
+            ready: completionGate.ready,
+            reasons: completionGate.reasons,
+          });
+          logRunnerEvent(taskDir, {
+            type: completionGate.ready ? "completion.gate.passed" : "completion.gate.blocked",
+            timestamp: new Date(iterEndMs).toISOString(),
+            iteration: i,
+            loopToken,
+            ready: completionGate.ready,
+            reasons: completionGate.reasons,
+          });
+        }
         if (!completionGate.ready) {
           completionGateFailureReasons = completionGate.reasons;
           onNotify?.(
@@ -663,12 +772,28 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         loopToken,
         completionPromiseMatched: completionPromiseMatched || undefined,
         completionGate,
+        completion: completionRecord,
         snapshotTruncated,
         snapshotErrorCount,
       };
       iterations.push(iterRecord);
       appendIterationRecord(taskDir, iterRecord);
       writeIterationTranscriptSafe(iterRecord, rpcResult.lastAssistantText);
+      logRunnerEvent(taskDir, {
+        type: "iteration.completed",
+        timestamp: new Date(iterEndMs).toISOString(),
+        iteration: i,
+        loopToken,
+        status: "complete",
+        progress: iterRecord.progress,
+        changedFiles: iterRecord.changedFiles,
+        noProgressStreak: iterRecord.noProgressStreak,
+        completionPromiseMatched: iterRecord.completionPromiseMatched,
+        completionGate: iterRecord.completionGate,
+        completion: iterRecord.completion,
+        snapshotTruncated: iterRecord.snapshotTruncated,
+        snapshotErrorCount: iterRecord.snapshotErrorCount,
+      });
 
       // Notify progress
       if (progress === true) {
@@ -748,6 +873,14 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     };
     writeStatusFile(taskDir, finalStatusFile);
     syncActiveLoopRegistry(finalStatusFile);
+    logRunnerEvent(taskDir, {
+      type: "runner.finished",
+      timestamp: completedAt,
+      loopToken,
+      status: finalStatus,
+      iterations: iterations.length,
+      totalDurationMs: Date.now() - startMs,
+    });
     onStatusChange?.(finalStatus);
 
     const totalMs = Date.now() - startMs;

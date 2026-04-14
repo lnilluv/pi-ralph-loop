@@ -17,6 +17,20 @@ export type RunnerStatus =
 
 export type ProgressState = boolean | "unknown";
 
+export type CompletionRecord = {
+  promiseSeen: boolean;
+  durableProgressObserved: boolean;
+  gateChecked: boolean;
+  gatePassed: boolean;
+  gateBlocked: boolean;
+  blockingReasons: string[];
+};
+
+export type Guardrails = {
+  blockCommands: string[];
+  protectedFiles: string[];
+};
+
 export type IterationRecord = {
   iteration: number;
   status: "running" | "complete" | "timeout" | "error";
@@ -28,10 +42,142 @@ export type IterationRecord = {
   noProgressStreak: number;
   completionPromiseMatched?: boolean;
   completionGate?: { ready: boolean; reasons: string[] };
+  completion?: CompletionRecord;
   snapshotTruncated?: boolean;
   snapshotErrorCount?: number;
   loopToken?: string;
 };
+
+export type RunnerStartedEvent = {
+  type: "runner.started";
+  timestamp: string;
+  loopToken: string;
+  cwd: string;
+  taskDir: string;
+  status: "initializing";
+  maxIterations: number;
+  timeout: number;
+  completionPromise?: string;
+  guardrails: Guardrails;
+};
+
+export type IterationStartedEvent = {
+  type: "iteration.started";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  status: "running";
+  maxIterations: number;
+  timeout: number;
+  completionPromise?: string;
+};
+
+export type DurableProgressObservedEvent = {
+  type: "durable.progress.observed";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  progress: ProgressState;
+  changedFiles: string[];
+  snapshotTruncated?: boolean;
+  snapshotErrorCount?: number;
+};
+
+export type DurableProgressMissingEvent = {
+  type: "durable.progress.missing";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  progress: ProgressState;
+  changedFiles: string[];
+  snapshotTruncated?: boolean;
+  snapshotErrorCount?: number;
+};
+
+export type DurableProgressUnknownEvent = {
+  type: "durable.progress.unknown";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  progress: ProgressState;
+  changedFiles: string[];
+  snapshotTruncated?: boolean;
+  snapshotErrorCount?: number;
+};
+
+export type CompletionPromiseSeenEvent = {
+  type: "completion.promise.seen";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  completionPromise: string;
+};
+
+export type CompletionGateCheckedEvent = {
+  type: "completion.gate.checked";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  ready: boolean;
+  reasons: string[];
+};
+
+export type CompletionGatePassedEvent = {
+  type: "completion.gate.passed";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  ready: boolean;
+  reasons: string[];
+};
+
+export type CompletionGateBlockedEvent = {
+  type: "completion.gate.blocked";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  ready: boolean;
+  reasons: string[];
+};
+
+export type IterationCompletedEvent = {
+  type: "iteration.completed";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  status: "complete" | "timeout" | "error";
+  progress: ProgressState;
+  changedFiles: string[];
+  noProgressStreak: number;
+  completionPromiseMatched?: boolean;
+  completionGate?: { ready: boolean; reasons: string[] };
+  completion?: CompletionRecord;
+  snapshotTruncated?: boolean;
+  snapshotErrorCount?: number;
+  reason?: string;
+};
+
+export type RunnerFinishedEvent = {
+  type: "runner.finished";
+  timestamp: string;
+  loopToken: string;
+  status: RunnerStatus;
+  iterations: number;
+  totalDurationMs: number;
+};
+
+export type RunnerEvent =
+  | RunnerStartedEvent
+  | IterationStartedEvent
+  | IterationCompletedEvent
+  | DurableProgressObservedEvent
+  | DurableProgressMissingEvent
+  | DurableProgressUnknownEvent
+  | CompletionPromiseSeenEvent
+  | CompletionGateCheckedEvent
+  | CompletionGatePassedEvent
+  | CompletionGateBlockedEvent
+  | RunnerFinishedEvent;
 
 export type RunnerStatusFile = {
   loopToken: string;
@@ -45,7 +191,7 @@ export type RunnerStatusFile = {
   completionPromise?: string;
   startedAt: string;
   completedAt?: string;
-  guardrails: { blockCommands: string[]; protectedFiles: string[] };
+  guardrails: Guardrails;
 };
 
 export type ActiveLoopRegistryEntry = {
@@ -81,6 +227,7 @@ const RUNNER_DIR_NAME = ".ralph-runner";
 const TRANSCRIPTS_DIR = "transcripts";
 const STATUS_FILE = "status.json";
 const ITERATIONS_FILE = "iterations.jsonl";
+const EVENTS_FILE = "events.jsonl";
 const STOP_FLAG_FILE = "stop.flag";
 const ACTIVE_LOOP_REGISTRY_DIR = "active-loops";
 const ACTIVE_LOOP_REGISTRY_LEGACY_FILE = "active-loops.json";
@@ -131,8 +278,210 @@ export function appendIterationRecord(taskDir: string, record: IterationRecord):
   writeFileSync(filePath, line, { flag: "a", encoding: "utf8" });
 }
 
+export function appendRunnerEvent(taskDir: string, event: RunnerEvent): void {
+  const dir = ensureRunnerDir(taskDir);
+  const filePath = join(dir, EVENTS_FILE);
+  writeFileSync(filePath, `${JSON.stringify(event)}\n`, { flag: "a", encoding: "utf8" });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function isProgressState(value: unknown): value is ProgressState {
+  return value === true || value === false || value === "unknown";
+}
+
+function isGuardrails(value: unknown): value is Guardrails {
+  if (!isRecord(value)) return false;
+  return isStringArray(value.blockCommands) && isStringArray(value.protectedFiles);
+}
+
+function isCompletionRecord(value: unknown): value is CompletionRecord {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.promiseSeen === "boolean" &&
+    typeof value.durableProgressObserved === "boolean" &&
+    typeof value.gateChecked === "boolean" &&
+    typeof value.gatePassed === "boolean" &&
+    typeof value.gateBlocked === "boolean" &&
+    isStringArray(value.blockingReasons)
+  );
+}
+
+function isCompletionGate(value: unknown): value is { ready: boolean; reasons: string[] } {
+  if (!isRecord(value)) return false;
+  return typeof value.ready === "boolean" && isStringArray(value.reasons);
+}
+
+function isIterationCompletedStatus(value: unknown): value is IterationRecord["status"] {
+  return value === "complete" || value === "timeout" || value === "error";
+}
+
+function isRunnerEvent(value: unknown): value is RunnerEvent {
+  if (!isRecord(value) || !isString(value.type) || !isString(value.timestamp)) return false;
+
+  switch (value.type) {
+    case "runner.started":
+      return (
+        isString(value.loopToken) &&
+        isString(value.cwd) &&
+        isString(value.taskDir) &&
+        value.status === "initializing" &&
+        isNumber(value.maxIterations) &&
+        Number.isInteger(value.maxIterations) &&
+        value.maxIterations > 0 &&
+        isNumber(value.timeout) &&
+        (value.completionPromise === undefined || isString(value.completionPromise)) &&
+        isGuardrails(value.guardrails)
+      );
+    case "iteration.started":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        value.status === "running" &&
+        isNumber(value.maxIterations) &&
+        Number.isInteger(value.maxIterations) &&
+        value.maxIterations > 0 &&
+        isNumber(value.timeout) &&
+        (value.completionPromise === undefined || isString(value.completionPromise))
+      );
+    case "durable.progress.observed":
+    case "durable.progress.missing":
+    case "durable.progress.unknown":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        isProgressState(value.progress) &&
+        isStringArray(value.changedFiles) &&
+        (value.snapshotTruncated === undefined || typeof value.snapshotTruncated === "boolean") &&
+        (value.snapshotErrorCount === undefined || (isNumber(value.snapshotErrorCount) && Number.isInteger(value.snapshotErrorCount) && value.snapshotErrorCount >= 0))
+      );
+    case "completion.promise.seen":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        isString(value.completionPromise)
+      );
+    case "completion.gate.checked":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        typeof value.ready === "boolean" &&
+        isStringArray(value.reasons)
+      );
+    case "completion.gate.passed":
+    case "completion.gate.blocked":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        typeof value.ready === "boolean" &&
+        isStringArray(value.reasons)
+      );
+    case "iteration.completed":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        isIterationCompletedStatus(value.status) &&
+        isProgressState(value.progress) &&
+        isStringArray(value.changedFiles) &&
+        isNumber(value.noProgressStreak) &&
+        Number.isInteger(value.noProgressStreak) &&
+        value.noProgressStreak >= 0 &&
+        (value.completionPromiseMatched === undefined || typeof value.completionPromiseMatched === "boolean") &&
+        (value.completionGate === undefined || isCompletionGate(value.completionGate)) &&
+        (value.completion === undefined || isCompletionRecord(value.completion)) &&
+        (value.snapshotTruncated === undefined || typeof value.snapshotTruncated === "boolean") &&
+        (value.snapshotErrorCount === undefined || (isNumber(value.snapshotErrorCount) && Number.isInteger(value.snapshotErrorCount) && value.snapshotErrorCount >= 0)) &&
+        (value.reason === undefined || isString(value.reason))
+      );
+    case "runner.finished":
+      return (
+        isString(value.loopToken) &&
+        isRunnerStatus(value.status) &&
+        isNumber(value.iterations) &&
+        Number.isInteger(value.iterations) &&
+        value.iterations >= 0 &&
+        isNumber(value.totalDurationMs) &&
+        value.totalDurationMs >= 0
+      );
+    default:
+      return false;
+  }
+}
+
+export function readRunnerEvents(taskDir: string): RunnerEvent[] {
+  const filePath = join(runnerDir(taskDir), EVENTS_FILE);
+  if (!existsSync(filePath)) return [];
+  try {
+    const raw = readFileSync(filePath, "utf8");
+    return raw
+      .split("\n")
+      .filter((line) => line.trim())
+      .flatMap((line) => {
+        try {
+          const parsed: unknown = JSON.parse(line);
+          return isRunnerEvent(parsed) ? [parsed] : [];
+        } catch {
+          return [];
+        }
+      });
+  } catch {
+    return [];
+  }
+}
+
 function normalizeTranscriptText(value: string): string {
   return value.replace(/\r\n/g, "\n").trimEnd();
+}
+
+function summarizeCompletionRecord(record: IterationRecord): CompletionRecord | undefined {
+  if (record.completion) return record.completion;
+  if (record.completionPromiseMatched === undefined && record.completionGate === undefined) return undefined;
+  return {
+    promiseSeen: record.completionPromiseMatched ?? false,
+    durableProgressObserved: record.progress === true,
+    gateChecked: record.completionPromiseMatched === true && record.progress !== false,
+    gatePassed: record.completionGate?.ready === true,
+    gateBlocked: record.completionGate?.ready === false,
+    blockingReasons: record.completionGate?.reasons ?? [],
+  };
+}
+
+function completionHeaderLines(record: IterationRecord): string[] {
+  const completion = summarizeCompletionRecord(record);
+  if (!completion) return [];
+  return [
+    `- Completion promise seen: ${completion.promiseSeen ? "yes" : "no"}`,
+    `- Durable progress observed: ${completion.durableProgressObserved ? "yes" : "no"}`,
+    `- Completion gate checked: ${completion.gateChecked ? "yes" : "no"}`,
+    `- Completion gate: ${completion.gateChecked ? (completion.gatePassed ? "passed" : completion.gateBlocked ? "blocked" : "pending") : "not checked"}`,
+    `- Blocking reasons: ${completion.blockingReasons.length > 0 ? completion.blockingReasons.join("; ") : "none"}`,
+  ];
 }
 
 function transcriptHeaderLines(record: IterationRecord): string[] {
@@ -142,17 +491,10 @@ function transcriptHeaderLines(record: IterationRecord): string[] {
     `- Progress: ${String(record.progress)}`,
     `- Changed files: ${record.changedFiles.length > 0 ? record.changedFiles.join(", ") : "none"}`,
     `- No-progress streak: ${record.noProgressStreak}`,
+    ...completionHeaderLines(record),
   ];
   if (record.completedAt) lines.push(`- Completed: ${record.completedAt}`);
   if (typeof record.durationMs === "number") lines.push(`- Duration: ${Math.round(record.durationMs / 1000)}s`);
-  if (record.completionPromiseMatched !== undefined) {
-    lines.push(`- Completion promise matched: ${record.completionPromiseMatched ? "yes" : "no"}`);
-  }
-  if (record.completionGate) {
-    const gateState = record.completionGate.ready ? "ready" : "blocked";
-    const gateReasons = record.completionGate.reasons.length > 0 ? ` (${record.completionGate.reasons.join("; ")})` : "";
-    lines.push(`- Completion gate: ${gateState}${gateReasons}`);
-  }
   if (record.snapshotTruncated !== undefined) lines.push(`- Snapshot truncated: ${record.snapshotTruncated ? "yes" : "no"}`);
   if (record.snapshotErrorCount !== undefined) lines.push(`- Snapshot errors: ${record.snapshotErrorCount}`);
   return lines;
