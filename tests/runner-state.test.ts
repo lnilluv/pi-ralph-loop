@@ -15,6 +15,7 @@ import {
   createStopSignal,
   ensureRunnerDir,
   listActiveLoopRegistryEntries,
+  readActiveLoopRegistry,
   readIterationRecords,
   readStatusFile,
   recordActiveLoopStopObservation,
@@ -371,6 +372,34 @@ test("active loop registry prunes stale entries and preserves fresh ones", () =>
 
     const activeEntries = listActiveLoopRegistryEntries(cwd);
     assert.deepEqual(activeEntries.map((entry) => entry.taskDir), [taskDir]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("active loop registry reads legacy active-loops.json files", () => {
+  const cwd = createTempDir();
+  try {
+    const taskDir = join(cwd, "legacy-task");
+    mkdirSync(taskDir, { recursive: true });
+    ensureRunnerDir(cwd);
+
+    const entry: ActiveLoopRegistryEntry = {
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      cwd,
+      loopToken: "legacy-loop-token",
+      status: "running",
+      currentIteration: 2,
+      maxIterations: 4,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    writeFileSync(join(cwd, ".ralph-runner", "active-loops.json"), JSON.stringify([entry], null, 2), "utf8");
+
+    assert.deepEqual(readActiveLoopRegistry(cwd), [entry]);
+    assert.deepEqual(listActiveLoopRegistryEntries(cwd), [entry]);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

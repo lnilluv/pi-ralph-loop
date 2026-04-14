@@ -3204,7 +3204,7 @@ test("/ralph-stop --path prefers session state and uses the session registry cwd
   assert.ok(notifications.some(({ message }) => message.includes("Ralph loop stopping after current iteration")));
 });
 
-test("/ralph-stop preserves durable iteration and status when stopping from session state", async (t) => {
+test("/ralph-stop preserves a stop that was already observed before the registry update", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
 
@@ -3213,16 +3213,20 @@ test("/ralph-stop preserves durable iteration and status when stopping from sess
   const ralphPath = join(taskDir, "RALPH.md");
   writeFileSync(ralphPath, "Task: Stop me\n", "utf8");
 
+  const stopRequestedAt = new Date(Date.now() - 2000).toISOString();
+  const stopObservedAt = new Date().toISOString();
   const durableEntry: ActiveLoopRegistryEntry = {
     taskDir,
     ralphPath,
     cwd,
     loopToken: "durable-loop-token",
-    status: "running",
+    status: "stopped",
     currentIteration: 5,
     maxIterations: 8,
     startedAt: new Date(Date.now() - 20_000).toISOString(),
-    updatedAt: new Date().toISOString(),
+    updatedAt: stopObservedAt,
+    stopRequestedAt,
+    stopObservedAt,
   };
   writeActiveLoopRegistryEntry(cwd, durableEntry);
 
@@ -3270,8 +3274,9 @@ test("/ralph-stop preserves durable iteration and status when stopping from sess
   assert.ok(updated);
   assert.equal(updated?.currentIteration, durableEntry.currentIteration);
   assert.equal(updated?.maxIterations, durableEntry.maxIterations);
-  assert.equal(updated?.status, durableEntry.status);
+  assert.equal(updated?.status, "stopped");
   assert.equal(updated?.startedAt, durableEntry.startedAt);
+  assert.equal(updated?.stopObservedAt, stopObservedAt);
   assert.equal(typeof updated?.stopRequestedAt, "string");
   assert.ok(notifications.some(({ message }) => message.includes("Ralph loop stopping after current iteration")));
 });

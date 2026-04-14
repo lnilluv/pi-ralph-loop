@@ -1309,7 +1309,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         createStopSignal(target.taskDir);
 
         const registryCwd = target.cwd;
-        const existingEntry = listActiveLoopRegistryEntries(registryCwd).find((entry) => entry.taskDir === target.taskDir);
+        const existingEntry = readActiveLoopRegistry(registryCwd).find((entry) => entry.taskDir === target.taskDir);
         const registryEntry: ActiveLoopRegistryEntry = existingEntry
           ? {
               ...existingEntry,
