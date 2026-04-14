@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
 import {
+  type ActiveLoopRegistryEntry,
   type IterationRecord,
   type RunnerStatusFile,
   appendIterationRecord,
@@ -13,8 +14,12 @@ import {
   clearStopSignal,
   createStopSignal,
   ensureRunnerDir,
+  listActiveLoopRegistryEntries,
   readIterationRecords,
   readStatusFile,
+  recordActiveLoopStopObservation,
+  recordActiveLoopStopRequest,
+  writeActiveLoopRegistryEntry,
   writeIterationTranscript,
   writeStatusFile,
 } from "../src/runner-state.ts";
@@ -327,5 +332,80 @@ test("writeIterationTranscript writes a human-reviewable markdown transcript", (
     assert.ok(raw.includes("src/index.ts"));
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("active loop registry prunes stale entries and preserves fresh ones", () => {
+  const cwd = createTempDir();
+  try {
+    const taskDir = join(cwd, "fresh-task");
+    const staleTaskDir = join(cwd, "stale-task");
+    mkdirSync(taskDir, { recursive: true });
+    mkdirSync(staleTaskDir, { recursive: true });
+
+    const freshEntry: ActiveLoopRegistryEntry = {
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      cwd,
+      loopToken: "fresh-loop-token",
+      status: "running",
+      currentIteration: 3,
+      maxIterations: 5,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const staleEntry: ActiveLoopRegistryEntry = {
+      taskDir: staleTaskDir,
+      ralphPath: join(staleTaskDir, "RALPH.md"),
+      cwd,
+      loopToken: "stale-loop-token",
+      status: "running",
+      currentIteration: 1,
+      maxIterations: 5,
+      startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+      updatedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    };
+
+    writeActiveLoopRegistryEntry(cwd, freshEntry);
+    writeActiveLoopRegistryEntry(cwd, staleEntry);
+
+    const activeEntries = listActiveLoopRegistryEntries(cwd);
+    assert.deepEqual(activeEntries.map((entry) => entry.taskDir), [taskDir]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("active loop registry records stop request and observation timestamps", () => {
+  const cwd = createTempDir();
+  try {
+    const taskDir = join(cwd, "registry-task");
+    mkdirSync(taskDir, { recursive: true });
+    const entry: ActiveLoopRegistryEntry = {
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      cwd,
+      loopToken: "registry-loop-token",
+      status: "running",
+      currentIteration: 4,
+      maxIterations: 7,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    writeActiveLoopRegistryEntry(cwd, entry);
+
+    const requestedAt = new Date().toISOString();
+    const requested = recordActiveLoopStopRequest(cwd, taskDir, requestedAt);
+    assert.equal(requested?.stopRequestedAt, requestedAt);
+    assert.equal(listActiveLoopRegistryEntries(cwd).length, 1);
+
+    const observedAt = new Date(Date.now() + 1000).toISOString();
+    const observed = recordActiveLoopStopObservation(cwd, taskDir, observedAt);
+    assert.equal(observed?.stopObservedAt, observedAt);
+    assert.equal(observed?.status, "stopped");
+    assert.deepEqual(listActiveLoopRegistryEntries(cwd), []);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });

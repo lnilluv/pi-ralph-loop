@@ -22,8 +22,11 @@ import {
   clearRunnerDir,
   clearStopSignal,
   ensureRunnerDir,
+  readActiveLoopRegistry,
   readIterationRecords,
   readStatusFile,
+  recordActiveLoopStopObservation,
+  writeActiveLoopRegistryEntry,
   writeIterationTranscript,
   writeStatusFile,
 } from "./runner-state.ts";
@@ -149,7 +152,7 @@ function renderProgressMemoryPrompt(progressMemory: string): string {
   ].join("\n");
 }
 
-async function waitForInterIterationDelay(taskDir: string, delaySeconds: number): Promise<boolean> {
+async function waitForInterIterationDelay(taskDir: string, cwd: string, delaySeconds: number): Promise<boolean> {
   const delayMs = delaySeconds * 1000;
   if (delayMs <= 0) return false;
 
@@ -158,6 +161,7 @@ async function waitForInterIterationDelay(taskDir: string, delaySeconds: number)
 
   while (remainingMs > 0) {
     if (checkStopSignal(taskDir)) {
+      recordActiveLoopStopObservation(cwd, taskDir, new Date().toISOString());
       clearStopSignal(taskDir);
       return true;
     }
@@ -417,7 +421,24 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     startedAt: new Date().toISOString(),
     guardrails: { blockCommands: currentGuardrails.blockCommands, protectedFiles: currentGuardrails.protectedFiles },
   };
+  const syncActiveLoopRegistry = (statusFile: RunnerStatusFile): void => {
+    const existing = readActiveLoopRegistry(cwd).find((entry) => entry.taskDir === taskDir && entry.loopToken === loopToken);
+    writeActiveLoopRegistryEntry(cwd, {
+      taskDir,
+      ralphPath,
+      cwd,
+      loopToken,
+      status: statusFile.status,
+      currentIteration: statusFile.currentIteration,
+      maxIterations: statusFile.maxIterations,
+      startedAt: statusFile.startedAt,
+      updatedAt: statusFile.completedAt ?? new Date().toISOString(),
+      stopRequestedAt: existing?.stopRequestedAt,
+      stopObservedAt: existing?.stopObservedAt,
+    });
+  };
   writeStatusFile(taskDir, initialStatus);
+  syncActiveLoopRegistry(initialStatus);
   onStatusChange?.("initializing");
   onNotify?.(`Ralph runner started: ${name} (max ${currentMaxIterations} iterations)`, "info");
 
@@ -427,6 +448,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     for (let i = 1; i <= currentMaxIterations; i++) {
       // Check stop signal from durable state
       if (checkStopSignal(taskDir)) {
+        recordActiveLoopStopObservation(cwd, taskDir, new Date().toISOString());
         finalStatus = "stopped";
         clearStopSignal(taskDir);
         break;
@@ -462,7 +484,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       currentGuardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
 
       // Update status to running
-      writeStatusFile(taskDir, {
+      const runningStatus: RunnerStatusFile = {
         ...initialStatus,
         status: "running",
         currentIteration: i,
@@ -470,7 +492,9 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         timeout: currentTimeout,
         completionPromise: currentCompletionPromise,
         guardrails: { blockCommands: currentGuardrails.blockCommands, protectedFiles: currentGuardrails.protectedFiles },
-      });
+      };
+      writeStatusFile(taskDir, runningStatus);
+      syncActiveLoopRegistry(runningStatus);
       onStatusChange?.("running");
       onIterationStart?.(i, currentMaxIterations);
 
@@ -689,7 +713,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       onNotify?.(`Iteration ${i} complete (${Math.round((iterEndMs - iterStartMs) / 1000)}s)`, "info");
 
       if (i < currentMaxIterations && currentInterIterationDelay > 0) {
-        const stoppedDuringDelay = await waitForInterIterationDelay(taskDir, currentInterIterationDelay);
+        const stoppedDuringDelay = await waitForInterIterationDelay(taskDir, cwd, currentInterIterationDelay);
         if (stoppedDuringDelay) {
           finalStatus = "stopped";
           break;
@@ -716,6 +740,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       completedAt,
     };
     writeStatusFile(taskDir, finalStatusFile);
+    syncActiveLoopRegistry(finalStatusFile);
     onStatusChange?.(finalStatus);
 
     const totalMs = Date.now() - startMs;

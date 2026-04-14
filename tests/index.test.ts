@@ -9,7 +9,17 @@ import { generateDraft, parseRalphMarkdown, slugifyTask, validateFrontmatter, ty
 import type { StrengthenDraftRuntime } from "../src/ralph-draft-llm.ts";
 import type { RunnerConfig, RunnerResult } from "../src/runner.ts";
 import { runRalphLoop as realRunRalphLoop, captureTaskDirectorySnapshot, assessTaskDirectoryProgress, summarizeChangedFiles } from "../src/runner.ts";
-import { appendIterationRecord, writeStatusFile, type IterationRecord, type RunnerStatusFile } from "../src/runner-state.ts";
+import {
+  appendIterationRecord,
+  listActiveLoopRegistryEntries,
+  readActiveLoopRegistry,
+  recordActiveLoopStopRequest,
+  writeActiveLoopRegistryEntry,
+  writeStatusFile,
+  type ActiveLoopRegistryEntry,
+  type IterationRecord,
+  type RunnerStatusFile,
+} from "../src/runner-state.ts";
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-loop-index-"));
@@ -3118,4 +3128,109 @@ test("/ralph subprocess child steers repeated bash failures from durable runner 
       { type: "text", text: "\n\n⚠️ ralph: 3+ failures this iteration. Stop and describe the root cause before retrying." },
     ],
   });
+});
+
+
+test("/ralph-stop falls back to the durable registry when session state is absent", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "registry-task");
+  mkdirSync(taskDir, { recursive: true });
+  const registryEntry: ActiveLoopRegistryEntry = {
+    taskDir,
+    ralphPath: join(taskDir, "RALPH.md"),
+    cwd,
+    loopToken: "registry-loop-token",
+    status: "running",
+    currentIteration: 2,
+    maxIterations: 5,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  writeActiveLoopRegistryEntry(cwd, registryEntry);
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-stop");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => ({ cancelled: true }),
+    waitForIdle: async () => undefined,
+  };
+
+  await handler("", ctx);
+
+  assert.equal(existsSync(join(taskDir, ".ralph-runner", "stop.flag")), true);
+  const activeEntries = listActiveLoopRegistryEntries(cwd);
+  assert.equal(activeEntries.length, 1);
+  assert.equal(typeof activeEntries[0]?.stopRequestedAt, "string");
+  assert.ok(notifications.some(({ message }) => message.includes("Ralph loop stopping after current iteration")));
+  assert.equal(notifications.some(({ message }) => message.includes("No active ralph loop")), false);
+});
+
+test("/ralph-stop refuses to guess when multiple durable active loops exist", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDirA = join(cwd, "registry-task-a");
+  const taskDirB = join(cwd, "registry-task-b");
+  mkdirSync(taskDirA, { recursive: true });
+  mkdirSync(taskDirB, { recursive: true });
+  writeActiveLoopRegistryEntry(cwd, {
+    taskDir: taskDirA,
+    ralphPath: join(taskDirA, "RALPH.md"),
+    cwd,
+    loopToken: "registry-loop-token-a",
+    status: "running",
+    currentIteration: 2,
+    maxIterations: 5,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+  writeActiveLoopRegistryEntry(cwd, {
+    taskDir: taskDirB,
+    ralphPath: join(taskDirB, "RALPH.md"),
+    cwd,
+    loopToken: "registry-loop-token-b",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-stop");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => ({ cancelled: true }),
+    waitForIdle: async () => undefined,
+  };
+
+  await handler("", ctx);
+
+  assert.equal(existsSync(join(taskDirA, ".ralph-runner", "stop.flag")), false);
+  assert.equal(existsSync(join(taskDirB, ".ralph-runner", "stop.flag")), false);
+  assert.ok(notifications.some(({ message }) => message.toLowerCase().includes("multiple active ralph loops")));
+  assert.ok(notifications.some(({ message }) => message.toLowerCase().includes("explicit target path")));
 });

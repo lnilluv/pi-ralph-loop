@@ -27,7 +27,17 @@ import type { CommandDef, CommandOutput, DraftPlan, DraftTarget, Frontmatter, Ru
 import { createDraftPlan as createDraftPlanService } from "./ralph-draft.ts";
 import type { StrengthenDraftRuntime } from "./ralph-draft-llm.ts";
 import { runRalphLoop } from "./runner.ts";
-import { readIterationRecords, readStatusFile, checkStopSignal, createStopSignal } from "./runner-state.ts";
+import {
+  checkStopSignal,
+  createStopSignal,
+  listActiveLoopRegistryEntries,
+  readActiveLoopRegistry,
+  readIterationRecords,
+  readStatusFile,
+  recordActiveLoopStopRequest,
+  writeActiveLoopRegistryEntry,
+  type ActiveLoopRegistryEntry,
+} from "./runner-state.ts";
 
 type ProgressState = boolean | "unknown";
 
@@ -1227,24 +1237,185 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
   pi.registerCommand("ralph-stop", {
     description: "Stop the ralph loop after the current iteration",
-    handler: async (_args: string, ctx: CommandContext) => {
-      // First try durable stop signal (subprocess runner mode)
-      const persisted = readPersistedLoopState(ctx);
-      const loopTaskDir = loopState.active ? loopState.taskDir : persisted?.active ? persisted.taskDir : undefined;
-      if (loopTaskDir) {
-        createStopSignal(loopTaskDir);
-      }
-      // Also set in-process flag for backwards compatibility
-      if (persisted?.active) {
-        loopState.stopRequested = true;
-        persistLoopState(pi, { ...persisted, stopRequested: true });
-      } else if (loopState.active) {
-        loopState.stopRequested = true;
-      } else {
-        ctx.ui.notify("No active ralph loop", "warning");
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseCommandArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
         return;
       }
-      ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
+      if (parsed.mode === "task") {
+        ctx.ui.notify("/ralph-stop expects a task folder or RALPH.md path, not task text.", "error");
+        return;
+      }
+
+      type StopTarget = {
+        taskDir: string;
+        ralphPath: string;
+        loopToken: string;
+        currentIteration: number;
+        maxIterations: number;
+        startedAt: string;
+        source: "session" | "registry" | "status";
+      };
+
+      const now = new Date().toISOString();
+      const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
+      const inProcessSessionTarget: StopTarget | undefined = loopState.active
+        ? {
+            taskDir: loopState.taskDir,
+            ralphPath: loopState.ralphPath,
+            loopToken: loopState.loopToken ?? "",
+            currentIteration: loopState.iteration,
+            maxIterations: loopState.maxIterations,
+            startedAt: now,
+            source: "session",
+          }
+        : undefined;
+      const persistedSessionState = inProcessSessionTarget ? undefined : readActiveLoopState(ctx);
+      const sessionTarget: StopTarget | undefined =
+        persistedSessionState &&
+        typeof persistedSessionState.taskDir === "string" &&
+        persistedSessionState.taskDir.length > 0 &&
+        typeof persistedSessionState.loopToken === "string" &&
+        persistedSessionState.loopToken.length > 0 &&
+        typeof persistedSessionState.iteration === "number" &&
+        typeof persistedSessionState.maxIterations === "number"
+          ? {
+              taskDir: persistedSessionState.taskDir,
+              ralphPath: join(persistedSessionState.taskDir, "RALPH.md"),
+              loopToken: persistedSessionState.loopToken,
+              currentIteration: persistedSessionState.iteration,
+              maxIterations: persistedSessionState.maxIterations,
+              startedAt: now,
+              source: "session",
+            }
+          : inProcessSessionTarget;
+
+      const materializeRegistryTarget = (entry: ActiveLoopRegistryEntry): StopTarget => ({
+        taskDir: entry.taskDir,
+        ralphPath: entry.ralphPath,
+        loopToken: entry.loopToken,
+        currentIteration: entry.currentIteration,
+        maxIterations: entry.maxIterations,
+        startedAt: entry.startedAt,
+        source: "registry",
+      });
+
+      const stopTarget = (target: StopTarget): void => {
+        createStopSignal(target.taskDir);
+
+        const existingEntry = readActiveLoopRegistry(ctx.cwd).find((entry) => entry.taskDir === target.taskDir);
+        const registryEntry: ActiveLoopRegistryEntry = existingEntry
+          ? {
+              ...existingEntry,
+              taskDir: target.taskDir,
+              ralphPath: target.ralphPath,
+              cwd: ctx.cwd,
+              loopToken: target.loopToken,
+              status: existingEntry.loopToken === target.loopToken ? existingEntry.status : "running",
+              currentIteration: target.currentIteration,
+              maxIterations: target.maxIterations,
+              startedAt: existingEntry.loopToken === target.loopToken ? existingEntry.startedAt : target.startedAt,
+              updatedAt: now,
+              stopRequestedAt: existingEntry.loopToken === target.loopToken ? existingEntry.stopRequestedAt : undefined,
+              stopObservedAt: existingEntry.loopToken === target.loopToken ? existingEntry.stopObservedAt : undefined,
+            }
+          : {
+              taskDir: target.taskDir,
+              ralphPath: target.ralphPath,
+              cwd: ctx.cwd,
+              loopToken: target.loopToken,
+              status: "running",
+              currentIteration: target.currentIteration,
+              maxIterations: target.maxIterations,
+              startedAt: target.startedAt,
+              updatedAt: now,
+            };
+        writeActiveLoopRegistryEntry(ctx.cwd, registryEntry);
+        recordActiveLoopStopRequest(ctx.cwd, target.taskDir, now);
+
+        if (target.source === "session") {
+          loopState.stopRequested = true;
+          if (loopState.active) {
+            persistLoopState(pi, toPersistedLoopState(loopState, { active: true, stopRequested: true }));
+          } else if (persistedSessionState?.active) {
+            persistLoopState(pi, { ...persistedSessionState, stopRequested: true });
+          }
+        }
+
+        ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
+      };
+
+      if (sessionTarget && !parsed.value) {
+        stopTarget(sessionTarget);
+        return;
+      }
+
+      if (parsed.value) {
+        const inspection = inspectExistingTarget(parsed.value, ctx.cwd, true);
+        if (inspection.kind !== "run") {
+          if (inspection.kind === "invalid-markdown") {
+            ctx.ui.notify(`Only task folders or RALPH.md can be stopped directly. ${displayPath(ctx.cwd, inspection.path)} is not stoppable.`, "error");
+            return;
+          }
+          if (inspection.kind === "invalid-target") {
+            ctx.ui.notify(`Only task folders or RALPH.md can be stopped directly. ${displayPath(ctx.cwd, inspection.path)} is a file, not a task folder.`, "error");
+            return;
+          }
+          if (inspection.kind === "dir-without-ralph" || inspection.kind === "missing-path") {
+            ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, inspection.dirPath)}.`, "warning");
+            return;
+          }
+          ctx.ui.notify("/ralph-stop expects a task folder or RALPH.md path.", "error");
+          return;
+        }
+
+        const taskDir = dirname(inspection.ralphPath);
+        const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === taskDir || entry.ralphPath === inspection.ralphPath);
+        if (registryTarget) {
+          stopTarget(materializeRegistryTarget(registryTarget));
+          return;
+        }
+
+        if (sessionTarget && sessionTarget.taskDir === taskDir) {
+          stopTarget(sessionTarget);
+          return;
+        }
+
+        const statusFile = readStatusFile(taskDir);
+        if (statusFile && (statusFile.status === "running" || statusFile.status === "initializing")) {
+          stopTarget({
+            taskDir,
+            ralphPath: inspection.ralphPath,
+            loopToken: statusFile.loopToken,
+            currentIteration: statusFile.currentIteration,
+            maxIterations: statusFile.maxIterations,
+            startedAt: statusFile.startedAt,
+            source: "status",
+          });
+          return;
+        }
+
+        ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, inspection.ralphPath)}.`, "warning");
+        return;
+      }
+
+      if (sessionTarget) {
+        stopTarget(sessionTarget);
+        return;
+      }
+
+      const activeEntries = activeRegistryEntries();
+      if (activeEntries.length === 0) {
+        ctx.ui.notify("No active ralph loops found.", "warning");
+        return;
+      }
+      if (activeEntries.length > 1) {
+        ctx.ui.notify("Multiple active ralph loops found. Use /ralph-stop --path <task folder or RALPH.md> for an explicit target path.", "error");
+        return;
+      }
+
+      stopTarget(materializeRegistryTarget(activeEntries[0]));
     },
   });
 }

@@ -47,6 +47,20 @@ export type RunnerStatusFile = {
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
 };
 
+export type ActiveLoopRegistryEntry = {
+  taskDir: string;
+  ralphPath: string;
+  cwd: string;
+  loopToken: string;
+  status: RunnerStatus;
+  currentIteration: number;
+  maxIterations: number;
+  startedAt: string;
+  updatedAt: string;
+  stopRequestedAt?: string;
+  stopObservedAt?: string;
+};
+
 export type TranscriptCommandOutput = {
   name: string;
   output: string;
@@ -67,6 +81,9 @@ const TRANSCRIPTS_DIR = "transcripts";
 const STATUS_FILE = "status.json";
 const ITERATIONS_FILE = "iterations.jsonl";
 const STOP_FLAG_FILE = "stop.flag";
+const ACTIVE_LOOP_REGISTRY_FILE = "active-loops.json";
+const ACTIVE_LOOP_REGISTRY_STALE_AFTER_MS = 30 * 60 * 1000;
+const ACTIVE_LOOP_ACTIVE_STATUSES = new Set<RunnerStatus>(["initializing", "running"]);
 
 // --- Helper ---
 
@@ -199,4 +216,181 @@ export function clearRunnerDir(taskDir: string): void {
   if (existsSync(dir)) {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+function activeLoopRegistryPath(cwd: string): string {
+  return join(ensureRunnerDir(cwd), ACTIVE_LOOP_REGISTRY_FILE);
+}
+
+function parseIsoTimestamp(raw: unknown): number | undefined {
+  if (typeof raw !== "string") return undefined;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function isRunnerStatus(value: unknown): value is RunnerStatus {
+  return (
+    value === "initializing" ||
+    value === "running" ||
+    value === "complete" ||
+    value === "max-iterations" ||
+    value === "no-progress-exhaustion" ||
+    value === "stopped" ||
+    value === "timeout" ||
+    value === "error" ||
+    value === "cancelled"
+  );
+}
+
+function normalizeActiveLoopRegistryEntry(entry: unknown): ActiveLoopRegistryEntry | undefined {
+  if (!entry || typeof entry !== "object") return undefined;
+  const candidate = entry as Record<string, unknown>;
+  if (
+    typeof candidate.taskDir !== "string" ||
+    candidate.taskDir.length === 0 ||
+    typeof candidate.ralphPath !== "string" ||
+    candidate.ralphPath.length === 0 ||
+    typeof candidate.cwd !== "string" ||
+    candidate.cwd.length === 0 ||
+    typeof candidate.loopToken !== "string" ||
+    candidate.loopToken.length === 0 ||
+    !isRunnerStatus(candidate.status) ||
+    typeof candidate.currentIteration !== "number" ||
+    !Number.isInteger(candidate.currentIteration) ||
+    candidate.currentIteration < 0 ||
+    typeof candidate.maxIterations !== "number" ||
+    !Number.isInteger(candidate.maxIterations) ||
+    candidate.maxIterations <= 0 ||
+    typeof candidate.startedAt !== "string" ||
+    candidate.startedAt.length === 0 ||
+    typeof candidate.updatedAt !== "string" ||
+    candidate.updatedAt.length === 0
+  ) {
+    return undefined;
+  }
+
+  const stopRequestedAt = candidate.stopRequestedAt;
+  const stopObservedAt = candidate.stopObservedAt;
+  if ((stopRequestedAt !== undefined && typeof stopRequestedAt !== "string") || (stopObservedAt !== undefined && typeof stopObservedAt !== "string")) {
+    return undefined;
+  }
+
+  return {
+    taskDir: candidate.taskDir,
+    ralphPath: candidate.ralphPath,
+    cwd: candidate.cwd,
+    loopToken: candidate.loopToken,
+    status: candidate.status,
+    currentIteration: candidate.currentIteration,
+    maxIterations: candidate.maxIterations,
+    startedAt: candidate.startedAt,
+    updatedAt: candidate.updatedAt,
+    stopRequestedAt: typeof stopRequestedAt === "string" ? stopRequestedAt : undefined,
+    stopObservedAt: typeof stopObservedAt === "string" ? stopObservedAt : undefined,
+  };
+}
+
+function readRawActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEntry[] {
+  const filePath = activeLoopRegistryPath(cwd);
+  if (!existsSync(filePath)) return [];
+  try {
+    const raw = readFileSync(filePath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    const entries = Array.isArray(parsed) ? parsed : [];
+    return entries.map(normalizeActiveLoopRegistryEntry).filter((entry): entry is ActiveLoopRegistryEntry => entry !== undefined);
+  } catch {
+    return [];
+  }
+}
+
+function pruneActiveLoopRegistryEntries(entries: ActiveLoopRegistryEntry[], nowMs = Date.now()): { entries: ActiveLoopRegistryEntry[]; changed: boolean } {
+  const retained: ActiveLoopRegistryEntry[] = [];
+  const seen = new Set<string>();
+  let changed = false;
+
+  for (const entry of entries) {
+    const updatedAtMs = parseIsoTimestamp(entry.updatedAt);
+    if (updatedAtMs === undefined || nowMs - updatedAtMs > ACTIVE_LOOP_REGISTRY_STALE_AFTER_MS) {
+      changed = true;
+      continue;
+    }
+    if (seen.has(entry.taskDir)) {
+      changed = true;
+      continue;
+    }
+    seen.add(entry.taskDir);
+    retained.push(entry);
+  }
+
+  return { entries: retained, changed };
+}
+
+function writeActiveLoopRegistryEntries(cwd: string, entries: ActiveLoopRegistryEntry[]): void {
+  const filePath = activeLoopRegistryPath(cwd);
+  writeFileSync(filePath, JSON.stringify(entries, null, 2), "utf8");
+}
+
+function loadActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEntry[] {
+  const entries = readRawActiveLoopRegistryEntries(cwd);
+  const pruned = pruneActiveLoopRegistryEntries(entries);
+  if (pruned.changed || pruned.entries.length !== entries.length) {
+    writeActiveLoopRegistryEntries(cwd, pruned.entries);
+  }
+  return pruned.entries;
+}
+
+function upsertActiveLoopRegistryEntry(cwd: string, entry: ActiveLoopRegistryEntry): ActiveLoopRegistryEntry[] {
+  const entries = loadActiveLoopRegistryEntries(cwd);
+  const nextEntries = entries.filter((existing) => existing.taskDir !== entry.taskDir);
+  nextEntries.push(entry);
+  nextEntries.sort((left, right) => left.taskDir.localeCompare(right.taskDir));
+  writeActiveLoopRegistryEntries(cwd, nextEntries);
+  return nextEntries;
+}
+
+export function readActiveLoopRegistry(cwd: string): ActiveLoopRegistryEntry[] {
+  return loadActiveLoopRegistryEntries(cwd);
+}
+
+export function listActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEntry[] {
+  return loadActiveLoopRegistryEntries(cwd).filter((entry) => ACTIVE_LOOP_ACTIVE_STATUSES.has(entry.status));
+}
+
+export function writeActiveLoopRegistryEntry(cwd: string, entry: ActiveLoopRegistryEntry): ActiveLoopRegistryEntry[] {
+  return upsertActiveLoopRegistryEntry(cwd, entry);
+}
+
+export function recordActiveLoopStopRequest(cwd: string, taskDir: string, requestedAt: string): ActiveLoopRegistryEntry | undefined {
+  const entries = loadActiveLoopRegistryEntries(cwd);
+  let updated: ActiveLoopRegistryEntry | undefined;
+  const nextEntries = entries.map((entry) => {
+    if (entry.taskDir !== taskDir) return entry;
+    updated = {
+      ...entry,
+      stopRequestedAt: requestedAt,
+      updatedAt: requestedAt,
+    };
+    return updated;
+  });
+  if (!updated) return undefined;
+  writeActiveLoopRegistryEntries(cwd, nextEntries);
+  return updated;
+}
+
+export function recordActiveLoopStopObservation(cwd: string, taskDir: string, observedAt: string): ActiveLoopRegistryEntry | undefined {
+  const entries = loadActiveLoopRegistryEntries(cwd);
+  let updated: ActiveLoopRegistryEntry | undefined;
+  const nextEntries = entries.map((entry) => {
+    if (entry.taskDir !== taskDir) return entry;
+    updated = {
+      ...entry,
+      status: "stopped",
+      stopObservedAt: observedAt,
+      updatedAt: observedAt,
+    };
+    return updated;
+  });
+  if (!updated) return undefined;
+  writeActiveLoopRegistryEntries(cwd, nextEntries);
+  return updated;
 }
