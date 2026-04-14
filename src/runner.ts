@@ -424,6 +424,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
   let currentInterIterationDelay = 0;
   let currentGuardrails = initialGuardrails;
   let completionGateFailureReasons: string[] = [];
+  let completionGateRejectionReasons: string[] = [];
   let noProgressStreak = 0;
   const iterations: IterationRecord[] = [];
   const startMs = Date.now();
@@ -563,7 +564,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       const body = renderRalphBody(rawBody, commandsOutput, { iteration: i, name, maxIterations: currentMaxIterations }, runtimeArgs);
       const progressMemory = readProgressMemory(taskDir);
       const promptBody = progressMemory !== undefined ? `${renderProgressMemoryPrompt(progressMemory)}\n\n${body}` : body;
-      const prompt = renderIterationPrompt(promptBody, i, currentMaxIterations, currentCompletionPromise ? { completionPromise: currentCompletionPromise, requiredOutputs: currentRequiredOutputs, failureReasons: completionGateFailureReasons } : undefined);
+      const prompt = renderIterationPrompt(promptBody, i, currentMaxIterations, currentCompletionPromise ? { completionPromise: currentCompletionPromise, requiredOutputs: currentRequiredOutputs, failureReasons: completionGateFailureReasons, rejectionReasons: completionGateRejectionReasons } : undefined);
       const writeIterationTranscriptSafe = (record: IterationRecord, assistantText?: string, note?: string) => {
         try {
           writeIterationTranscript(taskDir, { record, prompt, commandOutputs: commandsOutput, assistantText, note });
@@ -653,6 +654,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       // Update no-progress streak
       if (progress === true) {
         noProgressStreak = 0;
+        completionGateRejectionReasons = [];
       } else if (progress === false) {
         noProgressStreak += 1;
       }
@@ -845,6 +847,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       // Check completion promise
       if (completionPromiseMatched) {
         if (progress === false) {
+          completionGateRejectionReasons = ["durable progress (no durable file changes were observed)"];
           onNotify?.(
             `Completion promise matched on iteration ${i}, but no durable progress was detected. Continuing.`,
             "warning",

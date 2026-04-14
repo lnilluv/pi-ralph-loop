@@ -1419,7 +1419,7 @@ export function renderIterationPrompt(
   body: string,
   iteration: number,
   maxIterations: number,
-  completionGate?: { completionPromise?: string; requiredOutputs?: string[]; failureReasons?: string[] },
+  completionGate?: { completionPromise?: string; requiredOutputs?: string[]; failureReasons?: string[]; rejectionReasons?: string[] },
 ): string {
   if (!completionGate) {
     return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
@@ -1427,12 +1427,16 @@ export function renderIterationPrompt(
 
   const requiredOutputs = completionGate.requiredOutputs ?? [];
   const failureReasons = completionGate.failureReasons ?? [];
+  const rejectionReasons = completionGate.rejectionReasons ?? [];
   const completionPromise = completionGate.completionPromise ?? "DONE";
   const gateLines = [
     "[completion gate]",
     `- Required outputs must exist before stopping${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`,
     "- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.",
     "- Label inferred claims as HYPOTHESIS.",
+    ...(rejectionReasons.length > 0
+      ? ["[completion gate rejection]", `- Still missing: ${rejectionReasons.join("; ")}`]
+      : []),
     ...(failureReasons.length > 0 ? [`- Previous gate failures: ${failureReasons.join("; ")}`] : []),
     `- Emit <promise>${completionPromise}</promise> only when the gate is truly satisfied.`,
   ];

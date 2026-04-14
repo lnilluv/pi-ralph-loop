@@ -157,6 +157,11 @@ export async function runCommands(
     const blockedPattern = findBlockedCommandPattern(semanticRun, blockPatterns);
     const resolvedRun = resolveCommandRun(cmd.run, runtimeArgs);
     if (blockedPattern) {
+      try {
+        pi.appendEntry("ralph-blocked-command", { name: cmd.name, command: semanticRun, blockedPattern, cwd: repoCwd, taskDir });
+      } catch {
+        // Durable proof should never break command guardrails.
+      }
       results.push({ name: cmd.name, output: `[blocked by guardrail: ${blockedPattern}]` });
       continue;
     }
@@ -849,6 +854,13 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   const pendingIterations = new Map<string, PendingIterationState>();
   const draftPlanFactory = services.createDraftPlan ?? createDraftPlanService;
   const isLoopSession = (ctx: Pick<CommandContext, "sessionManager">): boolean => resolveActiveLoopState(ctx) !== undefined;
+  const appendLoopProofEntry = (customType: string, data: Record<string, unknown>): void => {
+    try {
+      pi.appendEntry(customType, data);
+    } catch {
+      // Durable proof should never break the hook.
+    }
+  };
   const getPendingIteration = (ctx: Pick<CommandContext, "sessionManager">): PendingIterationState | undefined => {
     const state = resolveActiveIterationState(ctx);
     return state ? pendingIterations.get(getLoopIterationKey(state.loopToken, state.iteration)) : undefined;
@@ -1141,12 +1153,27 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     if (event.toolName === "bash") {
       const cmd = (event.input as { command?: string }).command ?? "";
       const blockedPattern = findBlockedCommandPattern(cmd, persisted.guardrails?.blockCommands ?? []);
-      if (blockedPattern) return { block: true, reason: `ralph: blocked (${blockedPattern})` };
+      if (blockedPattern) {
+        appendLoopProofEntry("ralph-blocked-command", {
+          loopToken: persisted.loopToken,
+          iteration: persisted.iteration,
+          command: cmd,
+          blockedPattern,
+        });
+        return { block: true, reason: `ralph: blocked (${blockedPattern})` };
+      }
     }
 
     if (event.toolName === "write" || event.toolName === "edit") {
       const filePath = (event.input as { path?: string }).path ?? "";
       if (matchesProtectedPath(filePath, persisted.guardrails?.protectedFiles ?? [], persisted.cwd)) {
+        appendLoopProofEntry("ralph-blocked-write", {
+          loopToken: persisted.loopToken,
+          iteration: persisted.iteration,
+          toolName: event.toolName,
+          path: filePath,
+          reason: `ralph: ${filePath} is protected`,
+        });
         return { block: true, reason: `ralph: ${filePath} is protected` };
       }
     }
@@ -1181,6 +1208,19 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     const lastSummary = summaries[summaries.length - 1];
     const lastFeedback = summarizeLastIterationFeedback(lastSummary, persisted?.noProgressStreak ?? 0);
     const taskDirLabel = persisted?.taskDir ? displayPath(persisted.cwd ?? persisted.taskDir, persisted.taskDir) : "the Ralph task directory";
+    appendLoopProofEntry("ralph-steering-injected", {
+      loopToken: persisted?.loopToken,
+      iteration: persisted?.iteration,
+      maxIterations: persisted?.maxIterations,
+      taskDir: taskDirLabel,
+    });
+    appendLoopProofEntry("ralph-loop-context-injected", {
+      loopToken: persisted?.loopToken,
+      iteration: persisted?.iteration,
+      maxIterations: persisted?.maxIterations,
+      taskDir: taskDirLabel,
+      summaryCount: summaries.length,
+    });
 
     return {
       systemPrompt:
