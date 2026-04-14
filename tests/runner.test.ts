@@ -465,6 +465,61 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRalphLoop keeps prompting after a premature completion promise until durable progress exists", async () => {
+  const taskDir = createTempDir();
+  let captureDir: string | undefined;
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 2, completion_promise: "DONE" }));
+    captureDir = mkdtempSync(join(tmpdir(), "pi-ralph-loop-capture-"));
+    const promptCounterPath = join(captureDir, "prompt-counter.txt");
+    const promptPathPrefix = join(captureDir, "prompt-");
+    const scriptPath = join(taskDir, "mock-pi-recovery.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+count=0
+if [ -f "${promptCounterPath}" ]; then
+  count=$(cat "${promptCounterPath}")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "${promptCounterPath}"
+read line
+printf '%s' "$line" > "${promptPathPrefix}$count.json"
+echo '{"type":"response","command":"prompt","success":true}'
+if [ "$count" -eq 1 ]; then
+  echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> premature"}]}]}'
+else
+  echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"still working"}]}]}'
+fi
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 2,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.iterations.length, 2);
+    const secondPrompt = JSON.parse(readFileSync(join(captureDir!, "prompt-2.json"), "utf8")) as { message: string };
+    assert.match(secondPrompt.message, /\[completion gate rejection\]/);
+    assert.match(secondPrompt.message, /Still missing: durable progress/);
+  } finally {
+    if (captureDir) {
+      rmSync(captureDir, { recursive: true, force: true });
+    }
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("validateCompletionReadiness reports ready when required outputs exist and OPEN_QUESTIONS.md is clear", (t) => {
   const taskDir = createTempDir();
   t.after(() => rmSync(taskDir, { recursive: true, force: true }));

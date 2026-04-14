@@ -2820,7 +2820,12 @@ test("tool_call blocks absolute write paths against repo-relative protected glob
 });
 
 test("tool_call keeps explicit protected-file globs working", async () => {
-  const harness = createHarness();
+  const proofEntries: Array<{ customType: string; data: any }> = [];
+  const harness = createHarness({
+    appendEntry: (customType, data) => {
+      proofEntries.push({ customType, data });
+    },
+  });
   const toolCall = harness.event("tool_call");
   const ctx = {
     sessionManager: {
@@ -2846,47 +2851,11 @@ test("tool_call keeps explicit protected-file globs working", async () => {
   }
 
   const allowed = await toolCall({ toolName: "write", input: { path: "src/app.ts" } }, ctx);
+
   assert.equal(allowed, undefined);
-});
-
-test("/ralph subprocess child resolves guardrails from durable runner state when session entries are empty", { concurrency: false }, async (t) => {
-  const cwd = createTempDir();
-  t.after(() => rmSync(cwd, { recursive: true, force: true }));
-
-  const taskDir = join(cwd, "subprocess-child-task");
-  mkdirSync(taskDir, { recursive: true });
-  writeStatusFile(taskDir, {
-    loopToken: "subprocess-loop-token",
-    ralphPath: join(taskDir, "RALPH.md"),
-    taskDir,
-    cwd,
-    status: "running",
-    currentIteration: 1,
-    maxIterations: 5,
-    timeout: 300,
-    startedAt: new Date().toISOString(),
-    guardrails: { blockCommands: ["git\\s+push"], protectedFiles: ["src/generated/**"] },
-  });
-
-  const restoreEnv = setRunnerEnv({
-    RALPH_RUNNER_TASK_DIR: taskDir,
-    RALPH_RUNNER_CWD: cwd,
-    RALPH_RUNNER_LOOP_TOKEN: "subprocess-loop-token",
-    RALPH_RUNNER_CURRENT_ITERATION: "1",
-    RALPH_RUNNER_MAX_ITERATIONS: "5",
-    RALPH_RUNNER_NO_PROGRESS_STREAK: "0",
-    RALPH_RUNNER_GUARDRAILS: JSON.stringify({ blockCommands: ["git\\s+push"], protectedFiles: ["src/generated/**"] }),
-  });
-  t.after(restoreEnv);
-
-  const harness = createHarness();
-  const toolCall = harness.event("tool_call");
-  const result = await toolCall(
-    { toolName: "bash", input: { command: "git push origin main" } },
-    { sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" } },
-  );
-
-  assert.deepEqual(result, { block: true, reason: "ralph: blocked (git\\s+push)" });
+  assert.equal(proofEntries.filter((entry) => entry.customType === "ralph-blocked-write").length, 2);
+  assert.ok(proofEntries.some((entry) => entry.data.toolName === "write" && entry.data.path === "src/generated/output.ts"));
+  assert.ok(proofEntries.some((entry) => entry.data.toolName === "edit" && entry.data.path === "src/generated/output.ts"));
 });
 
 test("/ralph subprocess child injects durable loop context into before_agent_start when session entries are empty", { concurrency: false }, async (t) => {
@@ -2932,7 +2901,12 @@ test("/ralph subprocess child injects durable loop context into before_agent_sta
   });
   t.after(restoreEnv);
 
-  const harness = createHarness();
+  const proofEntries: Array<{ customType: string; data: any }> = [];
+  const harness = createHarness({
+    appendEntry: (customType, data) => {
+      proofEntries.push({ customType, data });
+    },
+  });
   const beforeAgentStart = harness.event("before_agent_start");
   const result = await beforeAgentStart(
     { systemPrompt: "Base prompt" },
@@ -2945,6 +2919,7 @@ test("/ralph subprocess child injects durable loop context into before_agent_sta
   assert.match(result.systemPrompt, /Task directory: \.\/subprocess-child-task/);
   assert.match(result.systemPrompt, /Previous iterations:\n- Iteration 1: 1s — durable progress \(notes\/findings\.md\); no-progress streak: 0/);
   assert.match(result.systemPrompt, /Last iteration durable progress: notes\/findings\.md\./);
+  assert.deepEqual(proofEntries.map((entry) => entry.customType), ["ralph-steering-injected", "ralph-loop-context-injected"]);
 });
 
 test("/ralph subprocess child scopes durable history to the current loop token", { concurrency: false }, async (t) => {

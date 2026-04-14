@@ -449,7 +449,11 @@ test("acceptStrengthenedDraft rejects raw malformed guardrails shapes", () => {
 
 test("runCommands skips blocked commands before shelling out", async () => {
   const calls: string[] = [];
+  const proofEntries: Array<{ customType: string; data: any }> = [];
   const pi = {
+    appendEntry: (customType: string, data: any) => {
+      proofEntries.push({ customType, data });
+    },
     exec: async (_tool: string, args: string[]) => {
       calls.push(args.join(" "));
       return { killed: false, stdout: "allowed", stderr: "" };
@@ -470,6 +474,9 @@ test("runCommands skips blocked commands before shelling out", async () => {
     { name: "allowed", output: "allowed" },
   ]);
   assert.deepEqual(calls, ["-c echo ok"]);
+  assert.equal(proofEntries.length, 1);
+  assert.equal(proofEntries[0].customType, "ralph-blocked-command");
+  assert.equal(proofEntries[0].data.command, "git push origin main");
 });
 
 test("runCommands resolves args before shelling out", async () => {
@@ -577,6 +584,18 @@ test("renderIterationPrompt includes completion-gate reminders and previous fail
   assert.match(prompt, /OPEN_QUESTIONS\.md must have no remaining P0\/P1 items before stopping\./);
   assert.match(prompt, /Label inferred claims as HYPOTHESIS\./);
   assert.match(prompt, /Previous gate failures: Missing required output: ARCHITECTURE\.md; OPEN_QUESTIONS\.md still has P0 items/);
+  assert.match(prompt, /Emit <promise>DONE<\/promise> only when the gate is truly satisfied\./);
+});
+
+test("renderIterationPrompt includes a rejection section when durable progress is still missing", () => {
+  const prompt = renderIterationPrompt("Body", 2, 5, {
+    completionPromise: "DONE",
+    requiredOutputs: ["ARCHITECTURE.md"],
+    rejectionReasons: ["durable progress"],
+  });
+
+  assert.match(prompt, /\[completion gate rejection\]/);
+  assert.match(prompt, /Still missing: durable progress/);
   assert.match(prompt, /Emit <promise>DONE<\/promise> only when the gate is truly satisfied\./);
 });
 
