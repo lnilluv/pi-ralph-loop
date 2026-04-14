@@ -77,7 +77,7 @@ export type DurableProgressObservedEvent = {
   timestamp: string;
   iteration: number;
   loopToken: string;
-  progress: ProgressState;
+  progress: true;
   changedFiles: string[];
   snapshotTruncated?: boolean;
   snapshotErrorCount?: number;
@@ -88,7 +88,7 @@ export type DurableProgressMissingEvent = {
   timestamp: string;
   iteration: number;
   loopToken: string;
-  progress: ProgressState;
+  progress: false;
   changedFiles: string[];
   snapshotTruncated?: boolean;
   snapshotErrorCount?: number;
@@ -99,14 +99,14 @@ export type DurableProgressUnknownEvent = {
   timestamp: string;
   iteration: number;
   loopToken: string;
-  progress: ProgressState;
+  progress: "unknown";
   changedFiles: string[];
   snapshotTruncated?: boolean;
   snapshotErrorCount?: number;
 };
 
 export type CompletionPromiseSeenEvent = {
-  type: "completion.promise.seen";
+  type: "completion_promise_seen";
   timestamp: string;
   iteration: number;
   loopToken: string;
@@ -123,20 +123,20 @@ export type CompletionGateCheckedEvent = {
 };
 
 export type CompletionGatePassedEvent = {
-  type: "completion.gate.passed";
+  type: "completion_gate_passed";
   timestamp: string;
   iteration: number;
   loopToken: string;
-  ready: boolean;
+  ready: true;
   reasons: string[];
 };
 
 export type CompletionGateBlockedEvent = {
-  type: "completion.gate.blocked";
+  type: "completion_gate_blocked";
   timestamp: string;
   iteration: number;
   loopToken: string;
-  ready: boolean;
+  ready: false;
   reasons: string[];
 };
 
@@ -393,7 +393,7 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
         (value.snapshotTruncated === undefined || typeof value.snapshotTruncated === "boolean") &&
         (value.snapshotErrorCount === undefined || (isNumber(value.snapshotErrorCount) && Number.isInteger(value.snapshotErrorCount) && value.snapshotErrorCount >= 0))
       );
-    case "completion.promise.seen":
+    case "completion_promise_seen":
       return (
         isNumber(value.iteration) &&
         Number.isInteger(value.iteration) &&
@@ -410,7 +410,7 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
         typeof value.ready === "boolean" &&
         isStringArray(value.reasons)
       );
-    case "completion.gate.passed":
+    case "completion_gate_passed":
       return (
         isNumber(value.iteration) &&
         Number.isInteger(value.iteration) &&
@@ -419,7 +419,7 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
         value.ready === true &&
         isStringArray(value.reasons)
       );
-    case "completion.gate.blocked":
+    case "completion_gate_blocked":
       return (
         isNumber(value.iteration) &&
         Number.isInteger(value.iteration) &&

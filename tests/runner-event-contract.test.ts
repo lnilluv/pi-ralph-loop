@@ -52,7 +52,7 @@ type ExpectedRunnerEvent =
       timestamp: string;
       iteration: number;
       loopToken: string;
-      progress: ProgressState;
+      progress: true;
       changedFiles: string[];
       snapshotTruncated?: boolean;
       snapshotErrorCount?: number;
@@ -62,7 +62,7 @@ type ExpectedRunnerEvent =
       timestamp: string;
       iteration: number;
       loopToken: string;
-      progress: ProgressState;
+      progress: false;
       changedFiles: string[];
       snapshotTruncated?: boolean;
       snapshotErrorCount?: number;
@@ -72,13 +72,13 @@ type ExpectedRunnerEvent =
       timestamp: string;
       iteration: number;
       loopToken: string;
-      progress: ProgressState;
+      progress: "unknown";
       changedFiles: string[];
       snapshotTruncated?: boolean;
       snapshotErrorCount?: number;
     }
   | {
-      type: "completion.promise.seen";
+      type: "completion_promise_seen";
       timestamp: string;
       iteration: number;
       loopToken: string;
@@ -93,19 +93,19 @@ type ExpectedRunnerEvent =
       reasons: string[];
     }
   | {
-      type: "completion.gate.passed";
+      type: "completion_gate_passed";
       timestamp: string;
       iteration: number;
       loopToken: string;
-      ready: boolean;
+      ready: true;
       reasons: string[];
     }
   | {
-      type: "completion.gate.blocked";
+      type: "completion_gate_blocked";
       timestamp: string;
       iteration: number;
       loopToken: string;
-      ready: boolean;
+      ready: false;
       reasons: string[];
     }
   | {
@@ -126,6 +126,37 @@ type Equal<Left, Right> =
 type Assert<T extends true> = T;
 
 type _runnerEventContract = Assert<Equal<RunnerEvent, ExpectedRunnerEvent>>;
+
+// Compile-time contract checks: these contradictory payloads must be rejected.
+const invalidDurableProgressObservedEvent: Extract<ExpectedRunnerEvent, { type: "durable.progress.observed" }> = {
+  type: "durable.progress.observed",
+  timestamp: new Date("2026-04-13T12:00:01.000Z").toISOString(),
+  iteration: 1,
+  loopToken: "test-loop-token",
+  // @ts-expect-error durable.progress.observed requires progress: true
+  progress: false,
+  changedFiles: ["src/loop.ts"],
+};
+
+const invalidCompletionGatePassedEvent: Extract<ExpectedRunnerEvent, { type: "completion_gate_passed" }> = {
+  type: "completion_gate_passed",
+  timestamp: new Date("2026-04-13T12:00:02.000Z").toISOString(),
+  iteration: 1,
+  loopToken: "test-loop-token",
+  // @ts-expect-error completion_gate_passed requires ready: true
+  ready: false,
+  reasons: ["ready=false is contradictory"],
+};
+
+const invalidCompletionGateBlockedEvent: Extract<ExpectedRunnerEvent, { type: "completion_gate_blocked" }> = {
+  type: "completion_gate_blocked",
+  timestamp: new Date("2026-04-13T12:00:03.000Z").toISOString(),
+  iteration: 1,
+  loopToken: "test-loop-token",
+  // @ts-expect-error completion_gate_blocked requires ready: false
+  ready: true,
+  reasons: ["ready=true is contradictory"],
+};
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-runner-event-contract-"));
@@ -165,9 +196,9 @@ const malformedRunnerEventCases = [
     },
   },
   {
-    name: "completion.gate.passed with ready false",
+    name: "completion_gate_passed with ready false",
     event: {
-      type: "completion.gate.passed",
+      type: "completion_gate_passed",
       timestamp: new Date("2026-04-13T12:00:02.000Z").toISOString(),
       iteration: 1,
       loopToken: "test-loop-token",
@@ -176,9 +207,9 @@ const malformedRunnerEventCases = [
     },
   },
   {
-    name: "completion.gate.blocked with ready true",
+    name: "completion_gate_blocked with ready true",
     event: {
-      type: "completion.gate.blocked",
+      type: "completion_gate_blocked",
       timestamp: new Date("2026-04-13T12:00:03.000Z").toISOString(),
       iteration: 1,
       loopToken: "test-loop-token",

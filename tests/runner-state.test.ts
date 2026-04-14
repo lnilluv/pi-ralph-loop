@@ -210,13 +210,13 @@ test("appendRunnerEvent and readRunnerEvents round-trip", () => {
   try {
     ensureRunnerDir(taskDir);
     const event = {
-      type: "completion.gate.blocked",
+      type: "completion_gate_blocked",
       timestamp: new Date().toISOString(),
       iteration: 2,
       loopToken: "test-loop-token",
       ready: false,
       reasons: ["Missing required output: ARCHITECTURE.md"],
-    } satisfies Extract<RunnerEvent, { type: "completion.gate.blocked" }>;
+    } satisfies Extract<RunnerEvent, { type: "completion_gate_blocked" }>;
 
     appendRunnerEvent(taskDir, event);
 

@@ -731,18 +731,18 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       [
         "iteration.started",
         "durable.progress.observed",
-        "completion.promise.seen",
+        "completion_promise_seen",
         "completion.gate.checked",
-        "completion.gate.blocked",
+        "completion_gate_blocked",
         "iteration.completed",
       ],
     );
 
-    const completionPromiseEvent = events.find(isRunnerEventType("completion.promise.seen")) as Extract<RunnerEvent, { type: "completion.promise.seen" }> | undefined;
+    const completionPromiseEvent = events.find(isRunnerEventType("completion_promise_seen")) as Extract<RunnerEvent, { type: "completion_promise_seen" }> | undefined;
     assert.ok(completionPromiseEvent);
     const { timestamp: _completionPromiseTimestamp, ...completionPromisePayload } = completionPromiseEvent!;
     assert.deepEqual(completionPromisePayload, {
-      type: "completion.promise.seen",
+      type: "completion_promise_seen",
       iteration: 1,
       loopToken: completionPromiseEvent!.loopToken,
       completionPromise: "DONE",
@@ -759,11 +759,11 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       reasons: ["Missing required output: ARCHITECTURE.md"],
     });
 
-    const blockedEvent = events.find(isRunnerEventType("completion.gate.blocked")) as Extract<RunnerEvent, { type: "completion.gate.blocked" }> | undefined;
+    const blockedEvent = events.find(isRunnerEventType("completion_gate_blocked")) as Extract<RunnerEvent, { type: "completion_gate_blocked" }> | undefined;
     assert.ok(blockedEvent);
     const { timestamp: _blockedTimestamp, ...blockedPayload } = blockedEvent!;
     assert.deepEqual(blockedPayload, {
-      type: "completion.gate.blocked",
+      type: "completion_gate_blocked",
       iteration: 1,
       loopToken: blockedEvent!.loopToken,
       ready: false,

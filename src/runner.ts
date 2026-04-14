@@ -660,21 +660,40 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
       if (completionRecord) {
         completionRecord.durableProgressObserved = progress === true;
-        logRunnerEvent(taskDir, {
-          type:
-            progress === true
-              ? "durable.progress.observed"
-              : progress === false
-                ? "durable.progress.missing"
-                : "durable.progress.unknown",
-          timestamp: new Date(iterEndMs).toISOString(),
-          iteration: i,
-          loopToken,
-          progress,
-          changedFiles,
-          snapshotTruncated,
-          snapshotErrorCount,
-        });
+        if (progress === true) {
+          logRunnerEvent(taskDir, {
+            type: "durable.progress.observed",
+            timestamp: new Date(iterEndMs).toISOString(),
+            iteration: i,
+            loopToken,
+            progress: true,
+            changedFiles,
+            snapshotTruncated,
+            snapshotErrorCount,
+          });
+        } else if (progress === false) {
+          logRunnerEvent(taskDir, {
+            type: "durable.progress.missing",
+            timestamp: new Date(iterEndMs).toISOString(),
+            iteration: i,
+            loopToken,
+            progress: false,
+            changedFiles,
+            snapshotTruncated,
+            snapshotErrorCount,
+          });
+        } else {
+          logRunnerEvent(taskDir, {
+            type: "durable.progress.unknown",
+            timestamp: new Date(iterEndMs).toISOString(),
+            iteration: i,
+            loopToken,
+            progress: "unknown",
+            changedFiles,
+            snapshotTruncated,
+            snapshotErrorCount,
+          });
+        }
       }
 
       // Check completion promise
@@ -710,7 +729,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
               if (completionRecord) {
                 completionRecord.promiseSeen = true;
                 logRunnerEvent(taskDir, {
-                  type: "completion.promise.seen",
+                  type: "completion_promise_seen",
                   timestamp: new Date(iterEndMs).toISOString(),
                   iteration: i,
                   loopToken,
@@ -739,14 +758,25 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
             ready: completionGate.ready,
             reasons: completionGate.reasons,
           });
-          logRunnerEvent(taskDir, {
-            type: completionGate.ready ? "completion.gate.passed" : "completion.gate.blocked",
-            timestamp: new Date(iterEndMs).toISOString(),
-            iteration: i,
-            loopToken,
-            ready: completionGate.ready,
-            reasons: completionGate.reasons,
-          });
+          if (completionGate.ready) {
+            logRunnerEvent(taskDir, {
+              type: "completion_gate_passed",
+              timestamp: new Date(iterEndMs).toISOString(),
+              iteration: i,
+              loopToken,
+              ready: true,
+              reasons: completionGate.reasons,
+            });
+          } else {
+            logRunnerEvent(taskDir, {
+              type: "completion_gate_blocked",
+              timestamp: new Date(iterEndMs).toISOString(),
+              iteration: i,
+              loopToken,
+              ready: false,
+              reasons: completionGate.reasons,
+            });
+          }
         }
         if (!completionGate.ready) {
           completionGateFailureReasons = completionGate.reasons;
