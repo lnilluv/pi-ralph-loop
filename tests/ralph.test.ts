@@ -601,6 +601,25 @@ test("parseCommandArgs handles explicit path args, leaves task text alone, and r
   assert.equal(parseCommandArgs("--task reverse engineer auth --arg owner=Ada").error, "--arg is only supported with /ralph --path");
 });
 
+test("parseCommandArgs parses quoted explicit-path args and preserves literal equals", () => {
+  assert.deepEqual(parseCommandArgs('--path my-task --arg owner="Ada Lovelace"'), {
+    mode: "path",
+    value: "my-task",
+    runtimeArgs: [{ name: "owner", value: "Ada Lovelace" }],
+    error: undefined,
+  });
+  assert.deepEqual(parseCommandArgs("--path my-task --arg team='core infra' --arg note='a=b=c'"), {
+    mode: "path",
+    value: "my-task",
+    runtimeArgs: [
+      { name: "team", value: "core infra" },
+      { name: "note", value: "a=b=c" },
+    ],
+    error: undefined,
+  });
+  assert.equal(parseCommandArgs('--path my-task --arg owner="Ada Lovelace" --arg owner=\'Ada Smith\'').error, "Duplicate --arg: owner");
+});
+
 test("parseCommandArgs rejects malformed explicit-path args", () => {
   assert.equal(parseCommandArgs("--path my-task --arg owner=").error, "Invalid --arg entry: value is required");
   assert.equal(parseCommandArgs("--path my-task --arg =Ada").error, "Invalid --arg entry: name is required");
@@ -610,6 +629,14 @@ test("parseCommandArgs rejects malformed explicit-path args", () => {
   );
   assert.equal(
     parseCommandArgs("--path my-task --arg owner=Ada extra text").error,
+    "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
+  );
+  assert.equal(
+    parseCommandArgs('--path my-task --arg owner="Ada"extra').error,
+    "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
+  );
+  assert.equal(
+    parseCommandArgs('--path my-task --arg owner=pre"Ada Lovelace"post').error,
     "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
   );
 });
