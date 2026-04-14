@@ -220,13 +220,20 @@ def run_rpc_session(
                 break
 
             status_snapshot = read_status(task_dir)
-            if status_snapshot and status_snapshot.get("status") in TERMINAL_STATUSES:
-                termination_reason = f"terminal-status:{status_snapshot.get('status')}"
+            status_value = status_snapshot.get("status") if status_snapshot else None
+            if status_value in TERMINAL_STATUSES:
+                termination_reason = f"terminal-status:{status_value}"
                 time.sleep(1.0)
                 break
 
-            if time.time() - started_at >= startup_grace_seconds and time.time() - last_output[0] > quiet_kill_seconds:
-                termination_reason = "idle-timeout"
+            status_is_active = isinstance(status_value, str) and status_value in {"initializing", "running"}
+            if (
+                quiet_kill_seconds > 0
+                and time.time() - started_at >= startup_grace_seconds
+                and time.time() - last_output[0] > quiet_kill_seconds
+                and not status_is_active
+            ):
+                termination_reason = "idle-timeout:no-status"
                 break
 
             time.sleep(0.25)
@@ -434,7 +441,7 @@ def main() -> int:
         "--quiet-kill-seconds",
         type=float,
         default=3.0,
-        help="How long to wait with no output before a non-status-aware process is considered idle.",
+        help="How long to wait with no output before a non-status-aware process is considered idle. Processes that report initializing/running status are allowed to stay silent.",
     )
     args = parser.parse_args()
 
