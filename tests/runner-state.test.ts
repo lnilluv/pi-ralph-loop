@@ -405,6 +405,34 @@ test("active loop registry reads legacy active-loops.json files", () => {
   }
 });
 
+test("active loop registry prunes stale legacy active-loops.json entries", () => {
+  const cwd = createTempDir();
+  try {
+    const taskDir = join(cwd, "legacy-stale-task");
+    mkdirSync(taskDir, { recursive: true });
+    ensureRunnerDir(cwd);
+
+    const staleEntry: ActiveLoopRegistryEntry = {
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      cwd,
+      loopToken: "legacy-stale-loop-token",
+      status: "running",
+      currentIteration: 2,
+      maxIterations: 4,
+      startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+      updatedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    };
+
+    writeFileSync(join(cwd, ".ralph-runner", "active-loops.json"), JSON.stringify([staleEntry], null, 2), "utf8");
+
+    assert.deepEqual(readActiveLoopRegistry(cwd), []);
+    assert.deepEqual(listActiveLoopRegistryEntries(cwd), []);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("active loop registry records stop request and observation timestamps", () => {
   const cwd = createTempDir();
   try {

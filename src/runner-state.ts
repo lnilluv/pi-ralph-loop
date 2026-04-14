@@ -249,6 +249,11 @@ function parseIsoTimestamp(raw: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function isActiveLoopRegistryEntryStale(entry: ActiveLoopRegistryEntry): boolean {
+  const updatedAtMs = parseIsoTimestamp(entry.updatedAt);
+  return updatedAtMs === undefined || Date.now() - updatedAtMs > ACTIVE_LOOP_REGISTRY_STALE_AFTER_MS;
+}
+
 function isRunnerStatus(value: unknown): value is RunnerStatus {
   return (
     value === "initializing" ||
@@ -322,8 +327,7 @@ function readActiveLoopRegistryEntryFile(filePath: string): ActiveLoopRegistryEn
       rmSync(filePath, { force: true });
       return undefined;
     }
-    const updatedAtMs = parseIsoTimestamp(entry.updatedAt);
-    if (updatedAtMs === undefined || Date.now() - updatedAtMs > ACTIVE_LOOP_REGISTRY_STALE_AFTER_MS) {
+    if (isActiveLoopRegistryEntryStale(entry)) {
       rmSync(filePath, { force: true });
       return undefined;
     }
@@ -341,7 +345,19 @@ function readLegacyActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEnt
     const raw = readFileSync(filePath, "utf8");
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.map(normalizeActiveLoopRegistryEntry).filter((entry): entry is ActiveLoopRegistryEntry => entry !== undefined);
+
+    const normalizedEntries = parsed.map(normalizeActiveLoopRegistryEntry).filter((entry): entry is ActiveLoopRegistryEntry => entry !== undefined);
+    const freshEntries = normalizedEntries.filter((entry) => !isActiveLoopRegistryEntryStale(entry));
+
+    if (freshEntries.length !== normalizedEntries.length) {
+      if (freshEntries.length > 0) {
+        writeFileSync(filePath, `${JSON.stringify(freshEntries, null, 2)}\n`, "utf8");
+      } else {
+        rmSync(filePath, { force: true });
+      }
+    }
+
+    return freshEntries;
   } catch {
     return [];
   }
