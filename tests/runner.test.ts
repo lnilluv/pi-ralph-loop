@@ -99,6 +99,49 @@ test("runRalphLoop completes a single iteration with mock subprocess", async () 
   }
 });
 
+test("runRalphLoop persists RPC telemetry in iteration records", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+printf 'research stderr\n' >&2
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    const [record] = readIterationRecords(taskDir);
+    assert.ok(record.rpcTelemetry);
+    assert.ok(record.rpcTelemetry?.spawnedAt.length > 0);
+    assert.ok(record.rpcTelemetry?.promptSentAt);
+    assert.ok(record.rpcTelemetry?.firstStdoutEventAt);
+    assert.ok(record.rpcTelemetry?.lastEventAt);
+    assert.equal(record.rpcTelemetry?.lastEventType, "agent_end");
+    assert.ok(record.rpcTelemetry?.exitedAt);
+    assert.match(record.rpcTelemetry?.stderrText ?? "", /research stderr/);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("runRalphLoop writes durable status files", async () => {
   const taskDir = createTempDir();
   try {

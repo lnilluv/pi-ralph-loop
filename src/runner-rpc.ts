@@ -36,12 +36,27 @@ export type RpcSubprocessConfig = {
   onEvent?: (event: RpcEvent) => void;
 };
 
+export type RpcTelemetry = {
+  spawnedAt: string;
+  promptSentAt?: string;
+  firstStdoutEventAt?: string;
+  lastEventAt?: string;
+  lastEventType?: string;
+  exitedAt?: string;
+  timedOutAt?: string;
+  exitCode?: number | null;
+  exitSignal?: NodeJS.Signals | null;
+  stderrText?: string;
+  error?: string;
+};
+
 export type RpcSubprocessResult = {
   success: boolean;
   lastAssistantText: string;
   agentEndMessages: unknown[];
   timedOut: boolean;
   error?: string;
+  telemetry: RpcTelemetry;
 };
 
 export type RpcPromptResult = {
@@ -137,8 +152,20 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   const extensionPath = fileURLToPath(new URL("./index.ts", import.meta.url));
   const args = spawnArgs ?? ["--mode", "rpc", "--no-session", "-e", extensionPath];
   const subprocessEnv = { ...process.env, ...env };
+  const telemetry: RpcTelemetry = {
+    spawnedAt: new Date().toISOString(),
+  };
 
   let childProcess: ReturnType<typeof spawn>;
+  let stderrText = "";
+  const buildResult = (result: Omit<RpcSubprocessResult, "telemetry">): RpcSubprocessResult => ({
+    ...result,
+    telemetry: {
+      ...telemetry,
+      ...(stderrText ? { stderrText } : {}),
+    },
+  });
+
   try {
     childProcess = spawn(spawnCommand, args, {
       cwd,
@@ -146,13 +173,14 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (err) {
-    return {
+    telemetry.error = err instanceof Error ? err.message : String(err);
+    return buildResult({
       success: false,
       lastAssistantText: "",
       agentEndMessages: [],
       timedOut: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+      error: telemetry.error,
+    });
   }
 
   return new Promise<RpcSubprocessResult>((resolve) => {
@@ -164,20 +192,29 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     let modelSetAcknowledged = !(modelProvider && modelModelId); // true if no set_model needed
     let thinkingLevelAcknowledged = !thinkingLevel; // true if no set_thinking_level needed
 
+    const nowIso = () => new Date().toISOString();
+    const markStdoutEvent = (eventType: string) => {
+      const observedAt = nowIso();
+      if (!telemetry.firstStdoutEventAt) telemetry.firstStdoutEventAt = observedAt;
+      telemetry.lastEventAt = observedAt;
+      telemetry.lastEventType = eventType;
+    };
+
     const timeout = setTimeout(() => {
       if (settled) return;
       settled = true;
+      telemetry.timedOutAt = nowIso();
       try {
         childProcess.kill("SIGKILL");
       } catch {
         // process may already be dead
       }
-      resolve({
+      resolve(buildResult({
         success: false,
         lastAssistantText,
         agentEndMessages,
         timedOut: true,
-      });
+      }));
     }, timeoutMs);
 
     const cleanup = () => {
@@ -204,7 +241,6 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     };
 
     // Set up stderr collection
-    let stderrText = "";
     childProcess.stderr?.on("data", (data: Buffer) => {
       stderrText += data.toString("utf8");
     });
@@ -225,6 +261,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
         if (!trimmedLine) continue;
 
         const event = parseRpcEvent(trimmedLine);
+        markStdoutEvent(event.type);
         onEvent?.(event);
 
         if (event.type === "response") {
@@ -246,60 +283,67 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
           agentEndMessages = Array.isArray(endEvent.messages) ? endEvent.messages : [];
           lastAssistantText = extractAssistantText(agentEndMessages);
 
-          settle({
+          telemetry.exitedAt = telemetry.exitedAt ?? nowIso();
+          settle(buildResult({
             success: true,
             lastAssistantText,
             agentEndMessages,
             timedOut: false,
-          });
+          }));
           return;
         }
       }
     });
 
     childProcess.on("error", (err: Error) => {
-      settle({
+      telemetry.error = err.message;
+      settle(buildResult({
         success: false,
         lastAssistantText,
         agentEndMessages,
         timedOut: false,
         error: err.message,
-      });
+      }));
     });
     childProcess.stdin?.on("error", (err: Error & { code?: string }) => {
       if (settled) return;
-      settle({
+      const error = err.code === "EPIPE" ? "Subprocess closed stdin before prompt could be sent" : err.message;
+      telemetry.error = error;
+      settle(buildResult({
         success: false,
         lastAssistantText,
         agentEndMessages,
         timedOut: false,
-        error: err.code === "EPIPE" ? "Subprocess closed stdin before prompt could be sent" : err.message,
-      });
+        error,
+      }));
     });
 
-    childProcess.on("close", (code: number | null) => {
+    childProcess.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
+      telemetry.exitedAt = nowIso();
+      telemetry.exitCode = code;
+      telemetry.exitSignal = signal;
 
       // If the subprocess exited but we never got an agent_end
       if (code !== 0 && code !== null) {
-        settle({
+        settle(buildResult({
           success: false,
           lastAssistantText,
           agentEndMessages,
           timedOut: false,
           error: `Subprocess exited with code ${code}${stderrText ? `: ${stderrText.slice(0, 200)}` : ""}`,
-        });
+        }));
         return;
       }
 
       // Process exited normally but no agent_end received
-      settle({
+      settle(buildResult({
         success: agentEndMessages.length > 0,
         lastAssistantText,
         agentEndMessages,
         timedOut: false,
         error: agentEndMessages.length > 0 ? undefined : "Subprocess exited without sending agent_end",
-      });
+      }));
     });
 
     // Send set_model command if provider/model are specified
@@ -312,13 +356,15 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       try {
         childProcess.stdin?.write(setModelCommand + "\n");
       } catch (err) {
-        settle({
+        const error = `Failed to send set_model command: ${err instanceof Error ? err.message : String(err)}`;
+        telemetry.error = error;
+        settle(buildResult({
           success: false,
           lastAssistantText,
           agentEndMessages,
           timedOut: false,
-          error: `Failed to send set_model command: ${err instanceof Error ? err.message : String(err)}`,
-        });
+          error,
+        }));
         return;
       }
     }
@@ -332,13 +378,15 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       try {
         childProcess.stdin?.write(setThinkingCommand + "\n");
       } catch (err) {
-        settle({
+        const error = `Failed to send set_thinking_level command: ${err instanceof Error ? err.message : String(err)}`;
+        telemetry.error = error;
+        settle(buildResult({
           success: false,
           lastAssistantText,
           agentEndMessages,
           timedOut: false,
-          error: `Failed to send set_thinking_level command: ${err instanceof Error ? err.message : String(err)}`,
-        });
+          error,
+        }));
         return;
       }
     }
@@ -353,16 +401,19 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       });
 
       try {
+        telemetry.promptSentAt = telemetry.promptSentAt ?? nowIso();
         childProcess.stdin?.write(promptCommand + "\n");
         promptSent = true;
       } catch (err) {
-        settle({
+        const error = err instanceof Error ? err.message : String(err);
+        telemetry.error = error;
+        settle(buildResult({
           success: false,
           lastAssistantText,
           agentEndMessages,
           timedOut: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
+          error,
+        }));
       }
     };
 

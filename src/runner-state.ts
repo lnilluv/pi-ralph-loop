@@ -46,6 +46,7 @@ export type IterationRecord = {
   snapshotTruncated?: boolean;
   snapshotErrorCount?: number;
   loopToken?: string;
+  rpcTelemetry?: import("./runner-rpc.ts").RpcTelemetry;
 };
 
 export type RunnerStartedEvent = {
@@ -512,6 +513,24 @@ function completionHeaderLines(record: IterationRecord): string[] {
   ];
 }
 
+function rpcTelemetryHeaderLines(record: IterationRecord): string[] {
+  const telemetry = record.rpcTelemetry;
+  if (!telemetry) return [];
+  return [
+    `- RPC telemetry:`,
+    `  - Spawned: ${telemetry.spawnedAt}`,
+    ...(telemetry.promptSentAt ? [`  - Prompt sent: ${telemetry.promptSentAt}`] : []),
+    ...(telemetry.firstStdoutEventAt ? [`  - First stdout event: ${telemetry.firstStdoutEventAt}`] : []),
+    ...(telemetry.lastEventAt && telemetry.lastEventType ? [`  - Last stdout event: ${telemetry.lastEventType} at ${telemetry.lastEventAt}`] : []),
+    ...(telemetry.exitedAt ? [`  - Exited: ${telemetry.exitedAt}`] : []),
+    ...(telemetry.timedOutAt ? [`  - Timed out: ${telemetry.timedOutAt}`] : []),
+    ...(telemetry.exitCode !== undefined ? [`  - Exit code: ${String(telemetry.exitCode)}`] : []),
+    ...(telemetry.exitSignal !== undefined ? [`  - Exit signal: ${String(telemetry.exitSignal)}`] : []),
+    ...(telemetry.stderrText ? [`  - Stderr: ${telemetry.stderrText.trimEnd()}`] : []),
+    ...(telemetry.error ? [`  - Error: ${telemetry.error}`] : []),
+  ];
+}
+
 function transcriptHeaderLines(record: IterationRecord): string[] {
   const lines = [
     `- Status: ${record.status}`,
@@ -520,6 +539,7 @@ function transcriptHeaderLines(record: IterationRecord): string[] {
     `- Changed files: ${record.changedFiles.length > 0 ? record.changedFiles.join(", ") : "none"}`,
     `- No-progress streak: ${record.noProgressStreak}`,
     ...completionHeaderLines(record),
+    ...rpcTelemetryHeaderLines(record),
   ];
   if (record.completedAt) lines.push(`- Completed: ${record.completedAt}`);
   if (typeof record.durationMs === "number") lines.push(`- Duration: ${Math.round(record.durationMs / 1000)}s`);

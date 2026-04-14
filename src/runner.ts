@@ -613,6 +613,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           noProgressStreak: noProgressStreak + 1,
           completion: completionRecord,
           loopToken,
+          rpcTelemetry: rpcResult.telemetry,
         };
         iterations.push(iterRecord);
         appendIterationRecord(taskDir, iterRecord);
@@ -807,6 +808,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         completion: completionRecord,
         snapshotTruncated,
         snapshotErrorCount,
+        rpcTelemetry: rpcResult.telemetry,
       };
       iterations.push(iterRecord);
       appendIterationRecord(taskDir, iterRecord);

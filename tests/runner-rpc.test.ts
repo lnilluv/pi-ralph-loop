@@ -53,6 +53,7 @@ test("runRpcIteration returns success when subprocess completes", async () => {
   try {
     const mockScript = await writeMockScript(cwd, "mock-pi.sh", `#!/bin/bash
 read line
+printf 'mock stderr\n' >&2
 echo '{"type":"response","command":"prompt","success":true}'
 echo '{"type":"agent_start"}'
 echo '{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"done"}}'
@@ -71,12 +72,20 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.equal(result.lastAssistantText, "done");
     assert.equal(result.agentEndMessages.length, 1);
     assert.equal(result.error, undefined);
+    assert.ok(result.telemetry.spawnedAt.length > 0);
+    assert.ok(result.telemetry.promptSentAt);
+    assert.ok(result.telemetry.firstStdoutEventAt);
+    assert.ok(result.telemetry.lastEventAt);
+    assert.equal(result.telemetry.lastEventType, "agent_end");
+    assert.ok(result.telemetry.exitedAt);
+    assert.equal(result.telemetry.timedOutAt, undefined);
+    assert.match(result.telemetry.stderrText ?? "", /mock stderr/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("runRpcIteration returns timeout when subprocess takes too long", async () => {
+test("runRpcIteration records timeout telemetry when subprocess takes too long", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {
     const mockScript = await writeMockScript(cwd, "mock-pi-slow.sh", `#!/bin/bash
@@ -94,6 +103,13 @@ sleep 30
     });
     assert.equal(result.success, false);
     assert.equal(result.timedOut, true);
+    assert.ok(result.telemetry.spawnedAt.length > 0);
+    assert.ok(result.telemetry.promptSentAt);
+    assert.ok(result.telemetry.firstStdoutEventAt);
+    assert.ok(result.telemetry.lastEventAt);
+    assert.equal(result.telemetry.lastEventType, "response");
+    assert.ok(result.telemetry.timedOutAt);
+    assert.equal(result.telemetry.exitedAt, undefined);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
