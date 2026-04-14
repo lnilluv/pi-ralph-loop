@@ -14,8 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FIXTURES_ROOT = REPO_ROOT / "tests" / "fixtures" / "parity"
 DEFAULT_MODEL = os.environ.get("PI_RALPH_PARITY_MODEL")
 DEFAULT_LOOP_RPC_COMMAND = os.environ.get("PI_RALPH_PARITY_LOOP_RPC_COMMAND")
 DEFAULT_RALPHIFY_RPC_COMMAND = os.environ.get("PI_RALPH_PARITY_RALPHIFY_RPC_COMMAND", "")

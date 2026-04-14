@@ -238,10 +238,6 @@ The extension validates `RALPH.md` frontmatter before starting and on each re-pa
 | Input validation | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Setup required | task folder or draft flow | config | RALPH.md | PRD pipeline | scaffold + RALPH.md |
 
-## Parity harness
-
-Checked-in parity fixtures and the replay harness live in `parity/`. The harness uses the active pi model by default and can pin a specific model with `--model` or `PI_RALPH_PARITY_MODEL`. See `parity/README.md` for the exact rerun command, artifact layout, and environment variables.
-
 ## License
 
 MIT

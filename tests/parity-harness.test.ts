@@ -19,7 +19,7 @@ test("parity harness builds a pi command without pinning a model by default", as
     "python3",
     [
       "-c",
-      "from parity.harness import build_loop_rpc_command; print(' '.join(build_loop_rpc_command(None)))",
+      "from tests.parity.harness import build_loop_rpc_command; print(' '.join(build_loop_rpc_command(None)))",
     ],
     { cwd: repoRoot, env: cleanEnv() },
   );
@@ -33,7 +33,7 @@ test("parity harness appends an explicit model when requested", async () => {
     "python3",
     [
       "-c",
-      "from parity.harness import build_loop_rpc_command; print(' '.join(build_loop_rpc_command('openai-codex/gpt-5.4-mini:high')))"
+      "from tests.parity.harness import build_loop_rpc_command; print(' '.join(build_loop_rpc_command('openai-codex/gpt-5.4-mini:high')))"
     ],
     { cwd: repoRoot, env: cleanEnv() },
   );

@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
-const fixtureDir = join(process.cwd(), "parity/fixtures/research");
+const fixtureDir = join(process.cwd(), "tests/fixtures/parity/research");
 
 const generatedOutputs = [
   "INSTALL_FLOW.md",
