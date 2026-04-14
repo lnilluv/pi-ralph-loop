@@ -131,36 +131,74 @@ function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-runner-event-contract-"));
 }
 
-test("readRunnerEvents ignores malformed event payloads", () => {
-  const taskDir = createTempDir();
-  try {
-    const runnerDir = ensureRunnerDir(taskDir);
-    const eventsFile = join(runnerDir, "events.jsonl");
-    const validEvent = {
-      type: "runner.started",
-      timestamp: new Date("2026-04-13T12:00:00.000Z").toISOString(),
-      loopToken: "test-loop-token",
-      cwd: taskDir,
-      taskDir,
-      status: "initializing",
-      maxIterations: 3,
-      timeout: 10,
-      completionPromise: "DONE",
-      guardrails: { blockCommands: [], protectedFiles: [] },
-    } satisfies Extract<ExpectedRunnerEvent, { type: "runner.started" }>;
-    const malformedEvent = {
-      type: "completion.gate.checked",
+function writeEventsFile(taskDir: string, events: unknown[]): void {
+  const runnerDir = ensureRunnerDir(taskDir);
+  const eventsFile = join(runnerDir, "events.jsonl");
+  writeFileSync(eventsFile, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
+}
+
+function makeValidStartedEvent(taskDir: string): Extract<ExpectedRunnerEvent, { type: "runner.started" }> {
+  return {
+    type: "runner.started",
+    timestamp: new Date("2026-04-13T12:00:00.000Z").toISOString(),
+    loopToken: "test-loop-token",
+    cwd: taskDir,
+    taskDir,
+    status: "initializing",
+    maxIterations: 3,
+    timeout: 10,
+    completionPromise: "DONE",
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  };
+}
+
+const malformedRunnerEventCases = [
+  {
+    name: "durable.progress.observed with progress false",
+    event: {
+      type: "durable.progress.observed",
       timestamp: new Date("2026-04-13T12:00:01.000Z").toISOString(),
       iteration: 1,
       loopToken: "test-loop-token",
+      progress: false,
+      changedFiles: ["src/loop.ts"],
+    },
+  },
+  {
+    name: "completion.gate.passed with ready false",
+    event: {
+      type: "completion.gate.passed",
+      timestamp: new Date("2026-04-13T12:00:02.000Z").toISOString(),
+      iteration: 1,
+      loopToken: "test-loop-token",
       ready: false,
-    };
+      reasons: ["ready=false is contradictory"],
+    },
+  },
+  {
+    name: "completion.gate.blocked with ready true",
+    event: {
+      type: "completion.gate.blocked",
+      timestamp: new Date("2026-04-13T12:00:03.000Z").toISOString(),
+      iteration: 1,
+      loopToken: "test-loop-token",
+      ready: true,
+      reasons: ["ready=true is contradictory"],
+    },
+  },
+] as const;
 
-    writeFileSync(eventsFile, `${JSON.stringify(validEvent)}\n${JSON.stringify(malformedEvent)}\n`, "utf8");
+for (const { name, event } of malformedRunnerEventCases) {
+  test(`readRunnerEvents rejects ${name}`, () => {
+    const taskDir = createTempDir();
+    try {
+      const validEvent = makeValidStartedEvent(taskDir);
+      writeEventsFile(taskDir, [validEvent, event]);
 
-    const events = readRunnerEvents(taskDir);
-    assert.deepEqual(events, [validEvent]);
-  } finally {
-    rmSync(taskDir, { recursive: true, force: true });
-  }
-});
+      const events = readRunnerEvents(taskDir);
+      assert.deepEqual(events, [validEvent]);
+    } finally {
+      rmSync(taskDir, { recursive: true, force: true });
+    }
+  });
+}

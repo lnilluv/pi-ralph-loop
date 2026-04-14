@@ -361,14 +361,34 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
         (value.completionPromise === undefined || isString(value.completionPromise))
       );
     case "durable.progress.observed":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        value.progress === true &&
+        isStringArray(value.changedFiles) &&
+        (value.snapshotTruncated === undefined || typeof value.snapshotTruncated === "boolean") &&
+        (value.snapshotErrorCount === undefined || (isNumber(value.snapshotErrorCount) && Number.isInteger(value.snapshotErrorCount) && value.snapshotErrorCount >= 0))
+      );
     case "durable.progress.missing":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        value.progress === false &&
+        isStringArray(value.changedFiles) &&
+        (value.snapshotTruncated === undefined || typeof value.snapshotTruncated === "boolean") &&
+        (value.snapshotErrorCount === undefined || (isNumber(value.snapshotErrorCount) && Number.isInteger(value.snapshotErrorCount) && value.snapshotErrorCount >= 0))
+      );
     case "durable.progress.unknown":
       return (
         isNumber(value.iteration) &&
         Number.isInteger(value.iteration) &&
         value.iteration > 0 &&
         isString(value.loopToken) &&
-        isProgressState(value.progress) &&
+        value.progress === "unknown" &&
         isStringArray(value.changedFiles) &&
         (value.snapshotTruncated === undefined || typeof value.snapshotTruncated === "boolean") &&
         (value.snapshotErrorCount === undefined || (isNumber(value.snapshotErrorCount) && Number.isInteger(value.snapshotErrorCount) && value.snapshotErrorCount >= 0))
@@ -391,13 +411,21 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
         isStringArray(value.reasons)
       );
     case "completion.gate.passed":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        value.ready === true &&
+        isStringArray(value.reasons)
+      );
     case "completion.gate.blocked":
       return (
         isNumber(value.iteration) &&
         Number.isInteger(value.iteration) &&
         value.iteration > 0 &&
         isString(value.loopToken) &&
-        typeof value.ready === "boolean" &&
+        value.ready === false &&
         isStringArray(value.reasons)
       );
     case "iteration.completed":
