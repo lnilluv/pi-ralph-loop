@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { assessTaskDirectoryProgress, captureTaskDirectorySnapshot, runRalphLoop, validateCompletionReadiness } from "../src/runner.ts";
-import { readStatusFile, readIterationRecords, readRunnerEvents, checkStopSignal, createStopSignal as createStopSignalFn, type RunnerEvent } from "../src/runner-state.ts";
+import { readStatusFile, readIterationRecords, readRunnerEvents, checkStopSignal, createCancelSignal, createStopSignal as createStopSignalFn, type RunnerEvent } from "../src/runner-state.ts";
 import { generateDraft } from "../src/ralph.ts";
 import type { DraftTarget, CommandOutput, CommandDef } from "../src/ralph.ts";
 
@@ -334,6 +334,86 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     const prompt = JSON.parse(readFileSync(promptPath, "utf8")) as { message: string };
     assert.equal(prompt.message.includes("RALPH_PROGRESS.md"), false);
     assert.equal(prompt.message.toLowerCase().includes("keep it short and overwrite in place"), false);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop cancels mid-iteration when cancel flag is written", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 3 }));
+
+    const scriptPath = join(taskDir, "slow-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+sleep 10
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    setTimeout(() => createCancelSignal(taskDir), 1000);
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 30,
+      maxIterations: 3,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "cancelled");
+    assert.ok(result.iterations.length >= 1);
+    assert.equal(result.iterations[result.iterations.length - 1].status, "cancelled");
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop checks cancel flag at iteration boundary", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 3 }));
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    let iterationCount = 0;
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 3,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      onIterationComplete() {
+        iterationCount++;
+        if (iterationCount >= 1) {
+          createCancelSignal(taskDir);
+        }
+      },
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "cancelled");
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
