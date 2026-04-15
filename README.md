@@ -383,6 +383,19 @@ Stop with <promise>DONE</promise> when finished.
 
 Refuses to overwrite an existing `RALPH.md` or write outside the current working directory.
 
+## Agent skills
+
+pi-ralph-loop ships two [skills](https://github.com/mariozechner/pi-coding-agent/blob/main/docs/skills.md) that pi auto-discovers when the package is installed:
+
+| Skill | When it activates | What it teaches |
+|---|---|---|
+| `ralph-loop` | Starting or configuring a loop | When to loop vs. single-session, prompt structure, guardrails, completion gating, common mistakes |
+| `ralph-draft` | Creating a RALPH.md from plain language | Task classification, project detection, frontmatter generation, guardrail selection |
+
+The skills include detailed references:
+- **Prompt patterns** — annotated examples for self-healing, migration, research, security, and evidence-driven loops
+- **Config cookbook** — copy-paste frontmatter recipes for 8 common scenarios
+
 ## License
 
 MIT
