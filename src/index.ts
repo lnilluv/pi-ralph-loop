@@ -1034,6 +1034,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
   async function startRalphLoop(ralphPath: string, ctx: CommandContext, runLoopFn: typeof runRalphLoop = runRalphLoop, runtimeArgs: RuntimeArgs = {}) {
     let name: string;
+    let currentStopOnError = true;
     try {
       const raw = readFileSync(ralphPath, "utf8");
       const draftError = validateDraftContent(raw);
@@ -1044,6 +1045,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       const parsed = parseRalphMarkdown(raw);
       const { frontmatter } = parsed;
       if (!validateFrontmatter(frontmatter, ctx)) return;
+      currentStopOnError = frontmatter.stopOnError;
       const runtimeValidationError = validateRuntimeArgs(frontmatter, parsed.body, frontmatter.commands, runtimeArgs);
       if (runtimeValidationError) {
         ctx.ui.notify(runtimeValidationError, "error");
@@ -1080,6 +1082,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         timeout: loopState.timeout,
         maxIterations: loopState.maxIterations,
         guardrails: loopState.guardrails,
+        stopOnError: currentStopOnError,
         runtimeArgs,
         modelPattern: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
         thinkingLevel: ctx.model?.reasoning ? "high" : undefined,

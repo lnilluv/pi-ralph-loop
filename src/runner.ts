@@ -55,6 +55,8 @@ export type RunnerConfig = {
   cwd: string;
   timeout: number;
   maxIterations: number;
+  /** Error policy: true = stop on error (default), false = continue on error */
+  stopOnError?: boolean;
   /** Completion promise string from RALPH.md */
   completionPromise?: string;
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
@@ -415,6 +417,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     pi,
     runtimeArgs: initialRuntimeArgs = {},
   } = config;
+  let currentStopOnError = config.stopOnError ?? true;
   const runtimeArgs = initialRuntimeArgs;
 
   const taskDir = dirname(ralphPath);
@@ -533,6 +536,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       currentRequiredOutputs = fm.requiredOutputs ?? [];
       currentInterIterationDelay = fm.interIterationDelay;
       currentGuardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
+      currentStopOnError = config.stopOnError ?? fm.stopOnError;
 
       // Update status to running
       const runningStatus: RunnerStatusFile = {
@@ -696,13 +700,29 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
         if (rpcResult.timedOut) {
           onNotify?.(`Iteration ${i} timed out after ${currentTimeout}s`, "warning");
-          finalStatus = "timeout";
+          if (currentStopOnError) {
+            finalStatus = "timeout";
+            onIterationComplete?.(iterRecord);
+            break;
+          } else {
+            noProgressStreak += 1;
+            onNotify?.(`Continuing (stop_on_error=false).`, "warning");
+            onIterationComplete?.(iterRecord);
+            continue;
+          }
         } else {
           onNotify?.(`Iteration ${i} error: ${rpcResult.error ?? "unknown"}`, "error");
-          finalStatus = "error";
+          if (currentStopOnError) {
+            finalStatus = "error";
+            onIterationComplete?.(iterRecord);
+            break;
+          } else {
+            noProgressStreak += 1;
+            onNotify?.(`Continuing (stop_on_error=false).`, "warning");
+            onIterationComplete?.(iterRecord);
+            continue;
+          }
         }
-        onIterationComplete?.(iterRecord);
-        break;
       }
 
       // After snapshot
