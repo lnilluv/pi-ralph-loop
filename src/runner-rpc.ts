@@ -34,6 +34,7 @@ export type RpcSubprocessConfig = {
   thinkingLevel?: string;
   /** Callback for observing events as they stream */
   onEvent?: (event: RpcEvent) => void;
+  signal?: AbortSignal;
 };
 
 export type RpcTelemetry = {
@@ -55,6 +56,7 @@ export type RpcSubprocessResult = {
   lastAssistantText: string;
   agentEndMessages: unknown[];
   timedOut: boolean;
+  cancelled?: boolean;
   error?: string;
   telemetry: RpcTelemetry;
 };
@@ -126,6 +128,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     provider: explicitProvider,
     modelId: explicitModelId,
     onEvent,
+    signal,
   } = config;
 
   // Parse modelPattern ("provider/modelId" or "provider/modelId:thinking") into provider and modelId
@@ -201,7 +204,35 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       telemetry.lastEventType = eventType;
     };
 
-    const timeout = setTimeout(() => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      telemetry.error = "cancelled";
+      try {
+        childProcess.kill("SIGKILL");
+      } catch {
+        // process may already be dead
+      }
+      clearTimeout(timeout);
+      resolve(buildResult({
+        success: false,
+        lastAssistantText,
+        agentEndMessages,
+        timedOut: false,
+        cancelled: true,
+        error: "cancelled",
+      }));
+    };
+
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    timeout = setTimeout(() => {
       if (settled) return;
       settled = true;
       telemetry.timedOutAt = nowIso();
@@ -230,6 +261,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     const cleanup = () => {
       clearTimeout(timeout);
       endStdin();
+      signal?.removeEventListener("abort", onAbort);
     };
 
     const settle = (result: RpcSubprocessResult) => {
