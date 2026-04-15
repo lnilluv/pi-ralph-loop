@@ -121,6 +121,7 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
     timeout: 12.5,
     completionPromise: "done",
     requiredOutputs: ["docs/ARCHITECTURE.md"],
+    stopOnError: true,
     guardrails: { blockCommands: ["rm .*"], protectedFiles: ["src/**"] },
     invalidCommandEntries: undefined,
   });
@@ -134,6 +135,21 @@ test("parseRalphMarkdown parses declared args as runtime parameters", () => {
 
   assert.deepEqual(parsed.frontmatter.args, ["owner", "mode"]);
   assert.equal(validateFrontmatter(parsed.frontmatter), null);
+});
+
+test("parseRalphMarkdown parses stop_on_error from frontmatter", () => {
+  const parsed = parseRalphMarkdown("---\nstop_on_error: false\nmax_iterations: 5\ntimeout: 60\ncommands: []\nguardrails: { block_commands: [], protected_files: [] }\n---\nTask\n");
+  assert.equal(parsed.frontmatter.stopOnError, false);
+});
+
+test("parseRalphMarkdown defaults stop_on_error to true", () => {
+  const parsed = parseRalphMarkdown("---\nmax_iterations: 5\ntimeout: 60\ncommands: []\nguardrails: { block_commands: [], protected_files: [] }\n---\nTask\n");
+  assert.equal(parsed.frontmatter.stopOnError, true);
+});
+
+test("parseRalphMarkdown treats non-false stop_on_error as true (safe default)", () => {
+  const parsed = parseRalphMarkdown("---\nstop_on_error: yes\nmax_iterations: 5\ntimeout: 60\ncommands: []\nguardrails: { block_commands: [], protected_files: [] }\n---\nTask\n");
+  assert.equal(parsed.frontmatter.stopOnError, true);
 });
 
 test("validateFrontmatter accepts valid input and rejects invalid bounds, names, args, and globs", () => {
@@ -242,6 +258,13 @@ test("validateFrontmatter accepts valid input and rejects invalid bounds, names,
     validateFrontmatter({ ...defaultFrontmatter(), requiredOutputs: ["docs/\nREADME.md"] }),
     "Invalid required_outputs entry: docs/\nREADME.md must be a relative file path",
   );
+});
+
+test("validateFrontmatter accepts stop_on_error true and false", () => {
+  const fmTrue = { ...defaultFrontmatter(), stopOnError: true };
+  const fmFalse = { ...defaultFrontmatter(), stopOnError: false };
+  assert.equal(validateFrontmatter(fmTrue), null);
+  assert.equal(validateFrontmatter(fmFalse), null);
 });
 
 test("validateFrontmatter rejects unsafe completion_promise values and Mission Brief fails closed", () => {
@@ -1010,6 +1033,7 @@ test("generated drafts reparse as valid RALPH files", () => {
     timeout: 300,
     completionPromise: undefined,
     requiredOutputs: [],
+    stopOnError: true,
     guardrails: { blockCommands: ["git\\s+push"], protectedFiles: [] },
     invalidCommandEntries: undefined,
   });
