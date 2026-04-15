@@ -121,6 +121,106 @@ type StopTarget = {
   source: StopTargetSource;
 };
 
+type ResolveRalphTargetResult =
+  | { kind: "resolved"; taskDir: string }
+  | { kind: "not-found" };
+
+function resolveRalphTarget(
+  ctx: Pick<CommandContext, "cwd" | "sessionManager" | "ui">,
+  options: {
+    commandName: string;
+    explicitPath?: string;
+    checkCrossProcess?: boolean;
+    allowCompletedRuns?: boolean;
+  },
+): ResolveRalphTargetResult | undefined {
+  const { commandName, explicitPath, checkCrossProcess = false, allowCompletedRuns = false } = options;
+  const now = new Date().toISOString();
+  const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
+  const { target: sessionTarget } = resolveSessionStopTarget(ctx, now);
+  const resolvedExplicitPath = explicitPath?.trim();
+
+  if (resolvedExplicitPath) {
+    const inspection = inspectExistingTarget(resolvedExplicitPath, ctx.cwd, true);
+    if (inspection.kind === "run") {
+      const taskDir = dirname(inspection.ralphPath);
+      if (checkCrossProcess) {
+        const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === taskDir);
+        if (registryTarget) {
+          return { kind: "resolved", taskDir: registryTarget.taskDir };
+        }
+
+        const statusFile = readStatusFile(taskDir);
+        if (
+          statusFile &&
+          (statusFile.status === "running" || statusFile.status === "initializing") &&
+          typeof statusFile.cwd === "string" &&
+          statusFile.cwd.length > 0
+        ) {
+          const statusRegistryTarget = listActiveLoopRegistryEntries(statusFile.cwd).find(
+            (entry) => entry.taskDir === taskDir && entry.loopToken === statusFile.loopToken,
+          );
+          if (statusRegistryTarget) {
+            return { kind: "resolved", taskDir: statusRegistryTarget.taskDir };
+          }
+        }
+      }
+
+      return { kind: "resolved", taskDir };
+    }
+
+    if (allowCompletedRuns) {
+      const taskDir = resolve(ctx.cwd, resolvedExplicitPath);
+      if (existsSync(join(taskDir, ".ralph-runner"))) {
+        return { kind: "resolved", taskDir };
+      }
+      ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, taskDir)}.`, "error");
+      return { kind: "not-found" };
+    }
+
+    if (inspection.kind === "invalid-markdown") {
+      ctx.ui.notify(`Only task folders or RALPH.md can be stopped directly. ${displayPath(ctx.cwd, inspection.path)} is not stoppable.`, "error");
+      return undefined;
+    }
+    if (inspection.kind === "invalid-target") {
+      ctx.ui.notify(`Only task folders or RALPH.md can be stopped directly. ${displayPath(ctx.cwd, inspection.path)} is a file, not a task folder.`, "error");
+      return undefined;
+    }
+    if (inspection.kind === "dir-without-ralph" || inspection.kind === "missing-path") {
+      ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, inspection.dirPath)}.`, "warning");
+      return { kind: "not-found" };
+    }
+
+    ctx.ui.notify(`${commandName} expects a task folder or RALPH.md path.`, "error");
+    return undefined;
+  }
+
+  if (sessionTarget) {
+    return { kind: "resolved", taskDir: sessionTarget.taskDir };
+  }
+
+  const activeEntries = activeRegistryEntries();
+  if (activeEntries.length === 0) {
+    ctx.ui.notify(
+      allowCompletedRuns
+        ? `No ralph run data found. Specify a task path with ${commandName} <path>.`
+        : "No active ralph loops found.",
+      "warning",
+    );
+    return { kind: "not-found" };
+  }
+
+  if (activeEntries.length > 1) {
+    ctx.ui.notify(
+      `Multiple active ralph loops found. Use ${commandName} <task folder or RALPH.md> for an explicit target path.`,
+      "error",
+    );
+    return undefined;
+  }
+
+  return { kind: "resolved", taskDir: activeEntries[0].taskDir };
+}
+
 type ToolEvent = {
   toolName?: string;
   toolCallId?: string;
@@ -1600,77 +1700,14 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
-      const now = new Date().toISOString();
-      const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
-      const { target: sessionTarget, persistedSessionState } = resolveSessionStopTarget(ctx, now);
+      const result = resolveRalphTarget(ctx, {
+        commandName: "/ralph-cancel",
+        explicitPath: parsed.value || undefined,
+        checkCrossProcess: true,
+      });
+      if (!result || result.kind === "not-found") return;
 
-      let resolvedTaskDir: string | undefined;
-
-      if (sessionTarget && !parsed.value) {
-        resolvedTaskDir = sessionTarget.taskDir;
-      } else if (parsed.value) {
-        const inspection = inspectExistingTarget(parsed.value, ctx.cwd, true);
-        if (inspection.kind === "run") {
-          resolvedTaskDir = dirname(inspection.ralphPath);
-        } else if (inspection.kind === "dir-without-ralph" || inspection.kind === "missing-path") {
-          ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, inspection.kind === "missing-path" ? inspection.dirPath : inspection.dirPath)}.`, "warning");
-          return;
-        } else {
-          ctx.ui.notify("/ralph-cancel expects a task folder or RALPH.md path.", "error");
-          return;
-        }
-
-        // Check registry for explicit path
-        if (resolvedTaskDir) {
-          const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === resolvedTaskDir);
-          if (registryTarget) {
-            resolvedTaskDir = registryTarget.taskDir;
-          }
-        }
-
-        // Also check status file for cross-process
-        if (resolvedTaskDir) {
-          const statusFile = readStatusFile(resolvedTaskDir);
-          if (
-            statusFile &&
-            (statusFile.status === "running" || statusFile.status === "initializing") &&
-            typeof statusFile.cwd === "string" &&
-            statusFile.cwd.length > 0
-          ) {
-            const statusRegistryTarget = listActiveLoopRegistryEntries(statusFile.cwd).find(
-              (entry) => entry.taskDir === resolvedTaskDir && entry.loopToken === statusFile.loopToken,
-            );
-            if (statusRegistryTarget) {
-              resolvedTaskDir = statusRegistryTarget.taskDir;
-            }
-          }
-        }
-
-        if (!resolvedTaskDir) {
-          ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, parsed.value)}.`, "warning");
-          return;
-        }
-      } else if (sessionTarget) {
-        resolvedTaskDir = sessionTarget.taskDir;
-      } else {
-        const activeEntries = activeRegistryEntries();
-        if (activeEntries.length === 0) {
-          ctx.ui.notify("No active ralph loops found.", "warning");
-          return;
-        }
-        if (activeEntries.length > 1) {
-          ctx.ui.notify("Multiple active ralph loops found. Use /ralph-cancel <task folder or RALPH.md> for an explicit target path.", "error");
-          return;
-        }
-        resolvedTaskDir = activeEntries[0].taskDir;
-      }
-
-      if (!resolvedTaskDir) {
-        ctx.ui.notify("Could not resolve a target ralph loop to cancel.", "error");
-        return;
-      }
-
-      createCancelSignal(resolvedTaskDir);
+      createCancelSignal(result.taskDir);
       ctx.ui.notify("Cancel requested. The active iteration will be terminated immediately.", "warning");
     },
   });
@@ -1725,41 +1762,13 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
-      let taskDir: string | undefined;
-
-      if (parsed.path) {
-        const inspection = inspectExistingTarget(parsed.path, ctx.cwd, true);
-        if (inspection.kind === "run") {
-          taskDir = dirname(inspection.ralphPath);
-        } else {
-          // Try as a directory that had a run
-          taskDir = resolve(ctx.cwd, parsed.path);
-          if (!existsSync(join(taskDir, ".ralph-runner"))) {
-            ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, taskDir)}.`, "error");
-            return;
-          }
-        }
-      }
-
-      if (!taskDir) {
-        // Try session target
-        const now = new Date().toISOString();
-        const { target: sessionTarget } = resolveSessionStopTarget(ctx, now);
-        if (sessionTarget) {
-          taskDir = sessionTarget.taskDir;
-        } else {
-          const activeEntries = listActiveLoopRegistryEntries(ctx.cwd);
-          if (activeEntries.length === 1) {
-            taskDir = activeEntries[0].taskDir;
-          } else if (activeEntries.length > 1) {
-            ctx.ui.notify("Multiple active ralph loops found. Use /ralph-logs <task folder>.", "error");
-            return;
-          } else {
-            ctx.ui.notify("No ralph run data found. Specify a task path with /ralph-logs <path>.", "error");
-            return;
-          }
-        }
-      }
+      const resolvedTarget = resolveRalphTarget(ctx, {
+        commandName: "/ralph-logs",
+        explicitPath: parsed.path,
+        allowCompletedRuns: true,
+      });
+      if (!resolvedTarget || resolvedTarget.kind === "not-found") return;
+      const taskDir = resolvedTarget.taskDir;
 
       // Resolve dest directory
       const destDir = parsed.dest
