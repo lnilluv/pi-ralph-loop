@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, SessionEntry, AgentEndEvent as PiAgentEndEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 import {
   buildMissionBrief,
   inspectExistingTarget,
@@ -91,34 +91,8 @@ const RALPH_RUNNER_MAX_ITERATIONS_ENV = "RALPH_RUNNER_MAX_ITERATIONS";
 const RALPH_RUNNER_NO_PROGRESS_STREAK_ENV = "RALPH_RUNNER_NO_PROGRESS_STREAK";
 const RALPH_RUNNER_GUARDRAILS_ENV = "RALPH_RUNNER_GUARDRAILS";
 
-type CommandUI = {
-  input(title: string, placeholder: string): Promise<string | undefined>;
-  select(title: string, options: string[]): Promise<string | undefined>;
-  editor(title: string, content: string): Promise<string | undefined>;
-  notify(message: string, level: "info" | "warning" | "error"): void;
-  setStatus(name: string, status?: string): void;
-};
-
-type CommandSessionEntry = {
-  type: string;
-  customType?: string;
-  data?: unknown;
-  message?: { role?: string; content?: Array<{ type: string; text?: string }> };
-};
-
-type CommandContext = {
-  cwd: string;
-  hasUI: boolean;
-  ui: CommandUI;
-  sessionManager: {
-    getEntries(): CommandSessionEntry[];
-    getSessionFile(): string | undefined;
-  };
-  newSession(): Promise<{ cancelled: boolean }>;
-  waitForIdle(): Promise<void>;
-  model?: StrengthenDraftRuntime["model"];
-  modelRegistry?: StrengthenDraftRuntime["modelRegistry"];
-};
+type CommandContext = ExtensionCommandContext;
+type CommandSessionEntry = SessionEntry;
 
 type DraftPlanFactory = (
   task: string,
@@ -156,15 +130,9 @@ type ToolEvent = {
   success?: boolean;
 };
 
-type AgentEndEvent = {
-  messages?: CommandSessionEntry[];
-  error?: unknown;
-};
+type AgentEndEvent = PiAgentEndEvent;
 
-type ToolResultEvent = {
-  toolName?: string;
-  content: Array<{ type: string; text?: string }>;
-};
+type ToolResultEvent = PiToolResultEvent;
 
 type BeforeAgentStartEvent = {
   systemPrompt: string;
@@ -250,7 +218,7 @@ type ProgressAssessment = {
 };
 
 type IterationCompletion = {
-  messages: CommandSessionEntry[];
+  messages: PiAgentEndEvent["messages"];
   observedTaskDirWrites: Set<string>;
   error?: Error;
 };
@@ -1031,7 +999,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     const pending = pendingIterations.get(pendingKey);
     if (!pending) return;
     pendingIterations.delete(pendingKey);
-    const error = event.error instanceof Error ? event.error : event.error ? new Error(String(event.error)) : undefined;
+    const rawError = (event as { error?: unknown }).error;
+    const error = rawError instanceof Error ? rawError : rawError ? new Error(String(rawError)) : undefined;
     pending.completion.resolve({
       messages: event.messages ?? [],
       observedTaskDirWrites: new Set(pending.observedTaskDirWrites),
