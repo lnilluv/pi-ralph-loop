@@ -957,6 +957,32 @@ function applyStopTarget(
 let loopState: LoopState = defaultLoopState();
 const RALPH_EXTENSION_REGISTERED = Symbol.for("pi-ralph-loop.registered");
 
+function scaffoldRalphTemplate(): string {
+  return `---
+max_iterations: 10
+timeout: 120
+commands: []
+---
+# {{ task.name }}
+
+Describe the task here.
+
+## Evidence
+Use {{ commands.* }} outputs as evidence.
+
+## Completion
+Stop with <promise>DONE</promise> when finished.
+`;
+}
+
+function slugifyTaskName(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 export default function (pi: ExtensionAPI, services: RegisterRalphCommandServices = {}) {
   const registeredPi = pi as ExtensionAPI & Record<symbol, boolean | undefined>;
   if (registeredPi[RALPH_EXTENSION_REGISTERED]) return;
@@ -1571,6 +1597,47 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
       createCancelSignal(resolvedTaskDir);
       ctx.ui.notify("Cancel requested. The active iteration will be terminated immediately.", "warning");
+    },
+  });
+
+  pi.registerCommand("ralph-scaffold", {
+    description: "Create a non-interactive RALPH.md starter template",
+    handler: async (args: string, ctx: CommandContext) => {
+      const name = (args ?? "").trim();
+      if (!name) {
+        ctx.ui.notify("/ralph-scaffold expects a task name or path.", "error");
+        return;
+      }
+
+      let taskDir: string;
+      let ralphPath: string;
+
+      if (name.includes("/") || name.startsWith("./")) {
+        ralphPath = resolve(ctx.cwd, name.endsWith("/RALPH.md") ? name : join(name, "RALPH.md"));
+        taskDir = dirname(ralphPath);
+      } else {
+        const slug = slugifyTaskName(name);
+        if (!slug) {
+          ctx.ui.notify(`Cannot slugify "${name}" into a valid directory name.`, "error");
+          return;
+        }
+        taskDir = join(ctx.cwd, slug);
+        ralphPath = join(taskDir, "RALPH.md");
+      }
+
+      if (existsSync(ralphPath)) {
+        ctx.ui.notify(`RALPH.md already exists at ${displayPath(ctx.cwd, ralphPath)}. Not overwriting.`, "error");
+        return;
+      }
+
+      if (existsSync(taskDir) && readdirSync(taskDir).length > 0) {
+        ctx.ui.notify(`Directory ${displayPath(ctx.cwd, taskDir)} already exists and is not empty. Not overwriting.`, "error");
+        return;
+      }
+
+      mkdirSync(taskDir, { recursive: true });
+      writeFileSync(ralphPath, scaffoldRalphTemplate(), "utf8");
+      ctx.ui.notify(`Scaffolded ${displayPath(ctx.cwd, ralphPath)}`, "info");
     },
   });
 }
