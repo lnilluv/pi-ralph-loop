@@ -34,6 +34,9 @@ export type RpcSubprocessConfig = {
   thinkingLevel?: string;
   /** Callback for observing events as they stream */
   onEvent?: (event: RpcEvent) => void;
+  /** AbortSignal for cooperative cancellation. On abort, the direct child process is SIGKILLed.
+   *  Grandchild processes may survive — the caller is responsible for process group cleanup
+   *  if full-tree termination is required. */
   signal?: AbortSignal;
 };
 

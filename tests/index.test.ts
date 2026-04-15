@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -592,6 +592,18 @@ test("/ralph-cancel writes the cancel flag from persisted active loop state afte
     guardrails: { blockCommands: [], protectedFiles: [] },
     stopRequested: false,
   };
+  writeStatusFile(taskDir, {
+    loopToken: persistedState.loopToken,
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 3,
+    maxIterations: 5,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
   const notifications: Array<{ message: string; level: string }> = [];
   const harness = createHarness();
   const handler = harness.handler("ralph-cancel");
@@ -622,6 +634,113 @@ test("/ralph-cancel writes the cancel flag from persisted active loop state afte
   assert.equal(existsSync(join(taskDir, ".ralph-runner", "stop.flag")), false);
   assert.ok(notifications.some(({ message }) => message.includes("Cancel requested. The active iteration will be terminated immediately.")));
   assert.equal(notifications.some(({ message }) => message.includes("No active ralph loop")), false);
+});
+
+test("/ralph-cancel refuses when the loop already finished", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "finished-loop-task");
+  mkdirSync(taskDir, { recursive: true });
+  writeStatusFile(taskDir, {
+    loopToken: "finished-loop-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "complete",
+    currentIteration: 3,
+    maxIterations: 5,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-cancel");
+  let ctx: any;
+  ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: createSessionManager([
+      {
+        type: "custom",
+        customType: "ralph-loop-state",
+        data: {
+          active: true,
+          loopToken: "finished-loop-token",
+          cwd,
+          taskDir,
+          iteration: 3,
+          maxIterations: 5,
+          noProgressStreak: 0,
+          iterationSummaries: [],
+          guardrails: { blockCommands: [], protectedFiles: [] },
+          stopRequested: false,
+        },
+      },
+    ], "session-a"),
+    getRuntimeCtx: () => ctx,
+  };
+
+  await handler("", ctx);
+
+  assert.equal(existsSync(join(taskDir, ".ralph-runner", "cancel.flag")), false);
+  assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("The loop already ended with status: complete.")));
+});
+
+test("/ralph-cancel refuses when no status.json exists", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "missing-status-task");
+  mkdirSync(taskDir, { recursive: true });
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-cancel");
+  let ctx: any;
+  ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: createSessionManager([
+      {
+        type: "custom",
+        customType: "ralph-loop-state",
+        data: {
+          active: true,
+          loopToken: "missing-status-loop-token",
+          cwd,
+          taskDir,
+          iteration: 3,
+          maxIterations: 5,
+          noProgressStreak: 0,
+          iterationSummaries: [],
+          guardrails: { blockCommands: [], protectedFiles: [] },
+          stopRequested: false,
+        },
+      },
+    ], "session-a"),
+    getRuntimeCtx: () => ctx,
+  };
+
+  await handler("", ctx);
+
+  assert.equal(existsSync(join(taskDir, ".ralph-runner", "cancel.flag")), false);
+  assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("No run data exists.")));
 });
 
 test("/ralph-scaffold creates a parseable scaffold from a task name", async (t) => {
@@ -678,6 +797,35 @@ test("/ralph-scaffold accepts path-style arguments", async (t) => {
   await handler("feature/new-task", ctx);
 
   assert.equal(existsSync(join(cwd, "feature", "new-task", "RALPH.md")), true);
+});
+
+test("/ralph-scaffold rejects paths outside the current working directory", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const escapedTaskDir = join(cwd, "..", "escape");
+  t.after(() => rmSync(escapedTaskDir, { recursive: true, force: true }));
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-scaffold");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("../escape", ctx);
+
+  assert.equal(existsSync(join(escapedTaskDir, "RALPH.md")), false);
+  assert.deepEqual(notifications, [{ message: "Task path must be within the current working directory.", level: "error" }]);
 });
 
 test("/ralph-scaffold refuses to overwrite an existing RALPH.md", async (t) => {
@@ -844,6 +992,42 @@ test("/ralph-logs excludes runtime control files", async (t) => {
   assert.equal(existsSync(join(exportedDir, "stop.flag")), false);
   assert.equal(existsSync(join(exportedDir, "cancel.flag")), false);
   assert.equal(existsSync(join(exportedDir, "active-loops")), false);
+});
+
+test("/ralph-logs skips symlinked transcript entries", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner", "transcripts"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "iterations.jsonl"), "{\"iteration\":1}\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "events.jsonl"), "{\"event\":1}\n", "utf8");
+  writeFileSync(join(taskDir, "secret.txt"), "top secret", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "good.txt"), "good", "utf8");
+  symlinkSync(join(taskDir, "secret.txt"), join(taskDir, ".ralph-runner", "transcripts", "leak.txt"));
+
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: () => undefined,
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest exported", ctx);
+
+  const exportedDir = join(cwd, "exported");
+  assert.equal(existsSync(join(exportedDir, "transcripts", "good.txt")), true);
+  assert.equal(existsSync(join(exportedDir, "transcripts", "leak.txt")), false);
 });
 
 test("/ralph reverse engineer this app with an injected llm-strengthened draft still shows review before start", async (t) => {

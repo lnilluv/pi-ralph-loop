@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, SessionEntry, AgentEndEvent as PiAgentEndEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 import {
@@ -844,8 +844,8 @@ function exportRalphLogs(taskDir: string, destDir: string): { iterations: number
     for (const entry of readdirSync(transcriptsDir)) {
       const srcPath = join(transcriptsDir, entry);
       try {
-        const stat = statSync(srcPath);
-        if (stat.isFile()) {
+        const stat = lstatSync(srcPath);
+        if (stat.isFile() && !stat.isSymbolicLink()) {
           copyFileSync(srcPath, join(destTranscripts, entry));
           transcripts++;
         }
@@ -1707,6 +1707,30 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       });
       if (!result || result.kind === "not-found") return;
 
+      const statusPath = join(result.taskDir, ".ralph-runner", "status.json");
+      if (!existsSync(statusPath)) {
+        ctx.ui.notify(`No active loop found at ${displayPath(ctx.cwd, result.taskDir)}. No run data exists.`, "warning");
+        return;
+      }
+
+      const statusFile = readStatusFile(result.taskDir);
+      const finishedStatuses = new Set([
+        "complete",
+        "max-iterations",
+        "no-progress-exhaustion",
+        "stopped",
+        "timeout",
+        "error",
+        "cancelled",
+      ]);
+      if (statusFile?.status && finishedStatuses.has(statusFile.status)) {
+        ctx.ui.notify(
+          `No active loop found at ${displayPath(ctx.cwd, result.taskDir)}. The loop already ended with status: ${statusFile.status}.`,
+          "warning",
+        );
+        return;
+      }
+
       createCancelSignal(result.taskDir);
       ctx.ui.notify("Cancel requested. The active iteration will be terminated immediately.", "warning");
     },
@@ -1735,6 +1759,13 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         }
         taskDir = join(ctx.cwd, slug);
         ralphPath = join(taskDir, "RALPH.md");
+      }
+
+      const resolvedTaskDir = resolve(taskDir);
+      const resolvedCwd = resolve(ctx.cwd);
+      if (!resolvedTaskDir.startsWith(resolvedCwd + "/") && resolvedTaskDir !== resolvedCwd) {
+        ctx.ui.notify("Task path must be within the current working directory.", "error");
+        return;
       }
 
       if (existsSync(ralphPath)) {
