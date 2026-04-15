@@ -11,9 +11,12 @@ import {
   type RunnerStatusFile,
   appendIterationRecord,
   appendRunnerEvent,
+  checkCancelSignal,
   checkStopSignal,
+  clearCancelSignal,
   clearRunnerDir,
   clearStopSignal,
+  createCancelSignal,
   createStopSignal,
   ensureRunnerDir,
   listActiveLoopRegistryEntries,
@@ -283,6 +286,31 @@ test("clearStopSignal is idempotent when no signal exists", () => {
     clearStopSignal(taskDir);
     clearStopSignal(taskDir);
     assert.equal(checkStopSignal(taskDir), false);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("createCancelSignal writes cancel.flag and checkCancelSignal detects it", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    assert.equal(checkCancelSignal(taskDir), false);
+    createCancelSignal(taskDir);
+    assert.equal(checkCancelSignal(taskDir), true);
+    clearCancelSignal(taskDir);
+    assert.equal(checkCancelSignal(taskDir), false);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("clearCancelSignal is safe when cancel.flag does not exist", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    clearCancelSignal(taskDir); // should not throw
+    assert.equal(checkCancelSignal(taskDir), false);
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
