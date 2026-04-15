@@ -18,6 +18,3 @@ declare module "node:path" {
   export function basename(path: string): string;
 }
 
-declare module "@mariozechner/pi-coding-agent" {
-  export type ExtensionAPI = any;
-}

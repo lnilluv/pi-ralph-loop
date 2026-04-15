@@ -1,140 +1,78 @@
-# pi-ralph // CURRENTLY IN FULL RE-WORK
+# pi-ralph
+Autonomous coding loops for pi with task folders, editable drafts, durable state, and per-iteration supervision.
 
-Autonomous coding loops for pi with mid-turn supervision.
+## Why use it
+- Keep work in a task folder instead of a single chat turn.
+- Re-run commands each iteration and feed the output back into the prompt.
+- Keep short rolling memory in `RALPH_PROGRESS.md`.
+- Store durable loop state in `.ralph-runner/`.
+- Draft from plain language, then review before starting.
 
 ## Install
-
 ```bash
 pi install npm:@lnilluv/pi-ralph-loop
 ```
 
 ## Quick start
+1. Create `work/RALPH.md`.
+2. Run `/ralph --path work --arg owner="Ada Lovelace"`.
+3. If you want a draft first, use `/ralph-draft fix flaky auth tests`.
 
+## Concise `RALPH.md`
 ```md
-# my-task/RALPH.md
 ---
+args:
+  - owner
 commands:
   - name: tests
-    run: npm test -- --runInBand
+    run: npm test
     timeout: 60
----
-Fix failing tests using this output:
-
-{{ commands.tests }}
-```
-
-Run `/ralph my-task` in pi.
-
-## How it works
-
-On each iteration, pi-ralph reads `RALPH.md`, runs the configured commands, injects their output into the prompt through `{{ commands.<name> }}` placeholders, starts a fresh session, sends the prompt, and waits for completion. Failed test output appears in the next iteration, which creates a self-healing loop.
-
-## RALPH.md format
-
-```md
----
-commands:
-  - name: tests
-    run: npm test -- --runInBand
-    timeout: 90
-  - name: lint
-    run: npm run lint
+  - name: verify
+    run: ./scripts/verify.sh
     timeout: 60
 max_iterations: 25
 timeout: 300
-completion_promise: "DONE"
-guardrails:
-  block_commands:
-    - "rm\\s+-rf\\s+/"
-    - "git\\s+push"
-  protected_files:
-    - ".env*"
-    - "**/secrets/**"
+completion_promise: DONE
 ---
-You are fixing flaky tests in the auth module.
+Fix the failing auth tests for {{ args.owner }}.
 
-<!-- This comment is stripped before sending to the agent -->
-
-Latest test output:
-{{ commands.tests }}
-
-Latest lint output:
-{{ commands.lint }}
-
-Iteration {{ ralph.iteration }} of {{ ralph.name }}.
-Apply the smallest safe fix and explain why it works.
+Use {{ commands.tests }} and {{ commands.verify }} as evidence.
+Stop with <promise>DONE</promise> only when the gate passes.
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `commands` | array | `[]` | Commands to run each iteration |
-| `commands[].name` | string | required | Key for `{{ commands.<name> }}` |
-| `commands[].run` | string | required | Shell command |
-| `commands[].timeout` | number | `60` | Seconds before kill |
-| `max_iterations` | number | `50` | Stop after N iterations |
-| `timeout` | number | `300` | Per-iteration timeout in seconds; stops the loop if the agent is stuck |
-| `completion_promise` | string | — | Agent signals completion by sending `<promise>DONE</promise>`; loop breaks on match |
-| `guardrails.block_commands` | string[] | `[]` | Regex patterns to block in bash |
-| `guardrails.protected_files` | string[] | `[]` | Glob patterns to block writes |
-
-### Placeholders
-
-| Placeholder | Description |
-|-------------|-------------|
-| `{{ commands.<name> }}` | Output from the named command |
-| `{{ ralph.iteration }}` | Current 1-based iteration number |
-| `{{ ralph.name }}` | Directory name containing the RALPH.md |
-
-HTML comments (`<!-- ... -->`) are stripped from the prompt body after placeholder resolution, so you can annotate your RALPH.md freely.
+## Key features
+- `/ralph` runs an existing task folder or `RALPH.md`, or drafts a new loop from plain language.
+- `/ralph-draft` saves the draft without starting the loop.
+- `/ralph-stop` writes a stop flag under `.ralph-runner/` so the loop exits after the current iteration.
+- Frontmatter can declare `args` and `{{ args.name }}` placeholders; `--arg name=value` fills them when you run an existing task folder with `/ralph --path`.
+- Commands that start with `./` run from the task directory, so checked-in helper scripts work.
+- `RALPH_PROGRESS.md` is injected as short rolling memory and excluded from progress snapshots.
+- The runner stores status, iteration records, events, transcripts, and stop signals in `.ralph-runner/`.
+- Completion gating only stops early when the promise is seen and the readiness checks pass; a clear no-progress result will not trigger early stop.
+- The loop can use a selected model and thinking level; if interactive draft strengthening has no authenticated model, it falls back to the deterministic draft path.
 
 ## Commands
+| Command | Use |
+|---|---|
+| `/ralph [path-or-task]` | Run an existing task folder or `RALPH.md`, or draft a new loop from a task description. |
+| `/ralph-draft [path-or-task]` | Draft or edit a loop without starting it. |
+| `/ralph-stop [path-or-task]` | Request a graceful stop after the current iteration. |
 
-- `/ralph <path>`: Start the loop from a `RALPH.md` file or directory.
-- `/ralph-stop`: Request a graceful stop after the current iteration.
+## Config reference
+| Field | Purpose |
+|---|---|
+| `commands` | Shell commands to run each iteration. |
+| `args` | Declared runtime parameters for `--arg`. |
+| `max_iterations` | Maximum iterations, from 1 to 50. |
+| `inter_iteration_delay` | Delay between iterations, in seconds. |
+| `timeout` | Per-iteration timeout, up to 300 seconds. |
+| `completion_promise` | Early-stop marker such as `DONE`. |
+| `required_outputs` | Files that must exist before early stop. |
+| `guardrails.block_commands` | Regexes blocked in bash commands. |
+| `guardrails.protected_files` | File globs protected from `write` and `edit`. |
+| Model selection | Use a selected model and optional thinking level; the runner applies it before the prompt. |
 
-## Pi-only features
-
-### Guardrails
-
-`guardrails.block_commands` and `guardrails.protected_files` come from RALPH frontmatter. The extension enforces them in the `tool_call` hook — but only for sessions created by the loop, so they don't leak into unrelated conversations. Matching bash commands are blocked, and writes/edits to protected file globs are denied.
-
-### Cross-iteration memory
-
-After each iteration, the extension stores a short summary with iteration number and duration. In `before_agent_start`, it injects that history into the system prompt so the next run can avoid repeating completed work.
-
-### Mid-turn steering
-
-In the `tool_result` hook, bash outputs are scanned for failure patterns. After three or more failures in the same iteration, the extension appends a stop-and-think warning to push root-cause analysis before another retry.
-
-### Completion promise
-
-When `completion_promise` is set (e.g., `"DONE"`), the loop scans the agent's messages for `<promise>DONE</promise>` after each iteration. If found, the loop stops early — the agent signals it's finished rather than relying solely on `max_iterations`.
-
-### Iteration timeout
-
-Each iteration has a configurable timeout (default 300 seconds). If the agent is stuck and doesn't become idle within the timeout, the loop stops with a warning. This prevents runaway iterations from running forever.
-
-### Input validation
-
-The extension validates `RALPH.md` frontmatter before starting and on each re-parse: `max_iterations` must be a positive integer, `timeout` must be positive, `block_commands` regexes must compile, and commands must have non-empty names and run strings with positive timeouts.
-
-## Comparison table
-
-| Feature | **@lnilluv/pi-ralph-loop** | pi-ralph | pi-ralph-wiggum | ralphi | ralphify |
-|---------|------------------------|----------------------|-----------------|--------|----------|
-| Command output injection | ✓ | ✗ | ✗ | ✗ | ✓ |
-| Fresh-context sessions | ✓ | ✓ | ✗ | ✓ | ✓ |
-| Mid-turn guardrails | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Cross-iteration memory | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Mid-turn steering | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Live prompt editing | ✓ | ✗ | ✗ | ✗ | ✓ |
-| Completion promise | ✓ | ✗ | ✗ | ✗ | ✓ |
-| Iteration timeout | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Session-scoped hooks | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Input validation | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Setup required | RALPH.md | config | RALPH.md | PRD pipeline | RALPH.md |
+Advanced behavior, validation, and edge cases live in `src/runner.ts`, `src/runner-state.ts`, `src/runner-rpc.ts`, `src/ralph.ts`, and `tests/`.
 
 ## License
-
 MIT
-# CI provenance test
