@@ -1425,3 +1425,128 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     rmSync(taskDir, { recursive: true, force: true });
   }
 });
+
+test("runRalphLoop stops on error when stopOnError is true (default)", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 3 }));
+
+    const scriptPath = join(taskDir, "failing-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+exit 1
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 3,
+      stopOnError: true,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "error");
+    assert.equal(result.iterations.length, 1);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop continues past error when stopOnError is false", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 3 }));
+
+    const scriptPath = join(taskDir, "maybe-fail-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+COUNTER_FILE="${taskDir}/.call-counter"
+COUNT=0
+if [ -f "$COUNTER_FILE" ]; then
+  COUNT=$(cat "$COUNTER_FILE")
+fi
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$COUNTER_FILE"
+echo '{"type":"response","command":"prompt","success":true}'
+if [ "$COUNT" -le 1 ]; then
+  exit 1
+fi
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 3,
+      stopOnError: false,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.ok(result.iterations.length > 1, `Expected >1 iteration, got ${result.iterations.length}`);
+    assert.equal(result.iterations[0].status, "error");
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop breaks on structural failure even with stopOnError false", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 3, stop_on_error: false }));
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"delete ralph"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    let iterationCount = 0;
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 3,
+      stopOnError: false,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      onIterationComplete() {
+        iterationCount++;
+        if (iterationCount >= 1) {
+          rmSync(ralphPath, { force: true });
+        }
+      },
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "error");
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
