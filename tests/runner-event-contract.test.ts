@@ -36,7 +36,7 @@ type ExpectedRunnerEvent =
       timestamp: string;
       iteration: number;
       loopToken: string;
-      status: "complete" | "timeout" | "error";
+      status: "complete" | "timeout" | "error" | "cancelled";
       progress: ProgressState;
       changedFiles: string[];
       noProgressStreak: number;

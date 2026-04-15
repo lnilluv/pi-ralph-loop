@@ -33,7 +33,7 @@ export type Guardrails = {
 
 export type IterationRecord = {
   iteration: number;
-  status: "running" | "complete" | "timeout" | "error";
+  status: "running" | "complete" | "timeout" | "error" | "cancelled";
   startedAt: string;
   completedAt?: string;
   durationMs?: number;
@@ -146,7 +146,7 @@ export type IterationCompletedEvent = {
   timestamp: string;
   iteration: number;
   loopToken: string;
-  status: "complete" | "timeout" | "error";
+  status: "complete" | "timeout" | "error" | "cancelled";
   progress: ProgressState;
   changedFiles: string[];
   noProgressStreak: number;
@@ -329,7 +329,7 @@ function isCompletionGate(value: unknown): value is { ready: boolean; reasons: s
 }
 
 function isIterationCompletedStatus(value: unknown): value is IterationRecord["status"] {
-  return value === "complete" || value === "timeout" || value === "error";
+  return value === "complete" || value === "timeout" || value === "error" || value === "cancelled";
 }
 
 function isRunnerEvent(value: unknown): value is RunnerEvent {
