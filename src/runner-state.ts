@@ -33,7 +33,7 @@ export type Guardrails = {
 
 export type IterationRecord = {
   iteration: number;
-  status: "running" | "complete" | "timeout" | "error";
+  status: "running" | "complete" | "timeout" | "error" | "cancelled";
   startedAt: string;
   completedAt?: string;
   durationMs?: number;
@@ -146,7 +146,7 @@ export type IterationCompletedEvent = {
   timestamp: string;
   iteration: number;
   loopToken: string;
-  status: "complete" | "timeout" | "error";
+  status: "complete" | "timeout" | "error" | "cancelled";
   progress: ProgressState;
   changedFiles: string[];
   noProgressStreak: number;
@@ -230,6 +230,7 @@ const STATUS_FILE = "status.json";
 const ITERATIONS_FILE = "iterations.jsonl";
 const EVENTS_FILE = "events.jsonl";
 const STOP_FLAG_FILE = "stop.flag";
+const CANCEL_FLAG_FILE = "cancel.flag";
 const ACTIVE_LOOP_REGISTRY_DIR = "active-loops";
 const ACTIVE_LOOP_REGISTRY_LEGACY_FILE = "active-loops.json";
 const ACTIVE_LOOP_REGISTRY_FILE_EXTENSION = ".json";
@@ -328,7 +329,7 @@ function isCompletionGate(value: unknown): value is { ready: boolean; reasons: s
 }
 
 function isIterationCompletedStatus(value: unknown): value is IterationRecord["status"] {
-  return value === "complete" || value === "timeout" || value === "error";
+  return value === "complete" || value === "timeout" || value === "error" || value === "cancelled";
 }
 
 function isRunnerEvent(value: unknown): value is RunnerEvent {
@@ -605,6 +606,22 @@ export function checkStopSignal(taskDir: string): boolean {
 
 export function clearStopSignal(taskDir: string): void {
   const filePath = join(runnerDir(taskDir), STOP_FLAG_FILE);
+  if (existsSync(filePath)) {
+    rmSync(filePath, { force: true });
+  }
+}
+
+export function createCancelSignal(taskDir: string): void {
+  const dir = ensureRunnerDir(taskDir);
+  writeFileSync(join(dir, CANCEL_FLAG_FILE), "", "utf8");
+}
+
+export function checkCancelSignal(taskDir: string): boolean {
+  return existsSync(join(runnerDir(taskDir), CANCEL_FLAG_FILE));
+}
+
+export function clearCancelSignal(taskDir: string): void {
+  const filePath = join(runnerDir(taskDir), CANCEL_FLAG_FILE);
   if (existsSync(filePath)) {
     rmSync(filePath, { force: true });
   }

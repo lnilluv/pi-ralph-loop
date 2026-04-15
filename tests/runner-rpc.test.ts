@@ -356,3 +356,91 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+
+test("runRpcIteration cancels on AbortSignal and returns cancelled=true", async () => {
+  const taskDir = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const scriptPath = join(taskDir, "slow-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+sleep 30
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 500);
+
+    const result = await runRpcIteration({
+      prompt: "do something",
+      cwd: taskDir,
+      timeoutMs: 60_000,
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      signal: controller.signal,
+    });
+
+    assert.equal(result.cancelled, true);
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.error, "cancelled");
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration returns immediately if AbortSignal is already aborted", async () => {
+  const taskDir = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await runRpcIteration({
+      prompt: "do something",
+      cwd: taskDir,
+      timeoutMs: 5_000,
+      spawnCommand: "echo",
+      spawnArgs: ["mock"],
+      signal: controller.signal,
+    });
+
+    assert.equal(result.cancelled, true);
+    assert.equal(result.success, false);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration completes normally without AbortSignal", async () => {
+  const taskDir = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const scriptPath = join(taskDir, "fast-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRpcIteration({
+      prompt: "do something",
+      cwd: taskDir,
+      timeoutMs: 5_000,
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.cancelled, undefined);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
