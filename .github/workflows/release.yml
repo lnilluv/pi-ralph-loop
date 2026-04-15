@@ -71,54 +71,23 @@ jobs:
           fi
 
           branch="${GITHUB_REF_NAME}"
-          current_version="$(node -p "require('./package.json').version")"
-          new_version="$(node - "$current_version" "$branch" "$bump" <<'NODE'
-          const [current, branch, bump] = process.argv.slice(2);
-          const match = current.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
-          if (!match) throw new Error(`Unsupported version: ${current}`);
-
-          let major = Number(match[1]);
-          let minor = Number(match[2]);
-          let patch = Number(match[3]);
-          const prerelease = match[4];
-
-          if (branch === 'dev') {
-            if (prerelease && prerelease.startsWith('dev.')) {
-              const currentN = Number(prerelease.split('.')[1] ?? '0');
-              process.stdout.write(`${major}.${minor}.${patch}-dev.${currentN + 1}`);
-            } else {
-              if (bump === 'major') { major += 1; minor = 0; patch = 0; }
-              else if (bump === 'minor') { minor += 1; patch = 0; }
-              else { patch += 1; }
-              process.stdout.write(`${major}.${minor}.${patch}-dev.0`);
-            }
-          } else {
-            if (bump === 'major') { major += 1; minor = 0; patch = 0; }
-            else if (bump === 'minor') { minor += 1; patch = 0; }
-            else { patch += 1; }
-            process.stdout.write(`${major}.${minor}.${patch}`);
-          }
-          NODE
-          )"
+          npm_versions="$(npm view @lnilluv/pi-ralph-loop versions --json)"
+          git_tags="$(git tag --list)"
+          new_version="$(node --experimental-strip-types ./scripts/version-helper.ts "$branch" "$bump" "$npm_versions" "$git_tags")"
 
           echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "bump=$bump" >> "$GITHUB_OUTPUT"
           echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
 
-      - name: Bump version (main)
-        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main'
-        run: npm version ${{ steps.bump.outputs.bump }} --no-git-tag-version
-
-      - name: Bump version (dev)
-        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev'
-        run: npm version prerelease --preid dev --no-git-tag-version
+      - name: Bump version
+        if: steps.bump.outputs.should_release == 'true'
+        run: npm version ${{ steps.bump.outputs.new_version }} --no-git-tag-version
 
       - name: Capture version tag
         if: steps.bump.outputs.should_release == 'true'
         id: version
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${{ steps.bump.outputs.new_version }}" >> "$GITHUB_OUTPUT"
 
       - name: Publish (main)
         if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main'
@@ -133,7 +102,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          VERSION=$(node -p "require('./package.json').version")
+          VERSION="${{ steps.bump.outputs.new_version }}"
           git add package.json package-lock.json
           git commit -m "chore(release): v${VERSION}"
           git tag "v${VERSION}"
