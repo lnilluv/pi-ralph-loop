@@ -17,6 +17,7 @@ export type Frontmatter = {
   timeout: number;
   completionPromise?: string;
   requiredOutputs?: string[];
+  stopOnError: boolean;
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
   invalidCommandEntries?: number[];
   invalidArgEntries?: number[];
@@ -483,7 +484,7 @@ function escapeHtmlCommentMarkers(text: string): string {
 }
 
 export function defaultFrontmatter(): Frontmatter {
-  return { commands: [], maxIterations: 50, interIterationDelay: 0, timeout: 300, requiredOutputs: [], guardrails: { blockCommands: [], protectedFiles: [] } };
+  return { commands: [], maxIterations: 50, interIterationDelay: 0, timeout: 300, requiredOutputs: [], stopOnError: true, guardrails: { blockCommands: [], protectedFiles: [] } };
 }
 
 export function parseRalphMarkdown(raw: string): ParsedRalph {
@@ -514,6 +515,7 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
       completionPromise:
         typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
       requiredOutputs: toStringArray(yaml.required_outputs),
+      stopOnError: yaml.stop_on_error === false ? false : true,
       guardrails: {
         blockCommands: toStringArray(guardrails.block_commands),
         protectedFiles: toStringArray(guardrails.protected_files),
@@ -557,6 +559,9 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
       return "Invalid args: names must be unique";
     }
     seenArgNames.add(arg);
+  }
+  if (typeof fm.stopOnError !== "boolean") {
+    return "Invalid stop_on_error: must be true or false";
   }
   for (const output of fm.requiredOutputs ?? []) {
     const requiredOutputError = validateRequiredOutputEntry(output);
@@ -1137,6 +1142,7 @@ function buildDraftFrontmatter(mode: DraftMode, commands: CommandDef[]): Frontma
     interIterationDelay: 0,
     timeout: 300,
     requiredOutputs: [],
+    stopOnError: true,
     guardrails,
   };
 }
@@ -1177,6 +1183,7 @@ function renderDraftPlan(task: string, mode: DraftMode, target: DraftTarget, fro
     `max_iterations: ${frontmatter.maxIterations}`,
     `inter_iteration_delay: ${frontmatter.interIterationDelay}`,
     `timeout: ${frontmatter.timeout}`,
+    ...(frontmatter.stopOnError === false ? ["stop_on_error: false"] : []),
     ...(requiredOutputs.length > 0
       ? ["required_outputs:", ...requiredOutputs.map((output) => `  - ${yamlQuote(output)}`)]
       : []),

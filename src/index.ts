@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, SessionEntry, AgentEndEvent as PiAgentEndEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 import {
@@ -30,6 +30,8 @@ import { runRalphLoop } from "./runner.ts";
 import {
   checkStopSignal,
   createStopSignal,
+  createCancelSignal,
+  checkCancelSignal,
   listActiveLoopRegistryEntries,
   readActiveLoopRegistry,
   readIterationRecords,
@@ -118,6 +120,106 @@ type StopTarget = {
   startedAt: string;
   source: StopTargetSource;
 };
+
+type ResolveRalphTargetResult =
+  | { kind: "resolved"; taskDir: string }
+  | { kind: "not-found" };
+
+function resolveRalphTarget(
+  ctx: Pick<CommandContext, "cwd" | "sessionManager" | "ui">,
+  options: {
+    commandName: string;
+    explicitPath?: string;
+    checkCrossProcess?: boolean;
+    allowCompletedRuns?: boolean;
+  },
+): ResolveRalphTargetResult | undefined {
+  const { commandName, explicitPath, checkCrossProcess = false, allowCompletedRuns = false } = options;
+  const now = new Date().toISOString();
+  const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
+  const { target: sessionTarget } = resolveSessionStopTarget(ctx, now);
+  const resolvedExplicitPath = explicitPath?.trim();
+
+  if (resolvedExplicitPath) {
+    const inspection = inspectExistingTarget(resolvedExplicitPath, ctx.cwd, true);
+    if (inspection.kind === "run") {
+      const taskDir = dirname(inspection.ralphPath);
+      if (checkCrossProcess) {
+        const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === taskDir);
+        if (registryTarget) {
+          return { kind: "resolved", taskDir: registryTarget.taskDir };
+        }
+
+        const statusFile = readStatusFile(taskDir);
+        if (
+          statusFile &&
+          (statusFile.status === "running" || statusFile.status === "initializing") &&
+          typeof statusFile.cwd === "string" &&
+          statusFile.cwd.length > 0
+        ) {
+          const statusRegistryTarget = listActiveLoopRegistryEntries(statusFile.cwd).find(
+            (entry) => entry.taskDir === taskDir && entry.loopToken === statusFile.loopToken,
+          );
+          if (statusRegistryTarget) {
+            return { kind: "resolved", taskDir: statusRegistryTarget.taskDir };
+          }
+        }
+      }
+
+      return { kind: "resolved", taskDir };
+    }
+
+    if (allowCompletedRuns) {
+      const taskDir = resolve(ctx.cwd, resolvedExplicitPath);
+      if (existsSync(join(taskDir, ".ralph-runner"))) {
+        return { kind: "resolved", taskDir };
+      }
+      ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, taskDir)}.`, "error");
+      return { kind: "not-found" };
+    }
+
+    if (inspection.kind === "invalid-markdown") {
+      ctx.ui.notify(`Only task folders or RALPH.md can be stopped directly. ${displayPath(ctx.cwd, inspection.path)} is not stoppable.`, "error");
+      return undefined;
+    }
+    if (inspection.kind === "invalid-target") {
+      ctx.ui.notify(`Only task folders or RALPH.md can be stopped directly. ${displayPath(ctx.cwd, inspection.path)} is a file, not a task folder.`, "error");
+      return undefined;
+    }
+    if (inspection.kind === "dir-without-ralph" || inspection.kind === "missing-path") {
+      ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, inspection.dirPath)}.`, "warning");
+      return { kind: "not-found" };
+    }
+
+    ctx.ui.notify(`${commandName} expects a task folder or RALPH.md path.`, "error");
+    return undefined;
+  }
+
+  if (sessionTarget) {
+    return { kind: "resolved", taskDir: sessionTarget.taskDir };
+  }
+
+  const activeEntries = activeRegistryEntries();
+  if (activeEntries.length === 0) {
+    ctx.ui.notify(
+      allowCompletedRuns
+        ? `No ralph run data found. Specify a task path with ${commandName} <path>.`
+        : "No active ralph loops found.",
+      "warning",
+    );
+    return { kind: "not-found" };
+  }
+
+  if (activeEntries.length > 1) {
+    ctx.ui.notify(
+      `Multiple active ralph loops found. Use ${commandName} <task folder or RALPH.md> for an explicit target path.`,
+      "error",
+    );
+    return undefined;
+  }
+
+  return { kind: "resolved", taskDir: activeEntries[0].taskDir };
+}
 
 type ToolEvent = {
   toolName?: string;
@@ -717,6 +819,81 @@ function displayPath(cwd: string, filePath: string): string {
   return rel && !rel.startsWith("..") ? `./${rel}` : filePath;
 }
 
+function exportRalphLogs(taskDir: string, destDir: string): { iterations: number; events: number; transcripts: number } {
+  const runnerDir = join(taskDir, ".ralph-runner");
+  if (!existsSync(runnerDir)) {
+    throw new Error(`No .ralph-runner directory found at ${taskDir}`);
+  }
+
+  mkdirSync(destDir, { recursive: true });
+
+  const filesToCopy = ["status.json", "iterations.jsonl", "events.jsonl"];
+  for (const file of filesToCopy) {
+    const src = join(runnerDir, file);
+    if (existsSync(src)) {
+      copyFileSync(src, join(destDir, file));
+    }
+  }
+
+  // Copy transcripts directory
+  const transcriptsDir = join(runnerDir, "transcripts");
+  let transcripts = 0;
+  if (existsSync(transcriptsDir)) {
+    const destTranscripts = join(destDir, "transcripts");
+    mkdirSync(destTranscripts, { recursive: true });
+    for (const entry of readdirSync(transcriptsDir)) {
+      const srcPath = join(transcriptsDir, entry);
+      try {
+        const stat = statSync(srcPath);
+        if (stat.isFile()) {
+          copyFileSync(srcPath, join(destTranscripts, entry));
+          transcripts++;
+        }
+      } catch {
+        // skip unreadable entries
+      }
+    }
+  }
+
+  // Count iterations and events
+  let iterations = 0;
+  let events = 0;
+  const iterPath = join(destDir, "iterations.jsonl");
+  if (existsSync(iterPath)) {
+    iterations = readFileSync(iterPath, "utf8").split("\n").filter((l) => l.trim()).length;
+  }
+  const evPath = join(destDir, "events.jsonl");
+  if (existsSync(evPath)) {
+    events = readFileSync(evPath, "utf8").split("\n").filter((l) => l.trim()).length;
+  }
+
+  return { iterations, events, transcripts };
+}
+
+export function parseLogExportArgs(raw: string): { path?: string; dest?: string; error?: string } {
+  const parts = raw.trim().split(/\s+/);
+  let path: string | undefined;
+  let dest: string | undefined;
+  let i = 0;
+  while (i < parts.length) {
+    if (parts[i] === "--dest" || parts[i] === "-d") {
+      if (i + 1 >= parts.length) return { error: "--dest requires a directory path" };
+      dest = parts[i + 1];
+      i += 2;
+    } else if (parts[i] === "--path" || parts[i] === "-p") {
+      if (i + 1 >= parts.length) return { error: "--path requires a task path" };
+      path = parts[i + 1];
+      i += 2;
+    } else if (!path && parts[i]) {
+      path = parts[i];
+      i++;
+    } else {
+      i++;
+    }
+  }
+  return { path, dest };
+}
+
 async function promptForTask(ctx: Pick<CommandContext, "hasUI" | "ui">, title: string, placeholder: string): Promise<string | undefined> {
   if (!ctx.hasUI) return undefined;
   const value = await ctx.ui.input(title, placeholder);
@@ -955,6 +1132,32 @@ function applyStopTarget(
 let loopState: LoopState = defaultLoopState();
 const RALPH_EXTENSION_REGISTERED = Symbol.for("pi-ralph-loop.registered");
 
+function scaffoldRalphTemplate(): string {
+  return `---
+max_iterations: 10
+timeout: 120
+commands: []
+---
+# {{ task.name }}
+
+Describe the task here.
+
+## Evidence
+Use {{ commands.* }} outputs as evidence.
+
+## Completion
+Stop with <promise>DONE</promise> when finished.
+`;
+}
+
+function slugifyTaskName(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 export default function (pi: ExtensionAPI, services: RegisterRalphCommandServices = {}) {
   const registeredPi = pi as ExtensionAPI & Record<symbol, boolean | undefined>;
   if (registeredPi[RALPH_EXTENSION_REGISTERED]) return;
@@ -1032,6 +1235,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
   async function startRalphLoop(ralphPath: string, ctx: CommandContext, runLoopFn: typeof runRalphLoop = runRalphLoop, runtimeArgs: RuntimeArgs = {}) {
     let name: string;
+    let currentStopOnError = true;
     try {
       const raw = readFileSync(ralphPath, "utf8");
       const draftError = validateDraftContent(raw);
@@ -1042,6 +1246,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       const parsed = parseRalphMarkdown(raw);
       const { frontmatter } = parsed;
       if (!validateFrontmatter(frontmatter, ctx)) return;
+      currentStopOnError = frontmatter.stopOnError;
       const runtimeValidationError = validateRuntimeArgs(frontmatter, parsed.body, frontmatter.commands, runtimeArgs);
       if (runtimeValidationError) {
         ctx.ui.notify(runtimeValidationError, "error");
@@ -1078,6 +1283,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         timeout: loopState.timeout,
         maxIterations: loopState.maxIterations,
         guardrails: loopState.guardrails,
+        stopOnError: currentStopOnError,
         runtimeArgs,
         modelPattern: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
         thinkingLevel: ctx.model?.reasoning ? "high" : undefined,
@@ -1478,6 +1684,104 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
 
       applyStopTarget(pi, ctx, materializeRegistryStopTarget(activeEntries[0]), now);
+    },
+  });
+
+  pi.registerCommand("ralph-cancel", {
+    description: "Cancel the active ralph iteration immediately",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseCommandArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+      if (parsed.mode === "task") {
+        ctx.ui.notify("/ralph-cancel expects a task folder or RALPH.md path, not task text.", "error");
+        return;
+      }
+
+      const result = resolveRalphTarget(ctx, {
+        commandName: "/ralph-cancel",
+        explicitPath: parsed.value || undefined,
+        checkCrossProcess: true,
+      });
+      if (!result || result.kind === "not-found") return;
+
+      createCancelSignal(result.taskDir);
+      ctx.ui.notify("Cancel requested. The active iteration will be terminated immediately.", "warning");
+    },
+  });
+
+  pi.registerCommand("ralph-scaffold", {
+    description: "Create a non-interactive RALPH.md starter template",
+    handler: async (args: string, ctx: CommandContext) => {
+      const name = (args ?? "").trim();
+      if (!name) {
+        ctx.ui.notify("/ralph-scaffold expects a task name or path.", "error");
+        return;
+      }
+
+      let taskDir: string;
+      let ralphPath: string;
+
+      if (name.includes("/") || name.startsWith("./")) {
+        ralphPath = resolve(ctx.cwd, name.endsWith("/RALPH.md") ? name : join(name, "RALPH.md"));
+        taskDir = dirname(ralphPath);
+      } else {
+        const slug = slugifyTaskName(name);
+        if (!slug) {
+          ctx.ui.notify(`Cannot slugify "${name}" into a valid directory name.`, "error");
+          return;
+        }
+        taskDir = join(ctx.cwd, slug);
+        ralphPath = join(taskDir, "RALPH.md");
+      }
+
+      if (existsSync(ralphPath)) {
+        ctx.ui.notify(`RALPH.md already exists at ${displayPath(ctx.cwd, ralphPath)}. Not overwriting.`, "error");
+        return;
+      }
+
+      if (existsSync(taskDir) && readdirSync(taskDir).length > 0) {
+        ctx.ui.notify(`Directory ${displayPath(ctx.cwd, taskDir)} already exists and is not empty. Not overwriting.`, "error");
+        return;
+      }
+
+      mkdirSync(taskDir, { recursive: true });
+      writeFileSync(ralphPath, scaffoldRalphTemplate(), "utf8");
+      ctx.ui.notify(`Scaffolded ${displayPath(ctx.cwd, ralphPath)}`, "info");
+    },
+  });
+
+  pi.registerCommand("ralph-logs", {
+    description: "Export run logs from a ralph task to an external directory",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseLogExportArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+
+      const resolvedTarget = resolveRalphTarget(ctx, {
+        commandName: "/ralph-logs",
+        explicitPath: parsed.path,
+        allowCompletedRuns: true,
+      });
+      if (!resolvedTarget || resolvedTarget.kind === "not-found") return;
+      const taskDir = resolvedTarget.taskDir;
+
+      // Resolve dest directory
+      const destDir = parsed.dest
+        ? resolve(ctx.cwd, parsed.dest)
+        : join(ctx.cwd, `ralph-logs-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+
+      try {
+        const result = exportRalphLogs(taskDir, destDir);
+        ctx.ui.notify(`Exported ${result.iterations} iteration records, ${result.events} events, ${result.transcripts} transcripts to ${displayPath(ctx.cwd, destDir)}`, "info");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Log export failed: ${message}`, "error");
+      }
     },
   });
 }

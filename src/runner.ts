@@ -21,9 +21,12 @@ import {
   type RunnerStatusFile,
   appendIterationRecord,
   appendRunnerEvent,
+  checkCancelSignal,
   checkStopSignal,
+  clearCancelSignal,
   clearRunnerDir,
   clearStopSignal,
+  createCancelSignal,
   ensureRunnerDir,
   readActiveLoopRegistry,
   readIterationRecords,
@@ -52,6 +55,8 @@ export type RunnerConfig = {
   cwd: string;
   timeout: number;
   maxIterations: number;
+  /** Error policy: true = stop on error (default), false = continue on error */
+  stopOnError?: boolean;
   /** Completion promise string from RALPH.md */
   completionPromise?: string;
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
@@ -412,6 +417,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     pi,
     runtimeArgs: initialRuntimeArgs = {},
   } = config;
+  let currentStopOnError = config.stopOnError ?? true;
   const runtimeArgs = initialRuntimeArgs;
 
   const taskDir = dirname(ralphPath);
@@ -495,6 +501,13 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         break;
       }
 
+      if (checkCancelSignal(taskDir)) {
+        recordActiveLoopStopObservation(cwd, taskDir, new Date().toISOString());
+        clearCancelSignal(taskDir);
+        finalStatus = "cancelled";
+        break;
+      }
+
       // Re-parse RALPH.md every iteration (live editing support)
       if (!existsSync(ralphPath)) {
         onNotify?.(`RALPH.md not found at ${ralphPath}, stopping runner`, "error");
@@ -523,6 +536,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       currentRequiredOutputs = fm.requiredOutputs ?? [];
       currentInterIterationDelay = fm.interIterationDelay;
       currentGuardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
+      currentStopOnError = config.stopOnError ?? fm.stopOnError;
 
       // Update status to running
       const runningStatus: RunnerStatusFile = {
@@ -540,6 +554,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       onIterationStart?.(i, currentMaxIterations);
 
       const iterStartMs = Date.now();
+      const iterationAbortController = new AbortController();
       const completionRecord = currentCompletionPromise ? createCompletionRecord() : undefined;
       logRunnerEvent(taskDir, {
         type: "iteration.started",
@@ -577,28 +592,74 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       // Run RPC iteration
       onNotify?.(`Iteration ${i}/${currentMaxIterations} starting`, "info");
 
-      const rpcResult = await runRpcIteration({
-        prompt,
-        cwd,
-        timeoutMs: currentTimeout * 1000,
-        spawnCommand,
-        spawnArgs,
-        env: {
-          RALPH_RUNNER_TASK_DIR: taskDir,
-          RALPH_RUNNER_CWD: cwd,
-          RALPH_RUNNER_LOOP_TOKEN: loopToken,
-          RALPH_RUNNER_CURRENT_ITERATION: String(i),
-          RALPH_RUNNER_MAX_ITERATIONS: String(currentMaxIterations),
-          RALPH_RUNNER_NO_PROGRESS_STREAK: String(noProgressStreak),
-          RALPH_RUNNER_GUARDRAILS: JSON.stringify(currentGuardrails),
-        },
-        modelPattern: config.modelPattern,
-        provider: config.provider,
-        modelId: config.modelId,
-        thinkingLevel: config.thinkingLevel,
-      });
+      const cancelPollInterval = setInterval(() => {
+        if (checkCancelSignal(taskDir)) {
+          iterationAbortController.abort();
+        }
+      }, 500);
+
+      let rpcResult: RpcSubprocessResult;
+      try {
+        rpcResult = await runRpcIteration({
+          prompt,
+          cwd,
+          timeoutMs: currentTimeout * 1000,
+          spawnCommand,
+          spawnArgs,
+          env: {
+            RALPH_RUNNER_TASK_DIR: taskDir,
+            RALPH_RUNNER_CWD: cwd,
+            RALPH_RUNNER_LOOP_TOKEN: loopToken,
+            RALPH_RUNNER_CURRENT_ITERATION: String(i),
+            RALPH_RUNNER_MAX_ITERATIONS: String(currentMaxIterations),
+            RALPH_RUNNER_NO_PROGRESS_STREAK: String(noProgressStreak),
+            RALPH_RUNNER_GUARDRAILS: JSON.stringify(currentGuardrails),
+          },
+          modelPattern: config.modelPattern,
+          provider: config.provider,
+          modelId: config.modelId,
+          thinkingLevel: config.thinkingLevel,
+          signal: iterationAbortController.signal,
+        });
+      } finally {
+        clearInterval(cancelPollInterval);
+      }
 
       const iterEndMs = Date.now();
+
+      if (rpcResult.cancelled) {
+        const iterRecord: IterationRecord = {
+          iteration: i,
+          status: "cancelled",
+          startedAt: new Date(iterStartMs).toISOString(),
+          completedAt: new Date(iterEndMs).toISOString(),
+          durationMs: iterEndMs - iterStartMs,
+          progress: false,
+          changedFiles: [],
+          noProgressStreak: noProgressStreak + 1,
+          loopToken,
+          rpcTelemetry: rpcResult.telemetry,
+        };
+        iterations.push(iterRecord);
+        appendIterationRecord(taskDir, iterRecord);
+        writeIterationTranscriptSafe(iterRecord, rpcResult.lastAssistantText, "Iteration cancelled by operator");
+        logRunnerEvent(taskDir, {
+          type: "iteration.completed",
+          timestamp: new Date(iterEndMs).toISOString(),
+          iteration: i,
+          loopToken,
+          status: "cancelled",
+          progress: iterRecord.progress,
+          changedFiles: [],
+          noProgressStreak: iterRecord.noProgressStreak,
+          reason: "operator-cancel",
+        });
+        recordActiveLoopStopObservation(cwd, taskDir, new Date().toISOString());
+        clearCancelSignal(taskDir);
+        finalStatus = "cancelled";
+        onIterationComplete?.(iterRecord);
+        break;
+      }
 
       // Handle RPC failure
       if (!rpcResult.success) {
@@ -639,13 +700,29 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
         if (rpcResult.timedOut) {
           onNotify?.(`Iteration ${i} timed out after ${currentTimeout}s`, "warning");
-          finalStatus = "timeout";
+          if (currentStopOnError) {
+            finalStatus = "timeout";
+            onIterationComplete?.(iterRecord);
+            break;
+          } else {
+            noProgressStreak += 1;
+            onNotify?.(`Continuing (stop_on_error=false).`, "warning");
+            onIterationComplete?.(iterRecord);
+            continue;
+          }
         } else {
           onNotify?.(`Iteration ${i} error: ${rpcResult.error ?? "unknown"}`, "error");
-          finalStatus = "error";
+          if (currentStopOnError) {
+            finalStatus = "error";
+            onIterationComplete?.(iterRecord);
+            break;
+          } else {
+            noProgressStreak += 1;
+            onNotify?.(`Continuing (stop_on_error=false).`, "warning");
+            onIterationComplete?.(iterRecord);
+            continue;
+          }
         }
-        onIterationComplete?.(iterRecord);
-        break;
       }
 
       // After snapshot
@@ -877,6 +954,14 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       }
 
       onNotify?.(`Iteration ${i} complete (${Math.round((iterEndMs - iterStartMs) / 1000)}s)`, "info");
+
+      // Quick cancel check before delay
+      if (checkCancelSignal(taskDir)) {
+        recordActiveLoopStopObservation(cwd, taskDir, new Date().toISOString());
+        clearCancelSignal(taskDir);
+        finalStatus = "cancelled";
+        break;
+      }
 
       if (i < currentMaxIterations && currentInterIterationDelay > 0) {
         const stoppedDuringDelay = await waitForInterIterationDelay(taskDir, cwd, currentInterIterationDelay);
