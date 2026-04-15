@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, SessionEntry, AgentEndEvent as PiAgentEndEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 import {
@@ -717,6 +717,81 @@ function writeDraftFile(ralphPath: string, content: string) {
 function displayPath(cwd: string, filePath: string): string {
   const rel = relative(cwd, filePath);
   return rel && !rel.startsWith("..") ? `./${rel}` : filePath;
+}
+
+function exportRalphLogs(taskDir: string, destDir: string): { iterations: number; events: number; transcripts: number } {
+  const runnerDir = join(taskDir, ".ralph-runner");
+  if (!existsSync(runnerDir)) {
+    throw new Error(`No .ralph-runner directory found at ${taskDir}`);
+  }
+
+  mkdirSync(destDir, { recursive: true });
+
+  const filesToCopy = ["status.json", "iterations.jsonl", "events.jsonl"];
+  for (const file of filesToCopy) {
+    const src = join(runnerDir, file);
+    if (existsSync(src)) {
+      copyFileSync(src, join(destDir, file));
+    }
+  }
+
+  // Copy transcripts directory
+  const transcriptsDir = join(runnerDir, "transcripts");
+  let transcripts = 0;
+  if (existsSync(transcriptsDir)) {
+    const destTranscripts = join(destDir, "transcripts");
+    mkdirSync(destTranscripts, { recursive: true });
+    for (const entry of readdirSync(transcriptsDir)) {
+      const srcPath = join(transcriptsDir, entry);
+      try {
+        const stat = statSync(srcPath);
+        if (stat.isFile()) {
+          copyFileSync(srcPath, join(destTranscripts, entry));
+          transcripts++;
+        }
+      } catch {
+        // skip unreadable entries
+      }
+    }
+  }
+
+  // Count iterations and events
+  let iterations = 0;
+  let events = 0;
+  const iterPath = join(destDir, "iterations.jsonl");
+  if (existsSync(iterPath)) {
+    iterations = readFileSync(iterPath, "utf8").split("\n").filter((l) => l.trim()).length;
+  }
+  const evPath = join(destDir, "events.jsonl");
+  if (existsSync(evPath)) {
+    events = readFileSync(evPath, "utf8").split("\n").filter((l) => l.trim()).length;
+  }
+
+  return { iterations, events, transcripts };
+}
+
+export function parseLogExportArgs(raw: string): { path?: string; dest?: string; error?: string } {
+  const parts = raw.trim().split(/\s+/);
+  let path: string | undefined;
+  let dest: string | undefined;
+  let i = 0;
+  while (i < parts.length) {
+    if (parts[i] === "--dest" || parts[i] === "-d") {
+      if (i + 1 >= parts.length) return { error: "--dest requires a directory path" };
+      dest = parts[i + 1];
+      i += 2;
+    } else if (parts[i] === "--path" || parts[i] === "-p") {
+      if (i + 1 >= parts.length) return { error: "--path requires a task path" };
+      path = parts[i + 1];
+      i += 2;
+    } else if (!path && parts[i]) {
+      path = parts[i];
+      i++;
+    } else {
+      i++;
+    }
+  }
+  return { path, dest };
 }
 
 async function promptForTask(ctx: Pick<CommandContext, "hasUI" | "ui">, title: string, placeholder: string): Promise<string | undefined> {
@@ -1638,6 +1713,66 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       mkdirSync(taskDir, { recursive: true });
       writeFileSync(ralphPath, scaffoldRalphTemplate(), "utf8");
       ctx.ui.notify(`Scaffolded ${displayPath(ctx.cwd, ralphPath)}`, "info");
+    },
+  });
+
+  pi.registerCommand("ralph-logs", {
+    description: "Export run logs from a ralph task to an external directory",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseLogExportArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+
+      let taskDir: string | undefined;
+
+      if (parsed.path) {
+        const inspection = inspectExistingTarget(parsed.path, ctx.cwd, true);
+        if (inspection.kind === "run") {
+          taskDir = dirname(inspection.ralphPath);
+        } else {
+          // Try as a directory that had a run
+          taskDir = resolve(ctx.cwd, parsed.path);
+          if (!existsSync(join(taskDir, ".ralph-runner"))) {
+            ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, taskDir)}.`, "error");
+            return;
+          }
+        }
+      }
+
+      if (!taskDir) {
+        // Try session target
+        const now = new Date().toISOString();
+        const { target: sessionTarget } = resolveSessionStopTarget(ctx, now);
+        if (sessionTarget) {
+          taskDir = sessionTarget.taskDir;
+        } else {
+          const activeEntries = listActiveLoopRegistryEntries(ctx.cwd);
+          if (activeEntries.length === 1) {
+            taskDir = activeEntries[0].taskDir;
+          } else if (activeEntries.length > 1) {
+            ctx.ui.notify("Multiple active ralph loops found. Use /ralph-logs <task folder>.", "error");
+            return;
+          } else {
+            ctx.ui.notify("No ralph run data found. Specify a task path with /ralph-logs <path>.", "error");
+            return;
+          }
+        }
+      }
+
+      // Resolve dest directory
+      const destDir = parsed.dest
+        ? resolve(ctx.cwd, parsed.dest)
+        : join(ctx.cwd, `ralph-logs-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+
+      try {
+        const result = exportRalphLogs(taskDir, destDir);
+        ctx.ui.notify(`Exported ${result.iterations} iteration records, ${result.events} events, ${result.transcripts} transcripts to ${displayPath(ctx.cwd, destDir)}`, "info");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Log export failed: ${message}`, "error");
+      }
     },
   });
 }
