@@ -398,7 +398,7 @@ test("registerRalphCommands is idempotent for the same extension API instance", 
   registerRalphCommands(pi, {} as any);
   registerRalphCommands(pi, {} as any);
 
-  assert.deepEqual(registeredCommands, ["ralph", "ralph-draft", "ralph-stop"]);
+  assert.deepEqual(registeredCommands, ["ralph", "ralph-draft", "ralph-stop", "ralph-cancel"]);
   assert.deepEqual(registeredEvents, [
     "tool_call",
     "tool_execution_start",
@@ -571,6 +571,56 @@ test("/ralph-stop writes the durable stop flag from persisted active loop state 
 
   assert.equal(existsSync(join(taskDir, ".ralph-runner", "stop.flag")), true);
   assert.ok(notifications.some(({ message }) => message.includes("Ralph loop stopping after current iteration")));
+  assert.equal(notifications.some(({ message }) => message.includes("No active ralph loop")), false);
+});
+
+test("/ralph-cancel writes the cancel flag from persisted active loop state after reload", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "persisted-loop-task");
+  mkdirSync(taskDir, { recursive: true });
+  const persistedState = {
+    active: true,
+    loopToken: "persisted-loop-token",
+    cwd,
+    taskDir,
+    iteration: 3,
+    maxIterations: 5,
+    noProgressStreak: 0,
+    iterationSummaries: [],
+    guardrails: { blockCommands: [], protectedFiles: [] },
+    stopRequested: false,
+  };
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-cancel");
+  let ctx: any;
+  ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: createSessionManager([
+      {
+        type: "custom",
+        customType: "ralph-loop-state",
+        data: persistedState,
+      },
+    ], "session-a"),
+    getRuntimeCtx: () => ctx,
+  };
+
+  await handler("", ctx);
+
+  assert.equal(existsSync(join(taskDir, ".ralph-runner", "cancel.flag")), true);
+  assert.equal(existsSync(join(taskDir, ".ralph-runner", "stop.flag")), false);
+  assert.ok(notifications.some(({ message }) => message.includes("Cancel requested. The active iteration will be terminated immediately.")));
   assert.equal(notifications.some(({ message }) => message.includes("No active ralph loop")), false);
 });
 

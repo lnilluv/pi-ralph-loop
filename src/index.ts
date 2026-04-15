@@ -30,6 +30,8 @@ import { runRalphLoop } from "./runner.ts";
 import {
   checkStopSignal,
   createStopSignal,
+  createCancelSignal,
+  checkCancelSignal,
   listActiveLoopRegistryEntries,
   readActiveLoopRegistry,
   readIterationRecords,
@@ -1478,6 +1480,94 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
 
       applyStopTarget(pi, ctx, materializeRegistryStopTarget(activeEntries[0]), now);
+    },
+  });
+
+  pi.registerCommand("ralph-cancel", {
+    description: "Cancel the active ralph iteration immediately",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseCommandArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+      if (parsed.mode === "task") {
+        ctx.ui.notify("/ralph-cancel expects a task folder or RALPH.md path, not task text.", "error");
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
+      const { target: sessionTarget, persistedSessionState } = resolveSessionStopTarget(ctx, now);
+
+      let resolvedTaskDir: string | undefined;
+
+      if (sessionTarget && !parsed.value) {
+        resolvedTaskDir = sessionTarget.taskDir;
+      } else if (parsed.value) {
+        const inspection = inspectExistingTarget(parsed.value, ctx.cwd, true);
+        if (inspection.kind === "run") {
+          resolvedTaskDir = dirname(inspection.ralphPath);
+        } else if (inspection.kind === "dir-without-ralph" || inspection.kind === "missing-path") {
+          ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, inspection.kind === "missing-path" ? inspection.dirPath : inspection.dirPath)}.`, "warning");
+          return;
+        } else {
+          ctx.ui.notify("/ralph-cancel expects a task folder or RALPH.md path.", "error");
+          return;
+        }
+
+        // Check registry for explicit path
+        if (resolvedTaskDir) {
+          const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === resolvedTaskDir);
+          if (registryTarget) {
+            resolvedTaskDir = registryTarget.taskDir;
+          }
+        }
+
+        // Also check status file for cross-process
+        if (resolvedTaskDir) {
+          const statusFile = readStatusFile(resolvedTaskDir);
+          if (
+            statusFile &&
+            (statusFile.status === "running" || statusFile.status === "initializing") &&
+            typeof statusFile.cwd === "string" &&
+            statusFile.cwd.length > 0
+          ) {
+            const statusRegistryTarget = listActiveLoopRegistryEntries(statusFile.cwd).find(
+              (entry) => entry.taskDir === resolvedTaskDir && entry.loopToken === statusFile.loopToken,
+            );
+            if (statusRegistryTarget) {
+              resolvedTaskDir = statusRegistryTarget.taskDir;
+            }
+          }
+        }
+
+        if (!resolvedTaskDir) {
+          ctx.ui.notify(`No active ralph loop found at ${displayPath(ctx.cwd, parsed.value)}.`, "warning");
+          return;
+        }
+      } else if (sessionTarget) {
+        resolvedTaskDir = sessionTarget.taskDir;
+      } else {
+        const activeEntries = activeRegistryEntries();
+        if (activeEntries.length === 0) {
+          ctx.ui.notify("No active ralph loops found.", "warning");
+          return;
+        }
+        if (activeEntries.length > 1) {
+          ctx.ui.notify("Multiple active ralph loops found. Use /ralph-cancel <task folder or RALPH.md> for an explicit target path.", "error");
+          return;
+        }
+        resolvedTaskDir = activeEntries[0].taskDir;
+      }
+
+      if (!resolvedTaskDir) {
+        ctx.ui.notify("Could not resolve a target ralph loop to cancel.", "error");
+        return;
+      }
+
+      createCancelSignal(resolvedTaskDir);
+      ctx.ui.notify("Cancel requested. The active iteration will be terminated immediately.", "warning");
     },
   });
 }

@@ -57,6 +57,7 @@ Stop with <promise>DONE</promise> only when the gate passes.
 | `/ralph [path-or-task]` | Run an existing task folder or `RALPH.md`, or draft a new loop from a task description. |
 | `/ralph-draft [path-or-task]` | Draft or edit a loop without starting it. |
 | `/ralph-stop [path-or-task]` | Request a graceful stop after the current iteration. |
+| `/ralph-cancel [path-or-task]` | Cancel the active iteration immediately. |
 
 ## Config reference
 | Field | Purpose |
