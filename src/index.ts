@@ -2,6 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionEvent, SessionEntry, AgentEndEvent as PiAgentEndEvent, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
+
+type ToolExecutionStartEvent = Extract<ExtensionEvent, { type: "tool_execution_start" }>;
+type ToolExecutionEndEvent = Extract<ExtensionEvent, { type: "tool_execution_end" }>;
 import {
   buildMissionBrief,
   inspectExistingTarget,
@@ -224,9 +227,6 @@ function resolveRalphTarget(
 type AgentEndEvent = PiAgentEndEvent;
 
 type ToolResultEvent = PiToolResultEvent;
-
-type ToolExecutionStartEvent = Extract<ExtensionEvent, { type: "tool_execution_start" }>;
-type ToolExecutionEndEvent = Extract<ExtensionEvent, { type: "tool_execution_end" }>;
 
 type EventContext = ExtensionContext;
 
