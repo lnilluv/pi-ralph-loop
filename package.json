@@ -23,12 +23,12 @@
     "url": "git+https://github.com/lnilluv/pi-ralph-loop.git"
   },
   "dependencies": {
-    "@mariozechner/pi-ai": "0.66.1",
+    "@mariozechner/pi-ai": ">=0.66.1 <0.69.0",
     "minimatch": "10.2.3",
     "yaml": "2.8.3"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@mariozechner/pi-coding-agent": ">=0.66.0 <0.69.0"
   },
   "keywords": [
     "pi-extension",

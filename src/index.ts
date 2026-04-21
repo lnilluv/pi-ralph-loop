@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, SessionEntry, AgentEndEvent as PiAgentEndEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionEvent, SessionEntry, AgentEndEvent as PiAgentEndEvent, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 import {
   buildMissionBrief,
   inspectExistingTarget,
@@ -221,26 +221,14 @@ function resolveRalphTarget(
   return { kind: "resolved", taskDir: activeEntries[0].taskDir };
 }
 
-type ToolEvent = {
-  toolName?: string;
-  toolCallId?: string;
-  input?: {
-    path?: string;
-    command?: string;
-  };
-  isError?: boolean;
-  success?: boolean;
-};
-
 type AgentEndEvent = PiAgentEndEvent;
 
 type ToolResultEvent = PiToolResultEvent;
 
-type BeforeAgentStartEvent = {
-  systemPrompt: string;
-};
+type ToolExecutionStartEvent = Extract<ExtensionEvent, { type: "tool_execution_start" }>;
+type ToolExecutionEndEvent = Extract<ExtensionEvent, { type: "tool_execution_end" }>;
 
-type EventContext = Pick<CommandContext, "sessionManager">;
+type EventContext = ExtensionContext;
 
 
 function validateFrontmatter(fm: Frontmatter, ctx: Pick<CommandContext, "ui">): boolean {
@@ -1210,22 +1198,22 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       error,
     });
   };
-  const recordPendingToolPath = (ctx: EventContext, event: ToolEvent) => {
+  const recordPendingToolPath = (ctx: EventContext, event: ToolCallEvent | ToolExecutionStartEvent) => {
     const pending = getPendingIteration(ctx);
     if (!pending) return;
     if (event.toolName !== "write" && event.toolName !== "edit") return;
     const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-    const filePath = event.input?.path ?? "";
+    const filePath = ("input" in event ? event.input : event.args)?.path ?? "";
     if (toolCallId && filePath) pending.toolCallPaths.set(toolCallId, filePath);
   };
-  const recordSuccessfulTaskDirWrite = (ctx: EventContext, event: ToolEvent) => {
+  const recordSuccessfulTaskDirWrite = (ctx: EventContext, event: ToolExecutionEndEvent) => {
     const pending = getPendingIteration(ctx);
     if (!pending) return;
     if (event.toolName !== "write" && event.toolName !== "edit") return;
     const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
     const filePath = toolCallId ? pending.toolCallPaths.get(toolCallId) : undefined;
     if (toolCallId) pending.toolCallPaths.delete(toolCallId);
-    if (event.isError === true || event.success === false || !filePath) return;
+    if (event.isError === true || !filePath) return;
     const persisted = resolveActiveLoopState(ctx);
     const taskDirPath = persisted?.taskDir ?? loopState.taskDir;
     const cwd = persisted?.cwd ?? loopState.cwd;
@@ -1463,7 +1451,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     return handleExistingInspection(parsed.value);
   }
 
-  pi.on("tool_call", async (event: ToolEvent, ctx: EventContext) => {
+  pi.on("tool_call", async (event: ToolCallEvent, ctx: EventContext) => {
     const persisted = resolveActiveLoopState(ctx);
     if (!persisted) return;
 
@@ -1502,11 +1490,11 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     recordPendingToolPath(ctx, event);
   });
 
-  pi.on("tool_execution_start", async (event: ToolEvent, ctx: EventContext) => {
+  pi.on("tool_execution_start", async (event: ToolExecutionStartEvent, ctx: EventContext) => {
     recordPendingToolPath(ctx, event);
   });
 
-  pi.on("tool_execution_end", async (event: ToolEvent, ctx: EventContext) => {
+  pi.on("tool_execution_end", async (event: ToolExecutionEndEvent, ctx: EventContext) => {
     recordSuccessfulTaskDirWrite(ctx, event);
   });
 
