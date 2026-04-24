@@ -772,6 +772,9 @@ test("/ralph-scaffold creates a parseable scaffold from a task name", async (t) 
   assert.equal(inspection.parsed?.frontmatter.maxIterations, 10);
   assert.equal(inspection.parsed?.frontmatter.timeout, 120);
   assert.deepEqual(inspection.parsed?.frontmatter.commands, []);
+  assert.equal(inspection.parsed?.frontmatter.completionPromise, "DONE");
+  assert.equal(inspection.parsed?.frontmatter.completionGate, "optional");
+  assert.match(readFileSync(ralphPath, "utf8"), /# \{\{ ralph\.name \}\}/);
   assert.ok(notifications.some(({ message, level }) => level === "info" && message.includes("Scaffolded")));
 });
 

@@ -116,6 +116,7 @@ commands:
 max_iterations: 20
 timeout: 120
 completion_promise: DONE
+completion_gate: required
 required_outputs:
   - AUTH_FIXES.md
 stop_on_error: false
@@ -137,7 +138,7 @@ Fix the failing auth tests for {{ args.owner }}.
 
 {{ commands.verify }}
 
-Stop with <promise>DONE</promise> only when all tests pass and AUTH_FIXES.md exists.
+Stop with <promise>DONE</promise> only when all tests pass, AUTH_FIXES.md exists, and OPEN_QUESTIONS.md has no remaining P0/P1 items.
 ```
 
 ### Frontmatter reference
@@ -150,6 +151,7 @@ Stop with <promise>DONE</promise> only when all tests pass and AUTH_FIXES.md exi
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
 | `timeout` | integer | `300` | 1–300 seconds per iteration |
 | `completion_promise` | string | — | Done marker. Single line, no `<>` or line breaks |
+| `completion_gate` | `required` \| `optional` \| `disabled` | `required` when `completion_promise` is set | Controls whether the promise, required outputs, and OPEN_QUESTIONS.md readiness block stopping |
 | `required_outputs` | string[] | `[]` | Relative file paths that must exist for early stop |
 | `stop_on_error` | boolean | `true` | `false` continues past RPC errors and timeouts |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns; matching bash commands are blocked |
@@ -194,18 +196,29 @@ Commands starting with `./` run from the task directory. Others run from the pro
 |---|---|
 | `/ralph-stop` | Finish current iteration, then stop |
 | `/ralph-cancel` | Kill the current iteration immediately |
-| Completion promise + gate | Stop when `<promise>DONE</promise>` appears and all `required_outputs` exist |
+| Completion promise + gate | Stop when the promise is matched; only `required` gates also wait for `required_outputs` and OPEN_QUESTIONS.md readiness |
 | Max iterations reached | Stop after the last iteration |
 | No progress for all iterations | Stop with `no-progress-exhaustion` |
 
 ## Completion gating
 
-Completion requires **both** conditions:
+`completion_gate` controls how strictly the loop treats completion promises:
+
+| Mode | Behavior |
+|---|---|
+| `required` | Default when `completion_promise` is set. The loop waits for the promise, every file in `required_outputs`, and an OPEN_QUESTIONS.md that is ready to stop (no remaining P0/P1 items). |
+| `optional` | The prompt still reminds the agent about outputs and OPEN_QUESTIONS.md readiness, but the loop may stop once the promise is emitted. |
+| `disabled` | The loop skips completion-gate reminders and checks. |
+
+In `optional` and `disabled` mode, `complete` means the promise was matched; those modes do not block on `required_outputs` or OPEN_QUESTIONS.md readiness.
+
+When the gate is `required`, completion still needs **all three** conditions:
 
 1. The agent emits `<promise>DONE</promise>` (or whatever marker you set)
 2. Every file in `required_outputs` exists on disk
+3. `OPEN_QUESTIONS.md` is ready to stop, meaning it has no remaining P0/P1 items
 
-If the promise is seen but files are missing, the loop continues — the next iteration gets a rejection notice telling the agent what's still missing.
+If the promise is seen but files or OPEN_QUESTIONS.md are not ready, the loop continues — the next iteration gets a rejection notice telling the agent what still needs to be fixed.
 
 `RALPH_PROGRESS.md` is injected as rolling memory (max 4096 chars) and excluded from the `required_outputs` gate.
 
@@ -263,7 +276,7 @@ completion_promise: DONE
 
 Fix failing tests before starting new work.
 Read TODO.md and implement the next task.
-Stop with <promise>DONE</promise> when all tests pass.
+Stop with <promise>DONE</promise> when all tests pass and OPEN_QUESTIONS.md has no remaining P0/P1 items.
 ```
 
 ### Parameterized multi-env loop
@@ -317,7 +330,7 @@ Build output:
 Test results:
 {{ commands.tests }}
 
-Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists and all tests pass.
+Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists, all tests pass, and OPEN_QUESTIONS.md has no remaining P0/P1 items.
 ```
 
 ## Run state
@@ -340,7 +353,7 @@ Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists and all tests p
 
 | Status | Meaning |
 |---|---|
-| `complete` | Completion promise seen and gate passed |
+| `complete` | Completion promise matched; `required` gates also passed when configured |
 | `max-iterations` | Reached `max_iterations` without completion |
 | `no-progress-exhaustion` | No durable progress in any iteration |
 | `stopped` | `/ralph-stop` observed |
@@ -369,6 +382,8 @@ Drafts include a metadata comment (`<!-- pi-ralph-loop: ... -->`) used for re-va
 max_iterations: 10
 timeout: 120
 commands: []
+completion_promise: DONE
+completion_gate: optional
 ---
 # {{ ralph.name }}
 
@@ -385,16 +400,16 @@ Refuses to overwrite an existing `RALPH.md` or write outside the current working
 
 ## Agent skills
 
-pi-ralph-loop ships two [skills](https://github.com/mariozechner/pi-coding-agent/blob/main/docs/skills.md) that pi auto-discovers when the package is installed:
+pi-ralph-loop ships two skills that pi auto-discovers when the package is installed:
 
 | Skill | When it activates | What it teaches |
 |---|---|---|
-| `ralph-loop` | Starting or configuring a loop | When to loop vs. single-session, prompt structure, guardrails, completion gating, common mistakes |
-| `ralph-draft` | Creating a RALPH.md from plain language | Task classification, project detection, frontmatter generation, guardrail selection |
+| [`ralph-loop`](./skills/ralph-loop/SKILL.md) | Starting or configuring a loop | When to loop vs. single-session, prompt structure, guardrails, completion gating, common mistakes |
+| [`ralph-draft`](./skills/ralph-draft/SKILL.md) | Creating a RALPH.md from plain language | Task classification, project detection, frontmatter generation, guardrail selection |
 
-The skills include detailed references:
-- **Prompt patterns** — annotated examples for self-healing, migration, research, security, and evidence-driven loops
-- **Config cookbook** — copy-paste frontmatter recipes for 8 common scenarios
+The `ralph-loop` skill includes detailed references:
+- [Prompt patterns](./skills/ralph-loop/references/prompt-patterns.md) — annotated examples for self-healing, migration, research, security, and evidence-driven loops
+- [Config cookbook](./skills/ralph-loop/references/config-cookbook.md) — copy-paste frontmatter recipes for common scenarios
 
 ## License
 

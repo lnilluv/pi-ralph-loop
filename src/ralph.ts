@@ -6,6 +6,7 @@ import { SECRET_PATH_POLICY_TOKEN, filterSecretBearingTopLevelNames, isSecretBea
 export type CommandDef = { name: string; run: string; timeout: number };
 export type DraftSource = "deterministic" | "llm-strengthened" | "fallback";
 export type DraftStrengtheningScope = "body-only" | "body-and-commands";
+export type CompletionGateMode = "required" | "optional" | "disabled";
 export type CommandIntent = CommandDef & { source: "heuristic" | "repo-signal" };
 export type RuntimeArg = { name: string; value: string };
 export type RuntimeArgs = Record<string, string>;
@@ -16,6 +17,7 @@ export type Frontmatter = {
   interIterationDelay: number;
   timeout: number;
   completionPromise?: string;
+  completionGate?: CompletionGateMode;
   requiredOutputs?: string[];
   stopOnError: boolean;
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
@@ -68,6 +70,10 @@ export type PlannedTaskTarget =
 export type RepoSignals = {
   packageManager?: "npm" | "pnpm" | "yarn" | "bun";
   testCommand?: string;
+  typecheckCommand?: string;
+  checkCommand?: string;
+  buildCommand?: string;
+  verifyCommand?: string;
   lintCommand?: string;
   hasGit: boolean;
   topLevelDirs: string[];
@@ -196,6 +202,18 @@ function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | nul
   return null;
 }
 
+function validateRawCompletionGateShape(rawFrontmatter: UnknownRecord): string | null {
+  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "completion_gate")) {
+    return null;
+  }
+
+  const completionGate = rawFrontmatter.completion_gate;
+  if (typeof completionGate !== "string") {
+    return "Invalid RALPH frontmatter: completion_gate must be a YAML string";
+  }
+  return null;
+}
+
 function validateRawRequiredOutputsShape(rawFrontmatter: UnknownRecord): string | null {
   if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "required_outputs")) {
     return null;
@@ -255,6 +273,13 @@ function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | nu
     for (const [index, command] of commands.entries()) {
       const commandError = validateRawCommandEntryShape(command, index);
       if (commandError) return commandError;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(rawFrontmatter, "completion_gate")) {
+    const completionGateError = validateRawCompletionGateShape(rawFrontmatter);
+    if (completionGateError) {
+      return completionGateError;
     }
   }
 
@@ -350,28 +375,48 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
   return labels.length > 0 ? labels.join(" and ") : "No extra safety rules";
 }
 
+export function resolveCompletionGateMode(frontmatter: Frontmatter): CompletionGateMode {
+  return frontmatter.completionGate ?? (frontmatter.completionPromise ? "required" : "disabled");
+}
+
 function summarizeFinishLabel(frontmatter: Frontmatter): string {
   const requiredOutputs = frontmatter.requiredOutputs ?? [];
   const labels = [`Stop after ${frontmatter.maxIterations} iterations or /ralph-stop`];
-  if (requiredOutputs.length > 0) {
-    labels.push(`required outputs: ${requiredOutputs.join(", ")}`);
+  if (frontmatter.completionPromise) {
+    labels.push(`completion gate: ${resolveCompletionGateMode(frontmatter)}`);
+    if (requiredOutputs.length > 0) {
+      labels.push(`required outputs: ${requiredOutputs.join(", ")}`);
+    }
   }
   return labels.join("; ");
 }
 
 function summarizeFinishBehavior(frontmatter: Frontmatter): string[] {
   const requiredOutputs = frontmatter.requiredOutputs ?? [];
+  const gateMode = resolveCompletionGateMode(frontmatter);
   const lines = [
     `- Stop after ${frontmatter.maxIterations} iterations or /ralph-stop`,
     `- Stop if an iteration exceeds ${frontmatter.timeout}s`,
   ];
 
   if (frontmatter.completionPromise) {
-    if (requiredOutputs.length > 0) {
-      lines.push(`- Required outputs must exist before stopping: ${requiredOutputs.join(", ")}`);
+    if (gateMode === "disabled") {
+      lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
+      lines.push("- Completion gate is disabled, so required outputs and OPEN_QUESTIONS.md are not checked.");
+    } else if (gateMode === "optional") {
+      if (requiredOutputs.length > 0) {
+        lines.push(`- Required outputs should exist before stopping: ${requiredOutputs.join(", ")}`);
+      }
+      lines.push("- OPEN_QUESTIONS.md should have no remaining P0/P1 items before stopping.");
+      lines.push("- Completion gate is advisory; the loop may still stop when the promise is emitted.");
+      lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
+    } else {
+      if (requiredOutputs.length > 0) {
+        lines.push(`- Required outputs must exist before stopping: ${requiredOutputs.join(", ")}`);
+      }
+      lines.push("- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.");
+      lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
     }
-    lines.push("- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.");
-    lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
   }
 
   return lines;
@@ -415,25 +460,30 @@ function detectPackageManager(cwd: string): RepoSignals["packageManager"] {
 
 function packageRunCommand(packageManager: RepoSignals["packageManager"], script: string): string {
   if (packageManager === "pnpm") return `pnpm ${script}`;
-  if (packageManager === "yarn") return `yarn ${script}`;
+  if (packageManager === "yarn") return `yarn run ${script}`;
   if (packageManager === "bun") return `bun run ${script}`;
   if (script === "test") return "npm test";
   return `npm run ${script}`;
 }
 
-function detectPackageScripts(cwd: string, packageManager: RepoSignals["packageManager"]): Pick<RepoSignals, "testCommand" | "lintCommand"> {
+function detectPackageScripts(cwd: string, packageManager: RepoSignals["packageManager"]): Pick<RepoSignals, "testCommand" | "typecheckCommand" | "checkCommand" | "buildCommand" | "verifyCommand" | "lintCommand"> {
   const packageJsonPath = join(cwd, "package.json");
   if (!existsSync(packageJsonPath)) return {};
 
   try {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { scripts?: Record<string, unknown> };
     const scripts = isRecord(packageJson.scripts) ? packageJson.scripts : {};
-    const testValue = typeof scripts.test === "string" ? scripts.test : undefined;
-    const lintValue = typeof scripts.lint === "string" ? scripts.lint : undefined;
+    const result: Partial<Pick<RepoSignals, "testCommand" | "typecheckCommand" | "checkCommand" | "buildCommand" | "verifyCommand" | "lintCommand">> = {};
 
-    const testCommand = testValue && !/no test specified/i.test(testValue) ? packageRunCommand(packageManager, "test") : undefined;
-    const lintCommand = lintValue ? packageRunCommand(packageManager, "lint") : undefined;
-    return { testCommand, lintCommand };
+    const testValue = typeof scripts.test === "string" ? scripts.test : undefined;
+    if (testValue && !/no test specified/i.test(testValue)) result.testCommand = packageRunCommand(packageManager, "test");
+    if (typeof scripts.typecheck === "string") result.typecheckCommand = packageRunCommand(packageManager, "typecheck");
+    if (typeof scripts.check === "string") result.checkCommand = packageRunCommand(packageManager, "check");
+    if (typeof scripts.build === "string") result.buildCommand = packageRunCommand(packageManager, "build");
+    if (typeof scripts.verify === "string") result.verifyCommand = packageRunCommand(packageManager, "verify");
+    if (typeof scripts.lint === "string") result.lintCommand = packageRunCommand(packageManager, "lint");
+
+    return result;
   } catch {
     return {};
   }
@@ -469,7 +519,7 @@ function renderCommandsYaml(commands: CommandDef[]): string[] {
     "commands:",
     ...commands.flatMap((command) => [
       `  - name: ${command.name}`,
-      `    run: ${command.run}`,
+      `    run: ${yamlQuote(command.run)}`,
       `    timeout: ${command.timeout}`,
     ]),
   ];
@@ -514,6 +564,7 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
       timeout: Number(yaml.timeout ?? 300),
       completionPromise:
         typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
+      ...(typeof yaml.completion_gate === "string" && yaml.completion_gate.trim() ? { completionGate: yaml.completion_gate as CompletionGateMode } : {}),
       requiredOutputs: toStringArray(yaml.required_outputs),
       stopOnError: yaml.stop_on_error === false ? false : true,
       guardrails: {
@@ -545,6 +596,9 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
   }
   if (fm.completionPromise !== undefined && !isSafeCompletionPromise(fm.completionPromise)) {
     return "Invalid completion_promise: must be a single-line string without line breaks or angle brackets";
+  }
+  if (fm.completionGate !== undefined && !["required", "optional", "disabled"].includes(fm.completionGate)) {
+    return "Invalid completion_gate: must be required, optional, or disabled";
   }
   const args = fm.args ?? [];
   const seenArgNames = new Set<string>();
@@ -1050,8 +1104,7 @@ export function inspectRepo(cwd: string): RepoSignals {
 
   return {
     packageManager,
-    testCommand: packageScripts.testCommand,
-    lintCommand: packageScripts.lintCommand,
+    ...packageScripts,
     hasGit: existsSync(join(cwd, ".git")),
     topLevelDirs,
     topLevelFiles,
@@ -1066,6 +1119,10 @@ export function buildRepoContext(signals: RepoSignals): RepoContext {
     summaryLines: [
       `package manager: ${signals.packageManager ?? "unknown"}`,
       `test command: ${signals.testCommand ?? "none"}`,
+      ...(signals.typecheckCommand ? [`typecheck command: ${signals.typecheckCommand}`] : []),
+      ...(signals.checkCommand ? [`check command: ${signals.checkCommand}`] : []),
+      ...(signals.buildCommand ? [`build command: ${signals.buildCommand}`] : []),
+      ...(signals.verifyCommand ? [`verify command: ${signals.verifyCommand}`] : []),
       `lint command: ${signals.lintCommand ?? "none"}`,
       `git repository: ${signals.hasGit ? "present" : "absent"}`,
       `top-level dirs: ${topLevelDirs.length > 0 ? topLevelDirs.join(", ") : "none"}`,
@@ -1111,7 +1168,19 @@ export function buildCommandIntent(mode: DraftMode, signals: RepoSignals): Comma
   }
 
   const commands: CommandIntent[] = [];
-  if (signals.testCommand) commands.push({ name: "tests", run: signals.testCommand, timeout: 120, source: "repo-signal" });
+  if (signals.testCommand) {
+    commands.push({ name: "tests", run: signals.testCommand, timeout: 120, source: "repo-signal" });
+  } else if (signals.verifyCommand) {
+    commands.push({ name: "verify", run: signals.verifyCommand, timeout: 120, source: "repo-signal" });
+  }
+
+  if (signals.typecheckCommand) {
+    commands.push({ name: "typecheck", run: signals.typecheckCommand, timeout: 120, source: "repo-signal" });
+  } else if (signals.checkCommand) {
+    commands.push({ name: "check", run: signals.checkCommand, timeout: 120, source: "repo-signal" });
+  }
+
+  if (signals.buildCommand) commands.push({ name: "build", run: signals.buildCommand, timeout: 120, source: "repo-signal" });
   if (signals.lintCommand) commands.push({ name: "lint", run: signals.lintCommand, timeout: 90, source: "repo-signal" });
   if (signals.hasGit) commands.push({ name: "git-log", run: "git log --oneline -10", timeout: 20, source: "heuristic" });
   if (commands.length === 0) commands.push({ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20, source: "heuristic" });
@@ -1424,7 +1493,7 @@ export function renderIterationPrompt(
   body: string,
   iteration: number,
   maxIterations: number,
-  completionGate?: { completionPromise?: string; requiredOutputs?: string[]; failureReasons?: string[]; rejectionReasons?: string[] },
+  completionGate?: { completionPromise?: string; requiredOutputs?: string[]; completionGateMode?: CompletionGateMode; failureReasons?: string[]; rejectionReasons?: string[] },
 ): string {
   if (!completionGate) {
     return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
@@ -1434,16 +1503,27 @@ export function renderIterationPrompt(
   const failureReasons = completionGate.failureReasons ?? [];
   const rejectionReasons = completionGate.rejectionReasons ?? [];
   const completionPromise = completionGate.completionPromise ?? "DONE";
+  const completionGateMode = completionGate.completionGateMode ?? "required";
+  if (completionGateMode === "disabled") {
+    return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
+  }
+
   const gateLines = [
     "[completion gate]",
-    `- Required outputs must exist before stopping${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`,
-    "- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.",
+    completionGateMode === "optional"
+      ? `- Completion gate is advisory${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`
+      : `- Required outputs must exist before stopping${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`,
+    completionGateMode === "optional"
+      ? "- OPEN_QUESTIONS.md should have no remaining P0/P1 items before stopping."
+      : "- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.",
     "- Label inferred claims as HYPOTHESIS.",
     ...(rejectionReasons.length > 0
       ? ["[completion gate rejection]", `- Still missing: ${rejectionReasons.join("; ")}`]
       : []),
     ...(failureReasons.length > 0 ? [`- Previous gate failures: ${failureReasons.join("; ")}`] : []),
-    `- Emit <promise>${completionPromise}</promise> only when the gate is truly satisfied.`,
+    completionGateMode === "optional"
+      ? `- Emit <promise>${completionPromise}</promise> once the work is complete, even if advisory outputs are still missing.`
+      : `- Emit <promise>${completionPromise}</promise> only when the gate is truly satisfied.`,
   ];
 
   return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}\n\n${gateLines.join("\n")}`;

@@ -591,7 +591,14 @@ function selectFiles(candidates: Candidate[]): RepoContextSelectedFile[] {
 }
 
 function summarizeSignals(signals: RepoSignals): string[] {
-  const scripts = [signals.testCommand ? `test=${signals.testCommand}` : undefined, signals.lintCommand ? `lint=${signals.lintCommand}` : undefined].filter((value): value is string => Boolean(value));
+  const scripts = [
+    signals.testCommand ? `test=${signals.testCommand}` : undefined,
+    signals.typecheckCommand ? `typecheck=${signals.typecheckCommand}` : undefined,
+    signals.checkCommand ? `check=${signals.checkCommand}` : undefined,
+    signals.buildCommand ? `build=${signals.buildCommand}` : undefined,
+    signals.verifyCommand ? `verify=${signals.verifyCommand}` : undefined,
+    signals.lintCommand ? `lint=${signals.lintCommand}` : undefined,
+  ].filter((value): value is string => Boolean(value));
 
   return [
     `package manager: ${signals.packageManager ?? "unknown"}`,

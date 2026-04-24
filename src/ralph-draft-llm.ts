@@ -109,6 +109,10 @@ function summarizeRepoSignals(request: DraftRequest): string[] {
   return [
     `package manager: ${request.repoSignals.packageManager ?? "unknown"}`,
     `test command: ${request.repoSignals.testCommand ?? "none"}`,
+    ...(request.repoSignals.typecheckCommand ? [`typecheck command: ${request.repoSignals.typecheckCommand}`] : []),
+    ...(request.repoSignals.checkCommand ? [`check command: ${request.repoSignals.checkCommand}`] : []),
+    ...(request.repoSignals.buildCommand ? [`build command: ${request.repoSignals.buildCommand}`] : []),
+    ...(request.repoSignals.verifyCommand ? [`verify command: ${request.repoSignals.verifyCommand}`] : []),
     `lint command: ${request.repoSignals.lintCommand ?? "none"}`,
     `git repository: ${request.repoSignals.hasGit ? "present" : "absent"}`,
     `top-level dirs: ${topLevelDirs.length > 0 ? topLevelDirs.join(", ") : "none"}`,

@@ -1125,8 +1125,10 @@ function scaffoldRalphTemplate(): string {
 max_iterations: 10
 timeout: 120
 commands: []
+completion_promise: DONE
+completion_gate: optional
 ---
-# {{ task.name }}
+# {{ ralph.name }}
 
 Describe the task here.
 

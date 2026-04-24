@@ -24,7 +24,7 @@ A ralph loop is the right tool when the task is **repetitive, verifiable, or pro
 
 ## Commands
 
-You have six commands available:
+You have seven commands available:
 
 | Command | Purpose |
 |---|---|
@@ -57,6 +57,7 @@ my-task/
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
 | `timeout` | integer | `300` | Seconds per iteration |
 | `completion_promise` | string | — | Done marker. Single line, no `<>` or line breaks |
+| `completion_gate` | `required` \| `optional` \| `disabled` | `required` when `completion_promise` is set | Controls whether required outputs and OPEN_QUESTIONS.md block stopping |
 | `required_outputs` | string[] | `[]` | Relative file paths that must exist for completion |
 | `stop_on_error` | boolean | `true` | `false` continues past RPC errors and timeouts |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns; matching bash commands blocked |
@@ -138,10 +139,15 @@ Commit with `test: add coverage for <module>`.
 
 ### Completion (always include)
 
-Use `completion_promise` and `required_outputs` together. The loop only stops when **both** are satisfied:
+Use `completion_promise` to define the stop signal. Use `completion_gate` to decide whether required outputs and OPEN_QUESTIONS.md can block stopping:
+
+- `required` — the default when `completion_promise` is set; the loop stops only when the promise, required outputs, and OPEN_QUESTIONS.md are all ready
+- `optional` — the prompt still reminds the agent about outputs and OPEN_QUESTIONS.md, but `complete` can happen once the promise is emitted
+- `disabled` — the loop skips completion-gate reminders and checks, so `complete` can happen once the promise is emitted
 
 ```yaml
 completion_promise: DONE
+completion_gate: required
 required_outputs:
   - COVERAGE_REPORT.md
 ```
@@ -198,7 +204,7 @@ guardrails:
 |---|---|
 | `/ralph-stop` | Finish current iteration, then stop |
 | `/ralph-cancel` | Kill current iteration immediately |
-| Completion promise + gate | Stop when `<promise>DONE</promise>` appears AND all `required_outputs` exist |
+| Completion promise + gate | Stop when the promise is matched; `required` gates also require `required_outputs` and OPEN_QUESTIONS.md |
 | `max_iterations` reached | Stop after N iterations |
 | No progress in every iteration | Stop with `no-progress-exhaustion` |
 | `stop_on_error: true` (default) | Stop on RPC error or timeout |

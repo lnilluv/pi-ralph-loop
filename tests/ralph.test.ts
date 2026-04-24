@@ -82,6 +82,20 @@ function makeFixRequest() {
   );
 }
 
+function makeCommandIntentRequest(signals: Partial<RepoSignals>) {
+  return buildDraftRequest(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    {
+      packageManager: "npm",
+      hasGit: false,
+      topLevelDirs: ["src"],
+      topLevelFiles: ["package.json"],
+      ...signals,
+    },
+  );
+}
+
 function makeFixRequestWithArgs(args: readonly string[]) {
   const request = makeFixRequest();
   return {
@@ -111,7 +125,7 @@ test("parseRalphMarkdown falls back to default frontmatter when no frontmatter i
 
 test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => {
   const parsed = parseRalphMarkdown(
-    "\uFEFF---\r\ncommands:\r\n  - name: build\r\n    run: npm test\r\n    timeout: 15\r\nmax_iterations: 3\r\ninter_iteration_delay: 7\r\ntimeout: 12.5\r\nrequired_outputs:\r\n  - docs/ARCHITECTURE.md\r\ncompletion_promise: done\r\nguardrails:\r\n  block_commands:\r\n    - rm .*\r\n  protected_files:\r\n    - src/**\r\n---\r\nBody\r\n",
+    "\uFEFF---\r\ncommands:\r\n  - name: build\r\n    run: npm test\r\n    timeout: 15\r\nmax_iterations: 3\r\ninter_iteration_delay: 7\r\ntimeout: 12.5\r\nrequired_outputs:\r\n  - docs/ARCHITECTURE.md\r\ncompletion_promise: done\r\ncompletion_gate: optional\r\nguardrails:\r\n  block_commands:\r\n    - rm .*\r\n  protected_files:\r\n    - src/**\r\n---\r\nBody\r\n",
   );
 
   assert.deepEqual(parsed.frontmatter, {
@@ -120,6 +134,7 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
     interIterationDelay: 7,
     timeout: 12.5,
     completionPromise: "done",
+    completionGate: "optional",
     requiredOutputs: ["docs/ARCHITECTURE.md"],
     stopOnError: true,
     guardrails: { blockCommands: ["rm .*"], protectedFiles: ["src/**"] },
@@ -265,6 +280,7 @@ test("validateFrontmatter accepts stop_on_error true and false", () => {
   const fmFalse = { ...defaultFrontmatter(), stopOnError: false };
   assert.equal(validateFrontmatter(fmTrue), null);
   assert.equal(validateFrontmatter(fmFalse), null);
+  assert.equal(validateFrontmatter({ ...defaultFrontmatter(), completionGate: "required" }), null);
 });
 
 test("validateFrontmatter rejects unsafe completion_promise values and Mission Brief fails closed", () => {
@@ -328,6 +344,20 @@ test("inspectDraftContent, validateDraftContent, and Mission Brief fail closed o
     assert.doesNotMatch(brief, /Finish behavior/, label);
     assert.doesNotMatch(brief, /<promise>/, label);
   }
+});
+
+test("inspectDraftContent rejects completion_gate values that are the wrong type or invalid", () => {
+  const plan = generateDraft(
+    "Fix flaky auth tests",
+    { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
+    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+  );
+
+  const wrongType = plan.content.replace("timeout: 300\n", "completion_gate: [required]\ntimeout: 300\n");
+  assert.equal(inspectDraftContent(wrongType).error, "Invalid RALPH frontmatter: completion_gate must be a YAML string");
+
+  const invalidValue = plan.content.replace("timeout: 300\n", "completion_gate: maybe\ntimeout: 300\n");
+  assert.equal(inspectDraftContent(invalidValue).error, "Invalid completion_gate: must be required, optional, or disabled");
 });
 
 test("acceptStrengthenedDraft rejects required_outputs changes", () => {
@@ -608,6 +638,26 @@ test("renderIterationPrompt includes completion-gate reminders and previous fail
   assert.match(prompt, /Label inferred claims as HYPOTHESIS\./);
   assert.match(prompt, /Previous gate failures: Missing required output: ARCHITECTURE\.md; OPEN_QUESTIONS\.md still has P0 items/);
   assert.match(prompt, /Emit <promise>DONE<\/promise> only when the gate is truly satisfied\./);
+});
+
+test("renderIterationPrompt handles optional and disabled completion gates", () => {
+  const optionalPrompt = renderIterationPrompt("Body", 2, 5, {
+    completionPromise: "DONE",
+    requiredOutputs: ["ARCHITECTURE.md"],
+    completionGateMode: "optional",
+  });
+
+  assert.match(optionalPrompt, /Completion gate is advisory: ARCHITECTURE\.md/);
+  assert.match(optionalPrompt, /OPEN_QUESTIONS\.md should have no remaining P0\/P1 items before stopping\./);
+  assert.match(optionalPrompt, /Emit <promise>DONE<\/promise> once the work is complete, even if advisory outputs are still missing\./);
+
+  const disabledPrompt = renderIterationPrompt("Body", 2, 5, {
+    completionPromise: "DONE",
+    requiredOutputs: ["ARCHITECTURE.md"],
+    completionGateMode: "disabled",
+  });
+
+  assert.equal(disabledPrompt, "[ralph: iteration 2/5]\n\nBody");
 });
 
 test("renderIterationPrompt includes a rejection section when durable progress is still missing", () => {
@@ -994,18 +1044,83 @@ test("inspectRepo detects bounded package signals", (t) => {
   writeFileSync(join(cwd, "package-lock.json"), "{}", "utf8");
   writeFileSync(
     join(cwd, "package.json"),
-    JSON.stringify({ name: "demo", scripts: { test: "vitest", lint: "eslint ." } }, null, 2),
+    JSON.stringify({
+      name: "demo",
+      scripts: {
+        test: "vitest",
+        typecheck: "tsc --noEmit",
+        check: "npm run lint:check",
+        build: "vite build",
+        verify: "scripts/verify.sh",
+        lint: "eslint .",
+      },
+    }, null, 2),
     "utf8",
   );
 
   assert.deepEqual(inspectRepo(cwd), {
     packageManager: "npm",
     testCommand: "npm test",
+    typecheckCommand: "npm run typecheck",
+    checkCommand: "npm run check",
+    buildCommand: "npm run build",
+    verifyCommand: "npm run verify",
     lintCommand: "npm run lint",
     hasGit: true,
     topLevelDirs: [".git", "src"],
     topLevelFiles: ["package-lock.json", "package.json"],
   });
+});
+
+test("inspectRepo uses yarn run for check scripts in yarn projects", () => {
+  const cwd = createTempDir();
+  writeFileSync(
+    join(cwd, "package.json"),
+    JSON.stringify(
+      {
+        name: "demo",
+        scripts: {
+          check: "eslint .",
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  writeFileSync(join(cwd, "yarn.lock"), "", "utf8");
+
+  assert.deepEqual(inspectRepo(cwd), {
+    packageManager: "yarn",
+    checkCommand: "yarn run check",
+    hasGit: false,
+    topLevelDirs: [],
+    topLevelFiles: ["package.json", "yarn.lock"],
+  });
+});
+
+test("buildDraftRequest includes verify when verify is the only repo signal", () => {
+  const request = makeCommandIntentRequest({ verifyCommand: "npm run verify" });
+
+  assert.deepEqual(request.commandIntent.map(({ name, run }) => ({ name, run })), [
+    { name: "verify", run: "npm run verify" },
+  ]);
+});
+
+test("buildDraftRequest uses check when check is the only repo signal", () => {
+  const request = makeCommandIntentRequest({ checkCommand: "npm run check" });
+
+  assert.deepEqual(request.commandIntent.map(({ name, run }) => ({ name, run })), [
+    { name: "check", run: "npm run check" },
+  ]);
+});
+
+test("buildDraftRequest prefers typecheck over check when both are present", () => {
+  const request = makeCommandIntentRequest({ typecheckCommand: "npm run typecheck", checkCommand: "npm run check" });
+
+  assert.deepEqual(request.commandIntent.map(({ name, run }) => ({ name, run })), [
+    { name: "typecheck", run: "npm run typecheck" },
+  ]);
 });
 
 test("generated drafts reparse as valid RALPH files", () => {
@@ -1799,18 +1914,95 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   const fixDraft = generateDraft(
     "Fix flaky auth tests",
     { slug: "fix-flaky-auth-tests", dirPath: "/repo/fix-flaky-auth-tests", ralphPath: "/repo/fix-flaky-auth-tests/RALPH.md" },
-    { packageManager: "npm", testCommand: "npm test", lintCommand: "npm run lint", hasGit: true, topLevelDirs: ["src"], topLevelFiles: ["package.json"] },
+    {
+      packageManager: "npm",
+      testCommand: "npm test",
+      typecheckCommand: "npm run typecheck",
+      checkCommand: "npm run check",
+      buildCommand: "npm run build",
+      verifyCommand: "npm run verify",
+      lintCommand: "npm run lint",
+      hasGit: false,
+      topLevelDirs: ["src"],
+      topLevelFiles: ["package.json"],
+    },
   );
   const fixParsed = parseRalphMarkdown(fixDraft.content);
   assert.equal(fixDraft.mode, "fix");
   assert.equal(fixDraft.source, "deterministic");
   assert.match(fixDraft.content, /If tests or lint are failing/);
   assert.match(fixDraft.content, /\{\{ commands.tests \}\}/);
+  assert.match(fixDraft.content, /\{\{ commands.typecheck \}\}/);
+  assert.match(fixDraft.content, /\{\{ commands.build \}\}/);
   assert.match(fixDraft.content, /\{\{ commands.lint \}\}/);
+  assert.doesNotMatch(fixDraft.content, /\{\{ commands.check \}\}/);
+  assert.doesNotMatch(fixDraft.content, /\{\{ commands.verify \}\}/);
+  assert.match(fixDraft.content, /run: 'npm test'/);
+  assert.match(fixDraft.content, /run: 'npm run typecheck'/);
+  assert.match(fixDraft.content, /run: 'npm run build'/);
+  assert.match(fixDraft.content, /run: 'npm run lint'/);
   assert.equal(extractDraftMetadata(fixDraft.content)?.task, "Fix flaky auth tests");
   assertMetadataSource(extractDraftMetadata(fixDraft.content), "deterministic");
+  assert.deepEqual(fixParsed.frontmatter.commands, [
+    { name: "tests", run: "npm test", timeout: 120 },
+    { name: "typecheck", run: "npm run typecheck", timeout: 120 },
+    { name: "build", run: "npm run build", timeout: 120 },
+    { name: "lint", run: "npm run lint", timeout: 90 },
+  ]);
   assert.deepEqual(fixParsed.frontmatter.guardrails.protectedFiles, [SECRET_PATH_POLICY_TOKEN]);
   assert.match(fixDraft.safetyLabel, /secret files/);
+});
+
+test("normalizeStrengthenedDraft preserves parseable quoted command scalars", () => {
+  const request = makeFixRequest();
+  const baseline = makeStrengthenedDraft(
+    [
+      "commands:",
+      "  - name: tests",
+      "    run: 'npm run typecheck:fast'",
+      "    timeout: 20",
+      "  - name: build",
+      "    run: 'sh -c \"echo # build\"'",
+      "    timeout: 45",
+      "max_iterations: 25",
+      "timeout: 300",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nOriginal body.",
+  );
+  const strengthenedDraft = makeStrengthenedDraft(
+    [
+      "commands:",
+      "  - name: tests",
+      "    run: 'npm run typecheck:fast'",
+      "    timeout: 20",
+      "  - name: build",
+      "    run: 'sh -c \"echo # build\"'",
+      "    timeout: 45",
+      "max_iterations: 25",
+      "timeout: 300",
+      "guardrails:",
+      "  block_commands:",
+      "    - 'git\\s+push'",
+      "  protected_files:",
+      `    - '${SECRET_PATH_POLICY_TOKEN}'`,
+    ],
+    "Task: Fix flaky auth tests\n\nUpdated body.",
+  );
+
+  const normalized = normalizeStrengthenedDraft({ ...request, baselineDraft: baseline }, strengthenedDraft, "body-only");
+  const reparsed = parseRalphMarkdown(normalized.content);
+
+  assert.deepEqual(reparsed.frontmatter.commands, [
+    { name: "tests", run: "npm run typecheck:fast", timeout: 20 },
+    { name: "build", run: 'sh -c "echo # build"', timeout: 45 },
+  ]);
+  assert.match(normalized.content, /run: 'npm run typecheck:fast'/);
+  assert.match(normalized.content, /run: 'sh -c "echo # build"'/);
 });
 
 test("generated draft metadata survives task text containing HTML comment markers", () => {
@@ -1845,7 +2037,7 @@ test("buildMissionBrief refreshes after draft edits", () => {
     ...plan,
     content: plan.content
       .replace("Task: Fix flaky auth tests", "Task: Fix flaky auth regressions")
-      .replace("name: tests\n    run: npm test\n    timeout: 120", "name: smoke\n    run: npm run smoke\n    timeout: 45")
+      .replace("name: tests\n    run: 'npm test'\n    timeout: 120", "name: smoke\n    run: 'npm run smoke'\n    timeout: 45")
       .replace("max_iterations: 25", "max_iterations: 7")
       .replace("timeout: 300\n", "timeout: 90\ncompletion_promise: deploy-ready\n"),
   };

@@ -5,6 +5,7 @@ import {
   inspectDraftContent,
   renderRalphBody,
   renderIterationPrompt,
+  resolveCompletionGateMode,
   shouldStopForCompletionPromise,
   validateRuntimeArgs,
   type CommandDef,
@@ -374,6 +375,8 @@ export function validateCompletionReadiness(taskDir: string, requiredOutputs: st
   const reasons: string[] = [];
 
   for (const requiredOutput of requiredOutputs) {
+    if (basename(requiredOutput) === RALPH_PROGRESS_FILE) continue;
+
     const filePath = join(taskDir, requiredOutput);
     if (!existsSync(filePath) || !statSync(filePath).isFile()) {
       addReadinessReason(reasons, `Missing required output: ${requiredOutput}`);
@@ -426,6 +429,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
   let currentMaxIterations = initialMaxIterations;
   let currentTimeout = timeout;
   let currentCompletionPromise = initialCompletionPromise;
+  let currentCompletionGateMode: "required" | "optional" | "disabled" = initialCompletionPromise ? "required" : "disabled";
   let currentRequiredOutputs: string[] = [];
   let currentInterIterationDelay = 0;
   let currentGuardrails = initialGuardrails;
@@ -533,6 +537,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       currentMaxIterations = fm.maxIterations;
       currentTimeout = fm.timeout;
       currentCompletionPromise = fm.completionPromise;
+      currentCompletionGateMode = resolveCompletionGateMode(fm);
       currentRequiredOutputs = fm.requiredOutputs ?? [];
       currentInterIterationDelay = fm.interIterationDelay;
       currentGuardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
@@ -579,7 +584,20 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       const body = renderRalphBody(rawBody, commandsOutput, { iteration: i, name, maxIterations: currentMaxIterations }, runtimeArgs);
       const progressMemory = readProgressMemory(taskDir);
       const promptBody = progressMemory !== undefined ? `${renderProgressMemoryPrompt(progressMemory)}\n\n${body}` : body;
-      const prompt = renderIterationPrompt(promptBody, i, currentMaxIterations, currentCompletionPromise ? { completionPromise: currentCompletionPromise, requiredOutputs: currentRequiredOutputs, failureReasons: completionGateFailureReasons, rejectionReasons: completionGateRejectionReasons } : undefined);
+      const prompt = renderIterationPrompt(
+        promptBody,
+        i,
+        currentMaxIterations,
+        currentCompletionPromise && currentCompletionGateMode !== "disabled"
+          ? {
+              completionPromise: currentCompletionPromise,
+              requiredOutputs: currentRequiredOutputs,
+              completionGateMode: currentCompletionGateMode,
+              failureReasons: completionGateFailureReasons,
+              rejectionReasons: completionGateRejectionReasons,
+            }
+          : undefined,
+      );
       const writeIterationTranscriptSafe = (record: IterationRecord, assistantText?: string, note?: string) => {
         try {
           writeIterationTranscript(taskDir, { record, prompt, commandOutputs: commandsOutput, assistantText, note });
@@ -823,7 +841,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       }
 
       let completionGate: CompletionReadiness | undefined;
-      if (completionPromiseMatched && progress !== false) {
+      if (completionPromiseMatched && progress !== false && currentCompletionGateMode !== "disabled") {
         completionGate = validateCompletionReadiness(taskDir, currentRequiredOutputs);
         if (completionRecord) {
           completionRecord.gateChecked = true;
@@ -861,7 +879,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         if (!completionGate.ready) {
           completionGateFailureReasons = completionGate.reasons;
           onNotify?.(
-            `Completion gate blocked on iteration ${i}: ${completionGate.reasons.join("; ")}`,
+            `${currentCompletionGateMode === "required" ? "Completion gate blocked" : "Completion gate not ready"} on iteration ${i}: ${completionGate.reasons.join("; ")}`,
             "warning",
           );
         } else {
@@ -931,7 +949,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
             `Completion promise matched on iteration ${i}, but no durable progress was detected. Continuing.`,
             "warning",
           );
-        } else if (completionGate && !completionGate.ready) {
+        } else if (currentCompletionGateMode === "required" && completionGate && !completionGate.ready) {
           onNotify?.(
             `completion promise matched on iteration ${i}, but the completion gate failed. Continuing.`,
             "warning",
