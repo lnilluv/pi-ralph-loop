@@ -38,6 +38,14 @@
     "loop"
   ],
   "license": "MIT",
+  "files": [
+    "README.md",
+    "docs/release-checklist.md",
+    "examples",
+    "presets",
+    "skills",
+    "src"
+  ],
   "devDependencies": {
     "@types/node": "25.6.0",
     "typescript": "6.0.2"

@@ -1,6 +1,6 @@
 ---
 name: ralph-draft
-description: Use when creating a RALPH.md from a plain-language task description. Covers task classification, bounded project detection, frontmatter generation, and guardrail selection.
+description: Use when turning a plain-language task into a RALPH.md or scaffolding a loop prompt. Covers task classification, bounded project detection, frontmatter generation, and guardrail selection.
 ---
 
 # Draft a RALPH.md
@@ -208,7 +208,7 @@ Tell the user:
 
 ## Quick examples
 
-- `/ralph "reverse engineer this app"` → analysis
-- `/ralph "fix the failing auth tests"` → fix
-- `/ralph "migrate the auth flow to v2"` → migration
-- `/ralph "draft a release note"` → general
+- `/ralph-draft "reverse engineer this app"` → analysis
+- `/ralph-draft "fix the failing auth tests"` → fix
+- `/ralph-draft "migrate the auth flow to v2"` → migration
+- `/ralph-draft "draft a release note"` → general

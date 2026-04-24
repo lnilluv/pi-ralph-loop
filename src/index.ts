@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionEvent, SessionEntry, AgentEndEvent as PiAgentEndEvent, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 
 type ToolExecutionStartEvent = Extract<ExtensionEvent, { type: "tool_execution_start" }>;
@@ -24,6 +25,7 @@ import {
   validateRuntimeArgs,
   createSiblingTarget,
   findBlockedCommandPattern,
+  findShellPolicyBlockedCommandPattern,
 } from "./ralph.ts";
 import { matchesProtectedPath } from "./secret-paths.ts";
 import type { CommandDef, CommandOutput, DraftPlan, DraftTarget, Frontmatter, RuntimeArgs } from "./ralph.ts";
@@ -42,6 +44,7 @@ import {
   recordActiveLoopStopRequest,
   writeActiveLoopRegistryEntry,
   type ActiveLoopRegistryEntry,
+  type IterationRecord,
 } from "./runner-state.ts";
 
 type ProgressState = boolean | "unknown";
@@ -68,7 +71,7 @@ type LoopState = {
   stopRequested: boolean;
   noProgressStreak: number;
   iterationSummaries: IterationSummary[];
-  guardrails: { blockCommands: string[]; protectedFiles: string[] };
+  guardrails: Frontmatter["guardrails"];
   observedTaskDirWrites: Set<string>;
   loopToken?: string;
 };
@@ -81,7 +84,7 @@ type PersistedLoopState = {
   maxIterations?: number;
   noProgressStreak?: number;
   iterationSummaries?: IterationSummary[];
-  guardrails?: { blockCommands: string[]; protectedFiles: string[] };
+  guardrails?: Frontmatter["guardrails"];
   stopRequested?: boolean;
 };
 
@@ -242,17 +245,21 @@ function validateFrontmatter(fm: Frontmatter, ctx: Pick<CommandContext, "ui">): 
 
 export async function runCommands(
   commands: CommandDef[],
-  blockPatterns: string[],
+  guardrailsOrBlockPatterns: Frontmatter["guardrails"] | string[],
   pi: ExtensionAPI,
   runtimeArgs: RuntimeArgs = {},
   cwd?: string,
   taskDir?: string,
 ): Promise<CommandOutput[]> {
   const repoCwd = cwd ?? process.cwd();
+  const guardrails: Frontmatter["guardrails"] = Array.isArray(guardrailsOrBlockPatterns)
+    ? { blockCommands: guardrailsOrBlockPatterns, protectedFiles: [] }
+    : guardrailsOrBlockPatterns;
   const results: CommandOutput[] = [];
   for (const cmd of commands) {
     const semanticRun = replaceArgsPlaceholders(cmd.run, runtimeArgs);
-    const blockedPattern = findBlockedCommandPattern(semanticRun, blockPatterns);
+    const shellPolicyBlocked = findShellPolicyBlockedCommandPattern(semanticRun, guardrails.shellPolicy);
+    const blockedPattern = shellPolicyBlocked ?? findBlockedCommandPattern(semanticRun, guardrails.blockCommands);
     const resolvedRun = resolveCommandRun(cmd.run, runtimeArgs);
     if (blockedPattern) {
       pi.appendEntry?.("ralph-blocked-command", { name: cmd.name, command: semanticRun, blockedPattern, cwd: repoCwd, taskDir });
@@ -394,7 +401,7 @@ function toPersistedLoopState(state: LoopState, overrides: Partial<PersistedLoop
     maxIterations: state.maxIterations,
     noProgressStreak: state.noProgressStreak,
     iterationSummaries: state.iterationSummaries,
-    guardrails: { blockCommands: state.guardrails.blockCommands, protectedFiles: state.guardrails.protectedFiles },
+    guardrails: cloneGuardrails(state.guardrails),
     stopRequested: state.stopRequested,
     ...overrides,
   };
@@ -411,15 +418,57 @@ function sanitizeStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
-function sanitizeGuardrails(value: unknown): { blockCommands: string[]; protectedFiles: string[] } {
+type ShellPolicy = NonNullable<Frontmatter["guardrails"]["shellPolicy"]>;
+
+function isShellPolicy(value: unknown): value is ShellPolicy {
+  if (!value || typeof value !== "object") return false;
+  const shellPolicy = value as { mode?: unknown; allow?: unknown };
+  if (shellPolicy.mode === "allowlist") {
+    return Array.isArray(shellPolicy.allow) && shellPolicy.allow.length > 0 && shellPolicy.allow.every((item) => typeof item === "string");
+  }
+  if (shellPolicy.mode === "blocklist") {
+    return shellPolicy.allow === undefined || (Array.isArray(shellPolicy.allow) && shellPolicy.allow.length === 0);
+  }
+  return false;
+}
+
+function shellPolicyAllowPatterns(shellPolicy?: ShellPolicy): string[] {
+  return shellPolicy?.mode === "allowlist" ? shellPolicy.allow : [];
+}
+
+function areShellPoliciesEqual(left?: ShellPolicy, right?: ShellPolicy): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  if (left.mode !== right.mode) return false;
+  return areStringArraysEqual(shellPolicyAllowPatterns(left), shellPolicyAllowPatterns(right));
+}
+
+function cloneShellPolicy(shellPolicy?: ShellPolicy): ShellPolicy | undefined {
+  if (!shellPolicy) return undefined;
+  return shellPolicy.mode === "allowlist"
+    ? { mode: "allowlist", allow: [...shellPolicy.allow] }
+    : { mode: "blocklist" };
+}
+
+function cloneGuardrails(guardrails: { blockCommands: string[]; protectedFiles: string[]; shellPolicy?: ShellPolicy }): Frontmatter["guardrails"] {
+  const shellPolicy = cloneShellPolicy(guardrails.shellPolicy);
+  return {
+    blockCommands: [...guardrails.blockCommands],
+    protectedFiles: [...guardrails.protectedFiles],
+    ...(shellPolicy ? { shellPolicy } : {}),
+  };
+}
+
+function sanitizeGuardrails(value: unknown): Frontmatter["guardrails"] {
   if (!value || typeof value !== "object") {
     return { blockCommands: [], protectedFiles: [] };
   }
-  const guardrails = value as { blockCommands?: unknown; protectedFiles?: unknown };
-  return {
+  const guardrails = value as { blockCommands?: unknown; protectedFiles?: unknown; shellPolicy?: unknown };
+  return cloneGuardrails({
     blockCommands: sanitizeStringArray(guardrails.blockCommands),
     protectedFiles: sanitizeStringArray(guardrails.protectedFiles),
-  };
+    ...(isShellPolicy(guardrails.shellPolicy) ? { shellPolicy: guardrails.shellPolicy } : {}),
+  });
 }
 
 function sanitizeProgressState(value: unknown): ProgressState {
@@ -470,24 +519,26 @@ function parseLoopContractInteger(raw: string | undefined): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
-function parseLoopContractGuardrails(raw: string | undefined): { blockCommands: string[]; protectedFiles: string[] } | undefined {
+function parseLoopContractGuardrails(raw: string | undefined): Frontmatter["guardrails"] | undefined {
   if (typeof raw !== "string") return undefined;
   try {
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return undefined;
-    const guardrails = parsed as { blockCommands?: unknown; protectedFiles?: unknown };
+    const guardrails = parsed as { blockCommands?: unknown; protectedFiles?: unknown; shellPolicy?: unknown };
     if (
       !Array.isArray(guardrails.blockCommands) ||
       !guardrails.blockCommands.every((item) => typeof item === "string") ||
       !Array.isArray(guardrails.protectedFiles) ||
-      !guardrails.protectedFiles.every((item) => typeof item === "string")
+      !guardrails.protectedFiles.every((item) => typeof item === "string") ||
+      (guardrails.shellPolicy !== undefined && !isShellPolicy(guardrails.shellPolicy))
     ) {
       return undefined;
     }
-    return {
+    return cloneGuardrails({
       blockCommands: [...guardrails.blockCommands],
       protectedFiles: [...guardrails.protectedFiles],
-    };
+      ...(guardrails.shellPolicy ? { shellPolicy: guardrails.shellPolicy } : {}),
+    });
   } catch {
     return undefined;
   }
@@ -581,14 +632,15 @@ function readDurableLoopState(taskDir: string, envState: ActiveLoopState): Activ
     status.taskDir !== taskDir ||
     !guardrails ||
     !isStringArray(guardrails.blockCommands) ||
-    !isStringArray(guardrails.protectedFiles)
+    !isStringArray(guardrails.protectedFiles) ||
+    (guardrails.shellPolicy !== undefined && !isShellPolicy(guardrails.shellPolicy))
   ) {
     return undefined;
   }
 
   const durableLoopToken = status.loopToken;
   const durableCwd = status.cwd;
-  const durableGuardrails = guardrails as { blockCommands: string[]; protectedFiles: string[] };
+  const durableGuardrails = guardrails as Frontmatter["guardrails"];
 
   if (
     durableLoopToken !== envState.loopToken ||
@@ -596,7 +648,8 @@ function readDurableLoopState(taskDir: string, envState: ActiveLoopState): Activ
     status.currentIteration !== envState.iteration ||
     status.maxIterations !== envState.maxIterations ||
     !areStringArraysEqual(durableGuardrails.blockCommands, envGuardrails.blockCommands) ||
-    !areStringArraysEqual(durableGuardrails.protectedFiles, envGuardrails.protectedFiles)
+    !areStringArraysEqual(durableGuardrails.protectedFiles, envGuardrails.protectedFiles) ||
+    !areShellPoliciesEqual(durableGuardrails.shellPolicy, envGuardrails.shellPolicy)
   ) {
     return undefined;
   }
@@ -614,10 +667,7 @@ function readDurableLoopState(taskDir: string, envState: ActiveLoopState): Activ
     maxIterations: status.maxIterations,
     noProgressStreak: envState.noProgressStreak,
     iterationSummaries,
-    guardrails: {
-      blockCommands: [...durableGuardrails.blockCommands],
-      protectedFiles: [...durableGuardrails.protectedFiles],
-    },
+    guardrails: cloneGuardrails(durableGuardrails),
     stopRequested: checkStopSignal(taskDir),
   };
 }
@@ -805,6 +855,76 @@ function writeDraftFile(ralphPath: string, content: string) {
 function displayPath(cwd: string, filePath: string): string {
   const rel = relative(cwd, filePath);
   return rel && !rel.startsWith("..") ? `./${rel}` : filePath;
+}
+
+type LifecycleTarget = { taskDir: string; ralphPath: string };
+
+function resolveLifecycleTarget(ctx: Pick<CommandContext, "cwd" | "ui">, input: string, commandName: string): LifecycleTarget | undefined {
+  const inspection = inspectExistingTarget(input, ctx.cwd, true);
+  switch (inspection.kind) {
+    case "run":
+      return { taskDir: dirname(inspection.ralphPath), ralphPath: inspection.ralphPath };
+    case "invalid-markdown":
+      ctx.ui.notify(`Only task folders or RALPH.md can be used with ${commandName}. ${displayPath(ctx.cwd, inspection.path)} is not runnable.`, "error");
+      return undefined;
+    case "invalid-target":
+      ctx.ui.notify(`Only task folders or RALPH.md can be used with ${commandName}. ${displayPath(ctx.cwd, inspection.path)} is a file, not a task folder.`, "error");
+      return undefined;
+    case "dir-without-ralph":
+    case "missing-path":
+      return { taskDir: inspection.dirPath, ralphPath: inspection.ralphPath };
+    case "not-path": {
+      const taskDir = resolve(ctx.cwd, input);
+      return { taskDir, ralphPath: join(taskDir, "RALPH.md") };
+    }
+  }
+}
+
+function findActiveLifecycleRegistryEntry(ctx: Pick<CommandContext, "cwd">, taskDir: string): ActiveLoopRegistryEntry | undefined {
+  const activeEntry = listActiveLoopRegistryEntries(ctx.cwd).find((entry) => entry.taskDir === taskDir);
+  if (activeEntry) {
+    return activeEntry;
+  }
+
+  const statusFile = readStatusFile(taskDir);
+  if (
+    statusFile &&
+    (statusFile.status === "running" || statusFile.status === "initializing") &&
+    typeof statusFile.cwd === "string" &&
+    statusFile.cwd.length > 0
+  ) {
+    return listActiveLoopRegistryEntries(statusFile.cwd).find(
+      (entry) => entry.taskDir === taskDir && entry.loopToken === statusFile.loopToken,
+    );
+  }
+
+  return undefined;
+}
+
+function summarizeIterationRecord(record: IterationRecord): string {
+  const parts = [`lastIteration: #${record.iteration}`];
+  if (typeof record.durationMs === "number") {
+    parts.push(`durationMs=${record.durationMs}`);
+  }
+  parts.push(`progress=${record.progress}`);
+  if (record.completionGate) {
+    const gateStatus = record.completionGate.ready
+      ? "ready"
+      : `blocked${record.completionGate.reasons.length > 0 ? ` (${record.completionGate.reasons.join("; ")})` : ""}`;
+    parts.push(`completionGate=${gateStatus}`);
+  } else if (record.completion?.blockingReasons?.length) {
+    parts.push(`completionGate=blocked (${record.completion.blockingReasons.join("; ")})`);
+  }
+  return parts.join(" ");
+}
+
+function archiveRunnerArtifacts(taskDir: string, archiveName = new Date().toISOString().replace(/[:.]/g, "-")): string {
+  const runnerDir = join(taskDir, ".ralph-runner");
+  const archiveRoot = join(taskDir, ".ralph-runner-archive");
+  const archiveDir = join(archiveRoot, archiveName);
+  mkdirSync(archiveRoot, { recursive: true });
+  renameSync(runnerDir, archiveDir);
+  return archiveDir;
 }
 
 function exportRalphLogs(taskDir: string, destDir: string): { iterations: number; events: number; transcripts: number } {
@@ -1120,6 +1240,23 @@ function applyStopTarget(
 let loopState: LoopState = defaultLoopState();
 const RALPH_EXTENSION_REGISTERED = Symbol.for("pi-ralph-loop.registered");
 
+const SCAFFOLD_PRESET_FILES = {
+  "fix-tests": new URL("../presets/fix-tests/RALPH.md", import.meta.url),
+  migration: new URL("../presets/migration/RALPH.md", import.meta.url),
+  "research-report": new URL("../presets/research-report/RALPH.md", import.meta.url),
+  "security-audit": new URL("../presets/security-audit/RALPH.md", import.meta.url),
+} as const;
+
+type ScaffoldPresetName = keyof typeof SCAFFOLD_PRESET_FILES;
+
+type ScaffoldArgs = {
+  preset?: ScaffoldPresetName;
+  target?: string;
+  error?: string;
+};
+
+const SCAFFOLD_PRESET_NAMES = Object.keys(SCAFFOLD_PRESET_FILES) as ScaffoldPresetName[];
+
 function scaffoldRalphTemplate(): string {
   return `---
 max_iterations: 10
@@ -1138,6 +1275,105 @@ Use {{ commands.* }} outputs as evidence.
 ## Completion
 Stop with <promise>DONE</promise> when finished.
 `;
+}
+
+function tokenizeScaffoldArgs(raw: string): { tokens: string[]; error?: string } {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | undefined;
+  let inToken = false;
+
+  for (const char of raw) {
+    if (quote) {
+      if (char === quote) {
+        quote = undefined;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      inToken = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (inToken) {
+        tokens.push(current);
+        current = "";
+        inToken = false;
+      }
+      continue;
+    }
+
+    current += char;
+    inToken = true;
+  }
+
+  if (quote) {
+    return { tokens, error: "Unterminated quote in /ralph-scaffold arguments." };
+  }
+
+  if (inToken) {
+    tokens.push(current);
+  }
+
+  return { tokens };
+}
+
+function parseScaffoldArgs(raw: string): ScaffoldArgs {
+  const tokenized = tokenizeScaffoldArgs(raw);
+  if (tokenized.error) return { error: tokenized.error };
+
+  const positional: string[] = [];
+  let presetName: string | undefined;
+
+  for (let index = 0; index < tokenized.tokens.length; index += 1) {
+    const token = tokenized.tokens[index];
+    if (token === "--preset" || token === "-p") {
+      const value = tokenized.tokens[index + 1];
+      if (!value) return { error: "/ralph-scaffold --preset requires a preset name." };
+      presetName = value;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--preset=")) {
+      const value = token.slice("--preset=".length).trim();
+      if (!value) return { error: "/ralph-scaffold --preset requires a preset name." };
+      presetName = value;
+      continue;
+    }
+
+    if (token.startsWith("-")) {
+      return { error: `Unknown /ralph-scaffold option: ${token}` };
+    }
+
+    positional.push(token);
+  }
+
+  if (positional.length === 0) {
+    return { error: "/ralph-scaffold expects a task name or path." };
+  }
+  if (positional.length > 1) {
+    return { error: "/ralph-scaffold expects a single task name or path. Use quotes for paths with spaces." };
+  }
+
+  if (presetName !== undefined && !Object.prototype.hasOwnProperty.call(SCAFFOLD_PRESET_FILES, presetName)) {
+    return { error: `Unknown scaffold preset "${presetName}". Available presets: ${SCAFFOLD_PRESET_NAMES.join(", ")}.` };
+  }
+
+  return { preset: presetName as ScaffoldPresetName | undefined, target: positional[0] };
+}
+
+function readScaffoldPresetTemplate(preset: ScaffoldPresetName): string {
+  return readFileSync(fileURLToPath(SCAFFOLD_PRESET_FILES[preset]), "utf8");
+}
+
+function scaffoldTemplateForPreset(preset?: ScaffoldPresetName): string {
+  return preset ? readScaffoldPresetTemplate(preset) : scaffoldRalphTemplate();
 }
 
 function slugifyTaskName(text: string): string {
@@ -1256,7 +1492,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         stopRequested: false,
         noProgressStreak: 0,
         iterationSummaries: [],
-        guardrails: { blockCommands: frontmatter.guardrails.blockCommands, protectedFiles: frontmatter.guardrails.protectedFiles },
+        guardrails: cloneGuardrails(frontmatter.guardrails),
         observedTaskDirWrites: new Set(),
         loopToken: randomUUID(),
       };
@@ -1277,7 +1513,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         runtimeArgs,
         modelPattern: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
         thinkingLevel: ctx.model?.reasoning ? "high" : undefined,
-        runCommandsFn: async (commands, blocked, commandPi, cwd, taskDir) => runCommands(commands, blocked, commandPi as ExtensionAPI, runtimeArgs, cwd, taskDir),
+        runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir) => runCommands(commands, guardrails, commandPi as ExtensionAPI, runtimeArgs, cwd, taskDir),
         onStatusChange(status) {
           ctx.ui.setStatus("ralph", status === "running" || status === "initializing" ? `🔁 ${name}: running` : undefined);
         },
@@ -1463,7 +1699,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
     if (event.toolName === "bash") {
       const cmd = (event.input as { command?: string }).command ?? "";
-      const blockedPattern = findBlockedCommandPattern(cmd, persisted.guardrails?.blockCommands ?? []);
+      const shellPolicyBlocked = findShellPolicyBlockedCommandPattern(cmd, persisted.guardrails?.shellPolicy);
+      const blockedPattern = shellPolicyBlocked ?? findBlockedCommandPattern(cmd, persisted.guardrails?.blockCommands ?? []);
       if (blockedPattern) {
         appendLoopProofEntry("ralph-blocked-command", {
           loopToken: persisted.loopToken,
@@ -1582,6 +1819,112 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     description: "Draft a Ralph task without starting it",
     handler: async (args: string, ctx: CommandContext) => {
       await handleDraftCommand("ralph-draft", args ?? "", ctx);
+    },
+  });
+
+  pi.registerCommand("ralph-list", {
+    description: "List active Ralph loops",
+    handler: async (_args: string, ctx: CommandContext) => {
+      const entries = listActiveLoopRegistryEntries(ctx.cwd).slice().sort((a, b) => a.taskDir.localeCompare(b.taskDir));
+      if (entries.length === 0) {
+        ctx.ui.notify("No active ralph loops found.", "info");
+        return;
+      }
+
+      const lines = entries.map((entry) => `${basename(entry.taskDir)} | ${displayPath(ctx.cwd, entry.taskDir)} | ${entry.status} | ${entry.currentIteration}/${entry.maxIterations}`);
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("ralph-status", {
+    description: "Show durable Ralph run status",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseCommandArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+
+      const target = resolveLifecycleTarget(ctx, parsed.value?.trim() || ".", "/ralph-status");
+      if (!target) return;
+
+      const statusFile = readStatusFile(target.taskDir);
+      if (!statusFile) {
+        ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, target.taskDir)}.`, "warning");
+        return;
+      }
+
+      const lines = [
+        `task: ${displayPath(ctx.cwd, target.taskDir)}`,
+        `status: ${statusFile.status}`,
+        `startedAt: ${statusFile.startedAt}`,
+        `currentIteration: ${statusFile.currentIteration}/${statusFile.maxIterations}`,
+        `lastUpdate: ${statusFile.completedAt ?? statusFile.startedAt}`,
+      ];
+
+      const iterationRecords = readIterationRecords(target.taskDir);
+      const lastIteration = iterationRecords[iterationRecords.length - 1];
+      if (lastIteration) {
+        lines.push(summarizeIterationRecord(lastIteration));
+      }
+
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("ralph-resume", {
+    description: "Start a new Ralph run from an existing RALPH.md",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseCommandArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+
+      const target = resolveLifecycleTarget(ctx, parsed.value?.trim() || ".", "/ralph-resume");
+      if (!target) return;
+
+      const activeEntry = findActiveLifecycleRegistryEntry(ctx, target.taskDir);
+      if (activeEntry) {
+        ctx.ui.notify(`A ralph loop is already active at ${displayPath(ctx.cwd, target.taskDir)}. Use /ralph-stop or /ralph-cancel first.`, "warning");
+        return;
+      }
+
+      if (!existsSync(target.ralphPath)) {
+        ctx.ui.notify(`No RALPH.md found at ${displayPath(ctx.cwd, target.ralphPath)}.`, "error");
+        return;
+      }
+
+      await startRalphLoop(target.ralphPath, ctx, services.runRalphLoopFn, {});
+    },
+  });
+
+  pi.registerCommand("ralph-archive", {
+    description: "Archive Ralph run artifacts",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseCommandArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+
+      const target = resolveLifecycleTarget(ctx, parsed.value?.trim() || ".", "/ralph-archive");
+      if (!target) return;
+
+      const activeEntry = findActiveLifecycleRegistryEntry(ctx, target.taskDir);
+      if (activeEntry) {
+        ctx.ui.notify(`A ralph loop is already active at ${displayPath(ctx.cwd, target.taskDir)}. Use /ralph-stop or /ralph-cancel first.`, "warning");
+        return;
+      }
+
+      const runnerDir = join(target.taskDir, ".ralph-runner");
+      if (!existsSync(runnerDir) || !lstatSync(runnerDir).isDirectory()) {
+        ctx.ui.notify(`No .ralph-runner directory found at ${displayPath(ctx.cwd, runnerDir)}.`, "warning");
+        return;
+      }
+
+      const archiveDir = archiveRunnerArtifacts(target.taskDir);
+      ctx.ui.notify(`Archived run artifacts to ${displayPath(ctx.cwd, archiveDir)}`, "info");
     },
   });
 
@@ -1729,7 +2072,14 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   pi.registerCommand("ralph-scaffold", {
     description: "Create a non-interactive RALPH.md starter template",
     handler: async (args: string, ctx: CommandContext) => {
-      const name = (args ?? "").trim();
+      const parsed = parseScaffoldArgs(args ?? "");
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+
+      const name = parsed.target;
+      const preset = parsed.preset;
       if (!name) {
         ctx.ui.notify("/ralph-scaffold expects a task name or path.", "error");
         return;
@@ -1753,7 +2103,45 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
       const resolvedTaskDir = resolve(taskDir);
       const resolvedCwd = resolve(ctx.cwd);
-      if (!resolvedTaskDir.startsWith(resolvedCwd + "/") && resolvedTaskDir !== resolvedCwd) {
+      const realCwd = (() => {
+        try {
+          return realpathSync(resolvedCwd);
+        } catch {
+          return resolvedCwd;
+        }
+      })();
+      const isWithinRoot = (root: string, candidate: string): boolean => {
+        const relativePath = relative(root, candidate);
+        return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+      };
+      const hasSymlinkedSegment = (root: string, candidate: string): boolean => {
+        const relativePath = relative(root, candidate);
+        if (relativePath === "") return false;
+        if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
+          return true;
+        }
+
+        const segments = relativePath.split(/[\\/]/).filter(Boolean);
+        let currentPath = root;
+        for (const segment of segments) {
+          currentPath = join(currentPath, segment);
+          if (!existsSync(currentPath)) continue;
+          try {
+            if (lstatSync(currentPath).isSymbolicLink()) return true;
+          } catch {
+            return true;
+          }
+        }
+
+        return false;
+      };
+
+      if (!isWithinRoot(resolvedCwd, resolvedTaskDir)) {
+        ctx.ui.notify("Task path must be within the current working directory.", "error");
+        return;
+      }
+
+      if (hasSymlinkedSegment(resolvedCwd, resolvedTaskDir)) {
         ctx.ui.notify("Task path must be within the current working directory.", "error");
         return;
       }
@@ -1769,7 +2157,22 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
 
       mkdirSync(taskDir, { recursive: true });
-      writeFileSync(ralphPath, scaffoldRalphTemplate(), "utf8");
+      const realTaskDir = realpathSync(taskDir);
+      if (!isWithinRoot(realCwd, realTaskDir)) {
+        ctx.ui.notify("Task path must be within the current working directory.", "error");
+        return;
+      }
+
+      let scaffoldTemplate: string;
+      try {
+        scaffoldTemplate = scaffoldTemplateForPreset(preset);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Unable to load scaffold preset${preset ? ` "${preset}"` : ""}: ${message}`, "error");
+        return;
+      }
+
+      writeFileSync(ralphPath, scaffoldTemplate, "utf8");
       ctx.ui.notify(`Scaffolded ${displayPath(ctx.cwd, ralphPath)}`, "info");
     },
   });

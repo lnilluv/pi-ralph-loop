@@ -10,17 +10,22 @@ export type CompletionGateMode = "required" | "optional" | "disabled";
 export type CommandIntent = CommandDef & { source: "heuristic" | "repo-signal" };
 export type RuntimeArg = { name: string; value: string };
 export type RuntimeArgs = Record<string, string>;
+export type ShellPolicy =
+  | { mode: "blocklist" }
+  | { mode: "allowlist"; allow: string[] };
 export type Frontmatter = {
   commands: CommandDef[];
   args?: string[];
   maxIterations: number;
   interIterationDelay: number;
+  itemsPerIteration?: number;
+  reflectEvery?: number;
   timeout: number;
   completionPromise?: string;
   completionGate?: CompletionGateMode;
   requiredOutputs?: string[];
   stopOnError: boolean;
-  guardrails: { blockCommands: string[]; protectedFiles: string[] };
+  guardrails: { blockCommands: string[]; protectedFiles: string[]; shellPolicy?: ShellPolicy };
   invalidCommandEntries?: number[];
   invalidArgEntries?: number[];
 };
@@ -162,6 +167,11 @@ function parseStringArray(value: unknown): { values: string[]; invalidEntries?: 
   return { values, invalidEntries: invalidEntries.length > 0 ? invalidEntries : undefined };
 }
 
+function parseOptionalNumber(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  return Number(value);
+}
+
 function isUniversalProtectedGlob(pattern: string): boolean {
   const trimmed = pattern.trim().replace(/\/+$/, "");
   if (!trimmed) return true;
@@ -198,6 +208,28 @@ function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | nul
     !Array.isArray(guardrails.protected_files)
   ) {
     return "Invalid RALPH frontmatter: guardrails.protected_files must be a YAML sequence";
+  }
+  if (Object.prototype.hasOwnProperty.call(guardrails, "shell_policy")) {
+    const shellPolicy = guardrails.shell_policy;
+    if (!isRecord(shellPolicy)) {
+      return "Invalid RALPH frontmatter: guardrails.shell_policy must be a YAML mapping";
+    }
+    if (Object.prototype.hasOwnProperty.call(shellPolicy, "mode") && typeof shellPolicy.mode !== "string") {
+      return "Invalid RALPH frontmatter: guardrails.shell_policy.mode must be a YAML string";
+    }
+    if (Object.prototype.hasOwnProperty.call(shellPolicy, "allow") && !Array.isArray(shellPolicy.allow)) {
+      return "Invalid RALPH frontmatter: guardrails.shell_policy.allow must be a YAML sequence";
+    }
+    if (Array.isArray(shellPolicy.allow)) {
+      for (const [index, entry] of shellPolicy.allow.entries()) {
+        if (typeof entry !== "string") {
+          return `Invalid RALPH frontmatter: guardrails.shell_policy.allow[${index}] must be a YAML string`;
+        }
+      }
+      if (shellPolicy.mode === "blocklist" && shellPolicy.allow.length > 0) {
+        return "Invalid RALPH frontmatter: guardrails.shell_policy.allow must be absent or empty when mode is blocklist";
+      }
+    }
   }
   return null;
 }
@@ -306,6 +338,18 @@ function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | nu
     return "Invalid RALPH frontmatter: max_iterations must be a YAML number";
   }
   if (
+    Object.prototype.hasOwnProperty.call(rawFrontmatter, "items_per_iteration") &&
+    (typeof rawFrontmatter.items_per_iteration !== "number" || !Number.isFinite(rawFrontmatter.items_per_iteration))
+  ) {
+    return "Invalid RALPH frontmatter: items_per_iteration must be a YAML number";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(rawFrontmatter, "reflect_every") &&
+    (typeof rawFrontmatter.reflect_every !== "number" || !Number.isFinite(rawFrontmatter.reflect_every))
+  ) {
+    return "Invalid RALPH frontmatter: reflect_every must be a YAML number";
+  }
+  if (
     Object.prototype.hasOwnProperty.call(rawFrontmatter, "inter_iteration_delay") &&
     (typeof rawFrontmatter.inter_iteration_delay !== "number" || !Number.isFinite(rawFrontmatter.inter_iteration_delay))
   ) {
@@ -366,6 +410,15 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
     labels.push("blocks git push");
   } else if (guardrails.blockCommands.length > 0) {
     labels.push(`blocks ${guardrails.blockCommands.length} command pattern${guardrails.blockCommands.length === 1 ? "" : "s"}`);
+  }
+  if (guardrails.shellPolicy?.mode === "allowlist") {
+    labels.push(
+      guardrails.shellPolicy.allow.length > 0
+        ? `shell allowlist with ${guardrails.shellPolicy.allow.length} regex${guardrails.shellPolicy.allow.length === 1 ? "" : "es"}`
+        : "shell allowlist",
+    );
+  } else if (guardrails.shellPolicy?.mode === "blocklist") {
+    labels.push("shell command blocklist");
   }
   if (guardrails.protectedFiles.some((pattern) => pattern === SECRET_PATH_POLICY_TOKEN || isSecretBearingPath(pattern))) {
     labels.push("blocks write/edit to secret files");
@@ -525,6 +578,23 @@ function renderCommandsYaml(commands: CommandDef[]): string[] {
   ];
 }
 
+function shellPolicyAllowPatterns(shellPolicy?: ShellPolicy): string[] {
+  return shellPolicy?.mode === "allowlist" ? shellPolicy.allow : [];
+}
+
+function renderShellPolicyYaml(shellPolicy?: ShellPolicy): string[] {
+  if (!shellPolicy) return [];
+  return shellPolicy.mode === "allowlist"
+    ? [
+        "  shell_policy:",
+        "    mode: allowlist",
+        ...(shellPolicy.allow.length > 0
+          ? ["    allow:", ...shellPolicy.allow.map((pattern) => `      - ${yamlQuote(pattern)}`)]
+          : ["    allow: []"]),
+      ]
+    : ["  shell_policy:", "    mode: blocklist"];
+}
+
 function bodySection(title: string, placeholder: string): string {
   return `${title}:\n${placeholder}`;
 }
@@ -554,6 +624,9 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
   });
   const parsedArgs = parseStringArray(yaml.args);
   const guardrails = isRecord(yaml.guardrails) ? yaml.guardrails : {};
+  const rawShellPolicy = isRecord(guardrails.shell_policy) ? guardrails.shell_policy : undefined;
+  const itemsPerIteration = parseOptionalNumber(yaml.items_per_iteration);
+  const reflectEvery = parseOptionalNumber(yaml.reflect_every);
 
   return {
     frontmatter: {
@@ -561,6 +634,8 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
       ...(parsedArgs.values.length > 0 ? { args: parsedArgs.values } : {}),
       maxIterations: Number(yaml.max_iterations ?? 50),
       interIterationDelay: Number(yaml.inter_iteration_delay ?? 0),
+      ...(itemsPerIteration !== undefined ? { itemsPerIteration } : {}),
+      ...(reflectEvery !== undefined ? { reflectEvery } : {}),
       timeout: Number(yaml.timeout ?? 300),
       completionPromise:
         typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
@@ -570,6 +645,14 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
       guardrails: {
         blockCommands: toStringArray(guardrails.block_commands),
         protectedFiles: toStringArray(guardrails.protected_files),
+        ...(rawShellPolicy
+          ? {
+              shellPolicy:
+                String(rawShellPolicy.mode ?? "") === "allowlist"
+                  ? { mode: "allowlist", allow: toStringArray(rawShellPolicy.allow) }
+                  : ({ mode: String(rawShellPolicy.mode ?? "") as ShellPolicy["mode"] } as ShellPolicy),
+            }
+          : {}),
       },
       invalidCommandEntries: invalidCommandEntries.length > 0 ? invalidCommandEntries : undefined,
       ...(parsedArgs.invalidEntries ? { invalidArgEntries: parsedArgs.invalidEntries } : {}),
@@ -590,6 +673,12 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
   }
   if (!Number.isFinite(fm.interIterationDelay) || !Number.isInteger(fm.interIterationDelay) || fm.interIterationDelay < 0) {
     return "Invalid inter_iteration_delay: must be a non-negative integer";
+  }
+  if (fm.itemsPerIteration !== undefined && (!Number.isFinite(fm.itemsPerIteration) || !Number.isInteger(fm.itemsPerIteration) || fm.itemsPerIteration < 1 || fm.itemsPerIteration > 20)) {
+    return "Invalid items_per_iteration: must be an integer between 1 and 20";
+  }
+  if (fm.reflectEvery !== undefined && (!Number.isFinite(fm.reflectEvery) || !Number.isInteger(fm.reflectEvery) || fm.reflectEvery < 2 || fm.reflectEvery > 20)) {
+    return "Invalid reflect_every: must be an integer between 2 and 20";
   }
   if (!Number.isFinite(fm.timeout) || fm.timeout <= 0 || fm.timeout > 300) {
     return "Invalid timeout: must be greater than 0 and at most 300";
@@ -628,6 +717,27 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
       new RegExp(pattern);
     } catch {
       return `Invalid block_commands regex: ${pattern}`;
+    }
+  }
+  const shellPolicy = fm.guardrails.shellPolicy;
+  if (shellPolicy !== undefined) {
+    if (shellPolicy.mode !== "blocklist" && shellPolicy.mode !== "allowlist") {
+      return "Invalid shell_policy.mode: must be blocklist or allowlist";
+    }
+    if (shellPolicy.mode === "allowlist") {
+      const allow = (shellPolicy as { allow?: string[] }).allow;
+      if (!Array.isArray(allow) || allow.length === 0) {
+        return "Invalid shell_policy.allow: allowlist mode requires at least one regex";
+      }
+      for (const pattern of allow) {
+        try {
+          new RegExp(pattern);
+        } catch {
+          return `Invalid shell_policy.allow regex: ${pattern}`;
+        }
+      }
+    } else if ((shellPolicy as { allow?: string[] }).allow?.length) {
+      return "Invalid shell_policy.allow: blocklist mode must be absent or empty when mode is blocklist";
     }
   }
   for (const pattern of fm.guardrails.protectedFiles) {
@@ -705,9 +815,13 @@ export function acceptStrengthenedDraft(request: DraftRequest, strengthenedDraft
   if (baseline.parsed.frontmatter.timeout < strengthened.parsed.frontmatter.timeout) {
     return null;
   }
+  const baselineShellPolicy = baseline.parsed.frontmatter.guardrails.shellPolicy;
+  const strengthenedShellPolicy = strengthened.parsed.frontmatter.guardrails.shellPolicy;
   if (
     baseline.parsed.frontmatter.guardrails.blockCommands.join("\n") !== strengthened.parsed.frontmatter.guardrails.blockCommands.join("\n") ||
-    baseline.parsed.frontmatter.guardrails.protectedFiles.join("\n") !== strengthened.parsed.frontmatter.guardrails.protectedFiles.join("\n")
+    baseline.parsed.frontmatter.guardrails.protectedFiles.join("\n") !== strengthened.parsed.frontmatter.guardrails.protectedFiles.join("\n") ||
+    baselineShellPolicy?.mode !== strengthenedShellPolicy?.mode ||
+    shellPolicyAllowPatterns(baselineShellPolicy).join("\n") !== shellPolicyAllowPatterns(strengthenedShellPolicy).join("\n")
   ) {
     return null;
   }
@@ -751,6 +865,22 @@ export function findBlockedCommandPattern(command: string, blockPatterns: string
     }
   }
   return undefined;
+}
+
+export function findAllowedCommandPattern(command: string, allowPatterns: string[]): string | undefined {
+  for (const pattern of allowPatterns) {
+    try {
+      if (new RegExp(pattern).test(command)) return pattern;
+    } catch {
+      // ignore malformed regexes; validateFrontmatter should catch these first
+    }
+  }
+  return undefined;
+}
+
+export function findShellPolicyBlockedCommandPattern(command: string, shellPolicy?: Frontmatter["guardrails"]["shellPolicy"]): string | undefined {
+  if (!shellPolicy || shellPolicy.mode !== "allowlist") return undefined;
+  return findAllowedCommandPattern(command, shellPolicy.allow) ? undefined : "shell_policy.allowlist";
 }
 
 function hasRuntimeArgToken(text: string): boolean {
@@ -1258,6 +1388,7 @@ function renderDraftPlan(task: string, mode: DraftMode, target: DraftTarget, fro
       : []),
     ...(frontmatter.completionPromise ? [`completion_promise: ${yamlQuote(frontmatter.completionPromise)}`] : []),
     "guardrails:",
+    ...(frontmatter.guardrails.shellPolicy ? renderShellPolicyYaml(frontmatter.guardrails.shellPolicy) : []),
     ...(frontmatter.guardrails.blockCommands.length > 0
       ? ["  block_commands:", ...frontmatter.guardrails.blockCommands.map((pattern) => `    - ${yamlQuote(pattern)}`)]
       : ["  block_commands: []"]),
@@ -1494,39 +1625,52 @@ export function renderIterationPrompt(
   iteration: number,
   maxIterations: number,
   completionGate?: { completionPromise?: string; requiredOutputs?: string[]; completionGateMode?: CompletionGateMode; failureReasons?: string[]; rejectionReasons?: string[] },
+  pacing?: { itemsPerIteration?: number; reflectEvery?: number },
 ): string {
-  if (!completionGate) {
-    return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
+  const extraBlocks: string[] = [];
+
+  const pacingLines: string[] = [];
+  if (pacing?.itemsPerIteration !== undefined) {
+    pacingLines.push("[pacing]", `- Keep this iteration to at most ${pacing.itemsPerIteration} items.`);
+  }
+  if (pacing?.reflectEvery !== undefined && iteration % pacing.reflectEvery === 0) {
+    pacingLines.push("[reflection checkpoint]", `- This iteration is a reflection checkpoint. Pause to reflect on progress, remaining work, and blockers before continuing.`);
+  }
+  if (pacingLines.length > 0) {
+    extraBlocks.push(pacingLines.join("\n"));
   }
 
-  const requiredOutputs = completionGate.requiredOutputs ?? [];
-  const failureReasons = completionGate.failureReasons ?? [];
-  const rejectionReasons = completionGate.rejectionReasons ?? [];
-  const completionPromise = completionGate.completionPromise ?? "DONE";
-  const completionGateMode = completionGate.completionGateMode ?? "required";
-  if (completionGateMode === "disabled") {
-    return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
+  if (completionGate) {
+    const requiredOutputs = completionGate.requiredOutputs ?? [];
+    const failureReasons = completionGate.failureReasons ?? [];
+    const rejectionReasons = completionGate.rejectionReasons ?? [];
+    const completionPromise = completionGate.completionPromise ?? "DONE";
+    const completionGateMode = completionGate.completionGateMode ?? "required";
+    if (completionGateMode !== "disabled") {
+      const gateLines = [
+        "[completion gate]",
+        completionGateMode === "optional"
+          ? `- Completion gate is advisory${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`
+          : `- Required outputs must exist before stopping${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`,
+        completionGateMode === "optional"
+          ? "- OPEN_QUESTIONS.md should have no remaining P0/P1 items before stopping."
+          : "- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.",
+        "- Label inferred claims as HYPOTHESIS.",
+        ...(rejectionReasons.length > 0
+          ? ["[completion gate rejection]", `- Still missing: ${rejectionReasons.join("; ")}`]
+          : []),
+        ...(failureReasons.length > 0 ? [`- Previous gate failures: ${failureReasons.join("; ")}`] : []),
+        completionGateMode === "optional"
+          ? `- Emit <promise>${completionPromise}</promise> once the work is complete, even if advisory outputs are still missing.`
+          : `- Emit <promise>${completionPromise}</promise> only when the gate is truly satisfied.`,
+      ];
+      extraBlocks.push(gateLines.join("\n"));
+    }
   }
 
-  const gateLines = [
-    "[completion gate]",
-    completionGateMode === "optional"
-      ? `- Completion gate is advisory${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`
-      : `- Required outputs must exist before stopping${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`,
-    completionGateMode === "optional"
-      ? "- OPEN_QUESTIONS.md should have no remaining P0/P1 items before stopping."
-      : "- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.",
-    "- Label inferred claims as HYPOTHESIS.",
-    ...(rejectionReasons.length > 0
-      ? ["[completion gate rejection]", `- Still missing: ${rejectionReasons.join("; ")}`]
-      : []),
-    ...(failureReasons.length > 0 ? [`- Previous gate failures: ${failureReasons.join("; ")}`] : []),
-    completionGateMode === "optional"
-      ? `- Emit <promise>${completionPromise}</promise> once the work is complete, even if advisory outputs are still missing.`
-      : `- Emit <promise>${completionPromise}</promise> only when the gate is truly satisfied.`,
-  ];
-
-  return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}\n\n${gateLines.join("\n")}`;
+  return extraBlocks.length > 0
+    ? `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}\n\n${extraBlocks.join("\n\n")}`
+    : `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
 }
 
 export function shouldWarnForBashFailure(output: string): boolean {

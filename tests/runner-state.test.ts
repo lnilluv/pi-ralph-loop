@@ -150,13 +150,18 @@ test("writeStatusFile preserves completionPromise and guardrails", () => {
     const status: RunnerStatusFile = makeStatusFile({
       taskDir,
       completionPromise: "DONE",
-      guardrails: { blockCommands: ["git\\s+push", "rm\\s+-rf"], protectedFiles: ["secret.pem"] },
+      guardrails: {
+        blockCommands: ["git\\s+push", "rm\\s+-rf"],
+        protectedFiles: ["secret.pem"],
+        shellPolicy: { mode: "allowlist", allow: ["^echo ok$"] },
+      },
     });
     writeStatusFile(taskDir, status);
     const read = readStatusFile(taskDir);
     assert.equal(read?.completionPromise, "DONE");
     assert.deepEqual(read?.guardrails.blockCommands, ["git\\s+push", "rm\\s+-rf"]);
     assert.deepEqual(read?.guardrails.protectedFiles, ["secret.pem"]);
+    assert.deepEqual(read?.guardrails.shellPolicy, { mode: "allowlist", allow: ["^echo ok$"] });
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }

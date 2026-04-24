@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { assessTaskDirectoryProgress, captureTaskDirectorySnapshot, runRalphLoop, validateCompletionReadiness } from "../src/runner.ts";
+import { runCommands } from "../src/index.ts";
 import { readStatusFile, readIterationRecords, readRunnerEvents, checkStopSignal, createCancelSignal, createStopSignal as createStopSignalFn, type RunnerEvent } from "../src/runner-state.ts";
 import { generateDraft } from "../src/ralph.ts";
 import type { DraftTarget, CommandOutput, CommandDef } from "../src/ralph.ts";
@@ -296,6 +297,44 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.match(prompt.message, /Keep this short\./);
     assert.match(prompt.message, /Keep it short/i);
     assert.match(prompt.message, /overwrite in place/i);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop injects pacing controls into every iteration prompt", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1, items_per_iteration: 2 }));
+
+    const promptPath = join(taskDir, "prompt.json");
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+printf '%s' "$line" > "${promptPath}"
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    const prompt = JSON.parse(readFileSync(promptPath, "utf8")) as { message: string };
+    assert.match(prompt.message, /\[pacing\]/);
+    assert.match(prompt.message, /Keep this iteration to at most 2 items\./);
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
@@ -1414,6 +1453,84 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.ok(transcript.includes("tests"));
     assert.ok(transcript.includes("command output"));
     assert.ok(transcript.includes("all done"));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop blocks disallowed frontmatter commands when shell allowlist is active", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(
+      taskDir,
+      `---
+commands:
+  - name: blocked
+    run: git push origin main
+    timeout: 1
+max_iterations: 1
+timeout: 5
+guardrails:
+  block_commands: []
+  protected_files: []
+  shell_policy:
+    mode: allowlist
+    allow:
+      - ^echo ok$
+---
+Task: Allowlist blocking case
+`,
+    );
+
+    const scriptPath = join(taskDir, "mock-pi-allowlist.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "persisted change" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const execCalls: Array<{ tool: string; args: string[]; options?: { cwd?: string } }> = [];
+    const pi = {
+      on: () => undefined,
+      registerCommand: () => undefined,
+      appendEntry: () => undefined,
+      sendUserMessage: () => undefined,
+      exec: async (tool: string, args: string[], options?: { cwd?: string }) => {
+        execCalls.push({ tool, args, options });
+        return { killed: false, stdout: "", stderr: "" };
+      },
+    };
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: ["^echo ok$"] } },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async (commands, guardrails, commandPi, cwd, loopTaskDir) => {
+        assert.equal(guardrails.shellPolicy?.mode, "allowlist");
+        assert.deepEqual(guardrails.shellPolicy?.allow, ["^echo ok$"]);
+        return runCommands(commands, guardrails, commandPi as any, {}, cwd, loopTaskDir);
+      },
+      pi: pi as any,
+    });
+
+    assert.equal(result.iterations.length, 1);
+    assert.equal(execCalls.length, 0);
+
+    const transcriptsDir = join(taskDir, ".ralph-runner", "transcripts");
+    const transcriptFiles = readdirSync(transcriptsDir).filter((file) => file.endsWith(".md"));
+    assert.equal(transcriptFiles.length, 1);
+    const transcript = readFileSync(join(transcriptsDir, transcriptFiles[0]), "utf8");
+    assert.ok(transcript.includes("[blocked by guardrail: shell_policy.allowlist]"));
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }

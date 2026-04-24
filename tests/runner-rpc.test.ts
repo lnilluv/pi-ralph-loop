@@ -85,6 +85,105 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRpcIteration waits for set_thinking_level ack before sending prompt", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const logFile = join(cwd, "thinking-handshake.log");
+    const mockScript = await writeMockScript(cwd, "mock-pi-thinking.sh", `#!/bin/bash
+set -euo pipefail
+log_file="$1"
+read -r thinking_line
+printf 'thinking_line=%s\n' "$thinking_line" >> "$log_file"
+sleep 0.05
+if read -r -t 0 early_prompt; then
+  printf 'early_prompt=%s\n' "$early_prompt" >> "$log_file"
+else
+  printf 'early_prompt=none\n' >> "$log_file"
+fi
+echo '{"type":"response","command":"set_thinking_level","success":true}'
+read -r prompt_line
+printf 'prompt_line=%s\n' "$prompt_line" >> "$log_file"
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript, logFile],
+      thinkingLevel: "high",
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.lastAssistantText, "done");
+    const logLines = readFileSync(logFile, "utf8").trim().split("\n");
+    assert.equal(logLines[0], `thinking_line=${JSON.stringify({ type: "set_thinking_level", level: "high" })}`);
+    assert.equal(logLines[1], "early_prompt=none");
+    const promptEvent = JSON.parse(logLines[2].slice("prompt_line=".length));
+    assert.equal(promptEvent.type, "prompt");
+    assert.equal(promptEvent.message, "test prompt");
+    assert.match(String(promptEvent.id), /^ralph-/);
+    assert.ok(result.telemetry.promptSentAt);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration waits for set_model and set_thinking_level acks before sending prompt", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const logFile = join(cwd, "combined-handshake.log");
+    const mockScript = await writeMockScript(cwd, "mock-pi-model-thinking.sh", `#!/bin/bash
+set -euo pipefail
+log_file="$1"
+read -r model_line
+printf 'model_line=%s\n' "$model_line" >> "$log_file"
+read -r thinking_line
+printf 'thinking_line=%s\n' "$thinking_line" >> "$log_file"
+if read -r -t 0; then
+  printf 'early_prompt_before_acks=present\n' >> "$log_file"
+else
+  printf 'early_prompt_before_acks=none\n' >> "$log_file"
+fi
+echo '{"type":"response","command":"set_model","success":true}'
+echo '{"type":"response","command":"set_thinking_level","success":true}'
+read -r prompt_line
+printf 'prompt_line=%s\n' "$prompt_line" >> "$log_file"
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript, logFile],
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-20250514",
+      thinkingLevel: "high",
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.lastAssistantText, "done");
+    const logLines = readFileSync(logFile, "utf8").trim().split("\n");
+    assert.equal(logLines[0], `model_line=${JSON.stringify({ type: "set_model", provider: "anthropic", modelId: "claude-sonnet-4-20250514" })}`);
+    assert.equal(logLines[1], `thinking_line=${JSON.stringify({ type: "set_thinking_level", level: "high" })}`);
+    assert.equal(logLines[2], "early_prompt_before_acks=none");
+    const promptEvent = JSON.parse(logLines[3].slice("prompt_line=".length));
+    assert.equal(promptEvent.type, "prompt");
+    assert.equal(promptEvent.message, "test prompt");
+    assert.match(String(promptEvent.id), /^ralph-/);
+    assert.ok(result.telemetry.promptSentAt);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runRpcIteration captures close telemetry after agent_end", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {

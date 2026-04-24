@@ -1,4 +1,5 @@
-import { basename, normalize, relative, resolve } from "node:path";
+import { basename, dirname, normalize, relative, resolve } from "node:path";
+import { realpathSync } from "node:fs";
 import { minimatch } from "minimatch";
 
 const SECRET_PATH_SEGMENTS = new Set([".aws", ".ssh", "secrets", "credentials", "ops-secrets", "credentials-prod"]);
@@ -14,6 +15,39 @@ function normalizePath(value: string): string {
   return toPosixPath(normalize(value));
 }
 
+function resolvePathWithSymlinks(path: string, cwd?: string): string {
+  const rawPath = toPosixPath(path);
+  const baseDirectory = (() => {
+    const resolvedCwd = resolve(cwd ?? process.cwd());
+    try {
+      return toPosixPath(realpathSync(resolvedCwd));
+    } catch {
+      return toPosixPath(resolvedCwd);
+    }
+  })();
+
+  const isAbsolutePath = rawPath.startsWith("/");
+  const segments = rawPath.split("/").filter((segment, index) => segment.length > 0 || index === 0);
+  let resolvedPath = isAbsolutePath ? "/" : baseDirectory;
+
+  for (const segment of segments) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      resolvedPath = dirname(resolvedPath);
+      continue;
+    }
+
+    const nextPath = resolvedPath === "/" ? `/${segment}` : `${resolvedPath}/${segment}`;
+    try {
+      resolvedPath = toPosixPath(realpathSync(nextPath));
+    } catch {
+      resolvedPath = nextPath;
+    }
+  }
+
+  return resolvedPath;
+}
+
 function candidatePaths(path: string, cwd?: string): string[] {
   const candidates = new Set<string>();
   const normalizedRaw = normalizePath(path);
@@ -22,9 +56,23 @@ function candidatePaths(path: string, cwd?: string): string[] {
   const absolutePath = normalizePath(resolve(cwd ?? process.cwd(), path));
   if (absolutePath) candidates.add(absolutePath);
 
+  const symlinkResolvedPath = normalizePath(resolvePathWithSymlinks(path, cwd));
+  if (symlinkResolvedPath) candidates.add(symlinkResolvedPath);
+
   if (cwd) {
-    const repoRelative = toPosixPath(relative(cwd, absolutePath));
-    if (repoRelative && !repoRelative.startsWith("..")) candidates.add(repoRelative);
+    const repoRelativeAbsolutePath = toPosixPath(relative(cwd, absolutePath));
+    if (repoRelativeAbsolutePath && !repoRelativeAbsolutePath.startsWith("..")) candidates.add(repoRelativeAbsolutePath);
+
+    const resolvedCwd = (() => {
+      const cwdPath = resolve(cwd);
+      try {
+        return toPosixPath(realpathSync(cwdPath));
+      } catch {
+        return toPosixPath(cwdPath);
+      }
+    })();
+    const repoRelativeSymlinkResolvedPath = toPosixPath(relative(resolvedCwd, symlinkResolvedPath));
+    if (repoRelativeSymlinkResolvedPath && !repoRelativeSymlinkResolvedPath.startsWith("..")) candidates.add(repoRelativeSymlinkResolvedPath);
   }
 
   return [...candidates];

@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { SECRET_PATH_POLICY_TOKEN, isSecretBearingPath, matchesProtectedPath } from "../src/secret-paths.ts";
+
+const symlinkTest = process.platform === "win32" ? test.skip : test;
 
 test("secret-bearing path detection uses exact rules and ignores similarly named public files", () => {
   for (const path of [
@@ -52,4 +57,18 @@ test("matchesProtectedPath checks repo-relative globs against absolute and relat
   assert.equal(matchesProtectedPath("src/generated/output.ts", protectedFiles, cwd), true);
   assert.equal(matchesProtectedPath("/repo/project/src/generated/output.ts", protectedFiles, cwd), true);
   assert.equal(matchesProtectedPath("/repo/project/src/app.ts", protectedFiles, cwd), false);
+});
+
+symlinkTest("matchesProtectedPath resolves symlinked parent segments before checking secret policy", (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-secret-paths-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const secretsDir = join(cwd, "secrets");
+  const secretsSubdir = join(secretsDir, "subdir");
+  mkdirSync(secretsSubdir, { recursive: true });
+  writeFileSync(join(secretsDir, "token.txt"), "content", "utf8");
+  symlinkSync(secretsSubdir, join(cwd, "link"));
+
+  assert.equal(matchesProtectedPath("link/../token.txt", [SECRET_PATH_POLICY_TOKEN], cwd), true);
+  assert.equal(matchesProtectedPath("link/../token.txt", ["secrets/**"], cwd), true);
 });

@@ -1,6 +1,6 @@
 ---
 name: ralph-loop
-description: Use when starting or configuring an autonomous coding loop with pi-ralph-loop. Covers when to loop, how to write RALPH.md, guardrails, completion gating, and iteration prompt patterns.
+description: Use when starting or configuring an autonomous coding loop with pi-ralph-loop. Triggered by phrases like autonomous loop, repeat until done, keep running tests until green, or a long-running coding campaign. Covers when to loop, how to write RALPH.md, guardrails, completion gating, and iteration prompt patterns.
 ---
 
 # Ralph Loop Skill
@@ -24,17 +24,30 @@ A ralph loop is the right tool when the task is **repetitive, verifiable, or pro
 
 ## Commands
 
-You have seven commands available:
+You have eleven commands available:
 
 | Command | Purpose |
 |---|---|
-| `/ralph "task description"` | Draft and start from plain language |
-| `/ralph --path ./dir --arg key=val` | Start an existing task folder |
+| `/ralph [path-or-task]` | Draft and start from plain language or an existing task folder |
+| `/ralph --path ./dir --arg key=val` | Start an existing task folder with args |
 | `/ralph-draft "task description"` | Create a draft without starting |
-| `/ralph-stop` | Graceful stop after current iteration |
-| `/ralph-cancel` | Kill the current iteration immediately |
-| `/ralph-scaffold name` | Create a starter RALPH.md template |
+| `/ralph-list` | List active loops |
+| `/ralph-status [path]` | Show durable status and the latest iteration summary |
+| `/ralph-resume <path>` | Start a new run from an existing `RALPH.md` |
+| `/ralph-archive <path>` | Move `.ralph-runner/` into `.ralph-runner-archive/<ISO>/` |
+| `/ralph-stop [path-or-task]` | Graceful stop after current iteration |
+| `/ralph-cancel [path-or-task]` | Kill the current iteration immediately |
+| `/ralph-scaffold [--preset <name>] <name-or-path>` | Create a starter RALPH.md template |
 | `/ralph-logs [--path] [--dest]` | Export run artifacts |
+
+Bundled presets:
+
+- `fix-tests`
+- `migration`
+- `research-report`
+- `security-audit`
+
+Use `/ralph-scaffold --preset fix-tests my-task` to scaffold from a bundled template. Quoted paths are supported, for example `/ralph-scaffold --preset migration "feature/new task"`.
 
 ## RALPH.md structure
 
@@ -55,13 +68,27 @@ my-task/
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
+| `items_per_iteration` | integer | — | Pacing cap for each iteration. Valid values: 1–20 |
+| `reflect_every` | integer | — | Reflection cadence. Valid values: 2–20 |
 | `timeout` | integer | `300` | Seconds per iteration |
 | `completion_promise` | string | — | Done marker. Single line, no `<>` or line breaks |
 | `completion_gate` | `required` \| `optional` \| `disabled` | `required` when `completion_promise` is set | Controls whether required outputs and OPEN_QUESTIONS.md block stopping |
 | `required_outputs` | string[] | `[]` | Relative file paths that must exist for completion |
 | `stop_on_error` | boolean | `true` | `false` continues past RPC errors and timeouts |
-| `guardrails.block_commands` | string[] | `[]` | Regex patterns; matching bash commands blocked |
+| `guardrails.block_commands` | string[] | `[]` | Default shell blocklist. Matching bash commands are blocked |
 | `guardrails.protected_files` | string[] | `[]` | Glob patterns + `policy:secret-bearing-paths` |
+| `guardrails.shell_policy` | object | — | Optional shell allowlist. Use only when you want to permit specific bash commands; `mode: allowlist` requires `allow` |
+
+### Pacing controls
+
+Use these to slow the loop down or add periodic self-checks:
+
+```yaml
+items_per_iteration: 3
+reflect_every: 4
+```
+
+`items_per_iteration` adds a short constraint section on every iteration. `reflect_every` adds a reflection request on iterations 4, 8, 12, ...
 
 ### Body placeholders
 
@@ -189,6 +216,21 @@ guardrails:
 
 `policy:secret-bearing-paths` is a built-in policy blocking `.aws/`, `.ssh/`, `secrets/`, `.npmrc`, `.pem`, `.key`, and other secret-bearing paths.
 
+### Shell allowlist
+
+Use `shell_policy` only when you want to allow a narrow set of bash commands. The allowlist is checked before `block_commands`. If a command does not match any allow regex, it is blocked with `[blocked by guardrail: shell_policy.allowlist]`.
+
+```yaml
+guardrails:
+  shell_policy:
+    mode: allowlist
+    allow:
+      - '^npm test$'
+      - '^npm run lint$'
+```
+
+You can omit `shell_policy` entirely unless you need an allowlist.
+
 ### Choose the right level
 
 | Autonomy | Guardrails | stop_on_error |
@@ -202,8 +244,8 @@ guardrails:
 
 | Action | Behavior |
 |---|---|
-| `/ralph-stop` | Finish current iteration, then stop |
-| `/ralph-cancel` | Kill current iteration immediately |
+| `/ralph-stop [path-or-task]` | Finish current iteration, then stop |
+| `/ralph-cancel [path-or-task]` | Kill current iteration immediately |
 | Completion promise + gate | Stop when the promise is matched; `required` gates also require `required_outputs` and OPEN_QUESTIONS.md |
 | `max_iterations` reached | Stop after N iterations |
 | No progress in every iteration | Stop with `no-progress-exhaustion` |
@@ -244,6 +286,7 @@ For a task you can describe in plain language:
 
 ```
 /ralph "fix the failing auth tests"
+/ralph-draft "fix the failing auth tests"
 ```
 
 For a task folder you've already set up:
@@ -252,8 +295,9 @@ For a task folder you've already set up:
 /ralph --path ./my-task --arg owner="Ada"
 ```
 
-To create a starter template:
+To create a starter template or start from a bundled preset:
 
 ```
 /ralph-scaffold my-task
+/ralph-scaffold --preset security-audit security-review
 ```

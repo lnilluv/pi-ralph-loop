@@ -125,13 +125,15 @@ test("parseRalphMarkdown falls back to default frontmatter when no frontmatter i
 
 test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => {
   const parsed = parseRalphMarkdown(
-    "\uFEFF---\r\ncommands:\r\n  - name: build\r\n    run: npm test\r\n    timeout: 15\r\nmax_iterations: 3\r\ninter_iteration_delay: 7\r\ntimeout: 12.5\r\nrequired_outputs:\r\n  - docs/ARCHITECTURE.md\r\ncompletion_promise: done\r\ncompletion_gate: optional\r\nguardrails:\r\n  block_commands:\r\n    - rm .*\r\n  protected_files:\r\n    - src/**\r\n---\r\nBody\r\n",
+    "\uFEFF---\r\ncommands:\r\n  - name: build\r\n    run: npm test\r\n    timeout: 15\r\nmax_iterations: 3\r\ninter_iteration_delay: 7\r\nitems_per_iteration: 4\r\nreflect_every: 3\r\ntimeout: 12.5\r\nrequired_outputs:\r\n  - docs/ARCHITECTURE.md\r\ncompletion_promise: done\r\ncompletion_gate: optional\r\nguardrails:\r\n  block_commands:\r\n    - rm .*\r\n  protected_files:\r\n    - src/**\r\n---\r\nBody\r\n",
   );
 
   assert.deepEqual(parsed.frontmatter, {
     commands: [{ name: "build", run: "npm test", timeout: 15 }],
     maxIterations: 3,
     interIterationDelay: 7,
+    itemsPerIteration: 4,
+    reflectEvery: 3,
     timeout: 12.5,
     completionPromise: "done",
     completionGate: "optional",
@@ -202,6 +204,34 @@ test("validateFrontmatter accepts valid input and rejects invalid bounds, names,
     "Invalid inter_iteration_delay: must be a non-negative integer",
   );
   assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), itemsPerIteration: 3, reflectEvery: 4 }),
+    null,
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), itemsPerIteration: 0 }),
+    "Invalid items_per_iteration: must be an integer between 1 and 20",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), itemsPerIteration: 21 }),
+    "Invalid items_per_iteration: must be an integer between 1 and 20",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), itemsPerIteration: 1.5 }),
+    "Invalid items_per_iteration: must be an integer between 1 and 20",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), reflectEvery: 1 }),
+    "Invalid reflect_every: must be an integer between 2 and 20",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), reflectEvery: 21 }),
+    "Invalid reflect_every: must be an integer between 2 and 20",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), reflectEvery: 2.5 }),
+    "Invalid reflect_every: must be an integer between 2 and 20",
+  );
+  assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), timeout: 0 }),
     "Invalid timeout: must be greater than 0 and at most 300",
   );
@@ -216,6 +246,26 @@ test("validateFrontmatter accepts valid input and rejects invalid bounds, names,
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: [], protectedFiles: ["**/*"] } }),
     "Invalid protected_files glob: **/*",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: ["^npm test$"] } } }),
+    null,
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: [] } } as any }),
+    "Invalid shell_policy.allow: allowlist mode requires at least one regex",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: ["["] } } as any }),
+    "Invalid shell_policy.allow regex: [",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "blocklist" } } }),
+    null,
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "blocklist", allow: ["^npm test$"] } } as any }),
+    "Invalid shell_policy.allow: blocklist mode must be absent or empty when mode is blocklist",
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "", run: "echo ok", timeout: 1 }] }),
@@ -442,7 +492,24 @@ test("inspectDraftContent, validateDraftContent, and Mission Brief fail closed o
         "  protected_files: null",
       ],
       expectedError: "Invalid RALPH frontmatter: guardrails.protected_files must be a YAML sequence",
-      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: guardrails\.protected_files must be a YAML sequence/,
+      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: guardrails\.protected_files must be a YAML sequence/, 
+    },
+    {
+      label: "shell_policy allow list in blocklist mode",
+      frontmatterLines: [
+        "commands: []",
+        "max_iterations: 25",
+        "timeout: 300",
+        "guardrails:",
+        "  block_commands: []",
+        "  protected_files: []",
+        "  shell_policy:",
+        "    mode: blocklist",
+        "    allow:",
+        "      - '^npm test$'",
+      ],
+      expectedError: "Invalid RALPH frontmatter: guardrails.shell_policy.allow must be absent or empty when mode is blocklist",
+      briefError: /Invalid RALPH\.md: Invalid RALPH frontmatter: guardrails\.shell_policy\.allow must be absent or empty when mode is blocklist/,
     },
   ] as const) {
     const raw = makeStrengthenedDraft(frontmatterLines, "Task: Fix flaky auth tests\n\nKeep the change small.");
@@ -530,6 +597,22 @@ test("runCommands skips blocked commands before shelling out", async () => {
   assert.equal(proofEntries.length, 1);
   assert.equal(proofEntries[0].customType, "ralph-blocked-command");
   assert.equal(proofEntries[0].data.command, "git push origin main");
+});
+
+test("runCommands blocks commands that do not match the shell allowlist", async () => {
+  const pi = {
+    exec: async () => {
+      throw new Error("should not execute disallowed command");
+    },
+  } as any;
+
+  const outputs = await runCommands(
+    [{ name: "lint", run: "npm run lint", timeout: 1 }],
+    { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: ["^npm test$"] } },
+    pi,
+  );
+
+  assert.deepEqual(outputs, [{ name: "lint", output: "[blocked by guardrail: shell_policy.allowlist]" }]);
 });
 
 test("runCommands resolves args before shelling out", async () => {
@@ -670,6 +753,17 @@ test("renderIterationPrompt includes a rejection section when durable progress i
   assert.match(prompt, /\[completion gate rejection\]/);
   assert.match(prompt, /Still missing: durable progress/);
   assert.match(prompt, /Emit <promise>DONE<\/promise> only when the gate is truly satisfied\./);
+});
+
+test("renderIterationPrompt includes pacing constraints and reflection checkpoints", () => {
+  const pacedPrompt = renderIterationPrompt("Body", 2, 5, undefined, { itemsPerIteration: 3 });
+  assert.match(pacedPrompt, /\[pacing\]/);
+  assert.match(pacedPrompt, /Keep this iteration to at most 3 items\./);
+
+  const reflectionPrompt = renderIterationPrompt("Body", 4, 8, undefined, { reflectEvery: 4 });
+  assert.match(reflectionPrompt, /\[reflection checkpoint\]/);
+  assert.match(reflectionPrompt, /This iteration is a reflection checkpoint\./);
+  assert.ok(!/\[reflection checkpoint\]/.test(renderIterationPrompt("Body", 3, 8, undefined, { reflectEvery: 4 })));
 });
 
 test("parseCommandArgs handles explicit path args, leaves task text alone, and rejects task args", () => {
@@ -874,6 +968,21 @@ test("inspectDraftContent and validateDraftContent fail closed on raw malformed 
       label: "max_iterations boolean",
       raw: makeRawDraft(["commands: []", "max_iterations: true", "timeout: 300"]),
       expectedError: "Invalid RALPH frontmatter: max_iterations must be a YAML number",
+    },
+    {
+      label: "items_per_iteration boolean",
+      raw: makeRawDraft(["commands: []", "max_iterations: 1", "items_per_iteration: true", "timeout: 300"]),
+      expectedError: "Invalid RALPH frontmatter: items_per_iteration must be a YAML number",
+    },
+    {
+      label: "reflect_every string",
+      raw: makeRawDraft(["commands: []", "max_iterations: 1", "reflect_every: \"5\"", "timeout: 300"]),
+      expectedError: "Invalid RALPH frontmatter: reflect_every must be a YAML number",
+    },
+    {
+      label: "reflect_every null",
+      raw: makeRawDraft(["commands: []", "max_iterations: 1", "reflect_every: null", "timeout: 300"]),
+      expectedError: "Invalid RALPH frontmatter: reflect_every must be a YAML number",
     },
     {
       label: "timeout boolean",
