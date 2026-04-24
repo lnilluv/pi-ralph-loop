@@ -15,6 +15,7 @@ completion_promise: DONE
 completion_gate: required
 required_outputs:
   - TEST_REPORT.md
+  - OPEN_QUESTIONS.md
 stop_on_error: true
 guardrails:
   block_commands:
@@ -32,7 +33,7 @@ Your progress lives in the code and git history.
 
 Fix failing tests before starting new work.
 Write a regression test for the bug you fix.
-Stop with <promise>DONE</promise> only when the tests pass and TEST_REPORT.md exists.
+Stop with <promise>DONE</promise> only when the tests pass, TEST_REPORT.md exists, and OPEN_QUESTIONS.md has no unresolved P0/P1 items.
 ```
 
 ## Migration loop
@@ -53,6 +54,7 @@ completion_promise: DONE
 completion_gate: required
 required_outputs:
   - MIGRATION_NOTES.md
+  - OPEN_QUESTIONS.md
 stop_on_error: false
 guardrails:
   block_commands:
@@ -61,6 +63,7 @@ guardrails:
 ```
 
 Focus on one module or one pattern per iteration. Keep the prompt specific so the loop can make visible progress every pass.
+Stop with <promise>DONE</promise> only when the build and tests pass, MIGRATION_NOTES.md exists, and OPEN_QUESTIONS.md has no unresolved P0/P1 items.
 
 ## Research loop
 
@@ -98,6 +101,7 @@ completion_promise: DONE
 completion_gate: required
 required_outputs:
   - SECURITY_FINDINGS.md
+  - OPEN_QUESTIONS.md
 stop_on_error: true
 guardrails:
   block_commands:
@@ -112,6 +116,7 @@ guardrails:
 ```
 
 Keep the prompt explicit about what counts as a finding, what evidence matters, and when the loop may stop.
+Stop with <promise>DONE</promise> only when tests pass, SECURITY_FINDINGS.md exists, and OPEN_QUESTIONS.md has no unresolved P0/P1 items.
 
 ## Good completion-gate reminders
 

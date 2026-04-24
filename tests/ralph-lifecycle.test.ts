@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -258,6 +258,30 @@ test("/ralph-archive moves the runner directory into the archive area", async (t
   assert.equal(harness.notifications.length, 1);
   assert.equal(harness.notifications[0].level, "info");
   assert.match(harness.notifications[0].message, /Archived run artifacts to/);
+});
+
+test("/ralph-archive rejects a symlinked archive root outside the task directory", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "epsilon-task");
+  mkdirSync(taskDir, { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), createValidRalphMarkdown(), "utf8");
+  const runnerDir = join(taskDir, ".ralph-runner");
+  mkdirSync(runnerDir, { recursive: true });
+
+  const outsideArchiveRoot = mkdtempSync(join(tmpdir(), "pi-ralph-loop-archive-target-"));
+  t.after(() => rmSync(outsideArchiveRoot, { recursive: true, force: true }));
+  symlinkSync(outsideArchiveRoot, join(taskDir, ".ralph-runner-archive"), "dir");
+
+  const harness = createHarness();
+  await invoke(harness, "ralph-archive", taskDir, cwd);
+
+  assert.equal(existsSync(runnerDir), true);
+  assert.equal(readdirSync(outsideArchiveRoot).length, 0);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].level, "error");
+  assert.match(harness.notifications[0].message, /archive root.*symlink|outside the task directory|unsafe/i);
 });
 
 test("/ralph-resume and /ralph-archive refuse active loops discovered through status.cwd from another cwd", async (t) => {

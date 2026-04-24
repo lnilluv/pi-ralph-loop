@@ -28,7 +28,7 @@
     "yaml": "2.8.3"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.69.0 <0.70.0"
+    "@mariozechner/pi-coding-agent": ">=0.69.0"
   },
   "overrides": {
     "basic-ftp": "5.3.0",

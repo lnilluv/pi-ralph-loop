@@ -2,7 +2,7 @@ import { basename, dirname, normalize, relative, resolve } from "node:path";
 import { realpathSync } from "node:fs";
 import { minimatch } from "minimatch";
 
-const SECRET_PATH_SEGMENTS = new Set([".aws", ".ssh", "secrets", "credentials", "ops-secrets", "credentials-prod"]);
+const SECRET_PATH_SEGMENTS = new Set([".aws", ".azure", ".gcloud", ".ssh", "secrets", "credentials", "ops-secrets", "credentials-prod"]);
 const SECRET_BASENAMES = new Set([".npmrc", ".pypirc", ".netrc"]);
 const SECRET_SUFFIXES = [".pem", ".key", ".asc"];
 export const SECRET_PATH_POLICY_TOKEN = "policy:secret-bearing-paths";
@@ -88,7 +88,7 @@ function isSecretPathCandidate(candidatePath: string): boolean {
     normalizedName.startsWith(".env") ||
     SECRET_BASENAMES.has(normalizedName) ||
     SECRET_SUFFIXES.some((suffix) => normalizedName.endsWith(suffix)) ||
-    segments.some((segment) => SECRET_PATH_SEGMENTS.has(segment))
+    segments.some((segment) => segment.startsWith(".env") || SECRET_PATH_SEGMENTS.has(segment))
   );
 }
 

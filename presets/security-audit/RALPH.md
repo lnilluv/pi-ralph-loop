@@ -15,6 +15,7 @@ completion_promise: DONE
 completion_gate: required
 required_outputs:
   - SECURITY_AUDIT.md
+  - OPEN_QUESTIONS.md
 stop_on_error: false
 guardrails:
   block_commands:
@@ -37,7 +38,8 @@ You are performing a security audit.
 ## Task
 - Triage the findings.
 - Fix the highest-risk issues first.
+- Capture unresolved P0/P1 items in OPEN_QUESTIONS.md.
 - Update SECURITY_AUDIT.md with residual risk and verification.
 
 ## Completion
-Stop with <promise>DONE</promise> only when the audit is addressed and the report is complete.
+Stop with <promise>DONE</promise> only when SECURITY_AUDIT.md exists, OPEN_QUESTIONS.md has no remaining P0/P1 items, and the audit is addressed.

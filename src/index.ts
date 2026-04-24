@@ -1018,12 +1018,41 @@ function summarizeIterationRecord(record: IterationRecord): string {
   return parts.join(" ");
 }
 
+function isWithinPath(basePath: string, targetPath: string): boolean {
+  const pathRelative = relative(basePath, targetPath);
+  return pathRelative === "" || (!pathRelative.startsWith("..") && !isAbsolute(pathRelative));
+}
+
 function archiveRunnerArtifacts(taskDir: string, archiveName = new Date().toISOString().replace(/[:.]/g, "-")): string {
   const runnerDir = join(taskDir, ".ralph-runner");
   const archiveRoot = join(taskDir, ".ralph-runner-archive");
   const archiveDir = join(archiveRoot, archiveName);
-  mkdirSync(archiveRoot, { recursive: true });
+  const taskRootRealPath = realpathSync(taskDir);
+
+  if (existsSync(archiveRoot)) {
+    const archiveRootStat = lstatSync(archiveRoot);
+    if (archiveRootStat.isSymbolicLink()) {
+      throw new Error(`Unsafe archive root: ${archiveRoot} is a symlink`);
+    }
+    if (!archiveRootStat.isDirectory()) {
+      throw new Error(`Unsafe archive root: ${archiveRoot} is not a directory`);
+    }
+  } else {
+    mkdirSync(archiveRoot, { recursive: true });
+  }
+
+  const archiveRootRealPath = realpathSync(archiveRoot);
+  if (!isWithinPath(taskRootRealPath, archiveRootRealPath)) {
+    throw new Error(`Unsafe archive root: ${archiveRoot} resolves outside the task directory`);
+  }
+
   renameSync(runnerDir, archiveDir);
+
+  const archiveDirRealPath = realpathSync(archiveDir);
+  if (!isWithinPath(taskRootRealPath, archiveDirRealPath)) {
+    throw new Error(`Unsafe archive destination: ${archiveDir} resolves outside the task directory`);
+  }
+
   return archiveDir;
 }
 
@@ -2035,8 +2064,13 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
-      const archiveDir = archiveRunnerArtifacts(target.taskDir);
-      ctx.ui.notify(`Archived run artifacts to ${displayPath(ctx.cwd, archiveDir)}`, "info");
+      try {
+        const archiveDir = archiveRunnerArtifacts(target.taskDir);
+        ctx.ui.notify(`Archived run artifacts to ${displayPath(ctx.cwd, archiveDir)}`, "info");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Failed to archive run artifacts: ${message}`, "error");
+      }
     },
   });
 

@@ -12,6 +12,7 @@ completion_promise: DONE
 completion_gate: required
 required_outputs:
   - MIGRATION_NOTES.md
+  - OPEN_QUESTIONS.md
 stop_on_error: false
 guardrails:
   block_commands:
@@ -32,7 +33,8 @@ Migrate one slice at a time.
 ## Task
 - Move one module or API boundary per iteration.
 - Keep compatibility shims explicit.
+- Capture unresolved P0/P1 items in OPEN_QUESTIONS.md.
 - Record decisions in MIGRATION_NOTES.md.
 
 ## Completion
-Stop with <promise>DONE</promise> only when MIGRATION_NOTES.md exists and the checks stay green.
+Stop with <promise>DONE</promise> only when MIGRATION_NOTES.md exists, OPEN_QUESTIONS.md has no remaining P0/P1 items, and the checks stay green.

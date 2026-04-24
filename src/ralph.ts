@@ -870,7 +870,7 @@ export function findBlockedCommandPattern(command: string, blockPatterns: string
 export function findAllowedCommandPattern(command: string, allowPatterns: string[]): string | undefined {
   for (const pattern of allowPatterns) {
     try {
-      if (new RegExp(pattern).test(command)) return pattern;
+      if (new RegExp(`^(?:${pattern})$`).test(command)) return pattern;
     } catch {
       // ignore malformed regexes; validateFrontmatter should catch these first
     }
@@ -1290,9 +1290,23 @@ function normalizeRepoContext(repoContext: RepoContext | undefined, signals: Rep
   return buildRepoContext(signals);
 }
 
+const REPO_MAP_PRUNED_DIR_NAMES = [".git", ".env*", "node_modules", "dist", "build", "coverage", ".cache", ".turbo", "vendor"];
+const REPO_MAP_SECRET_DIR_NAMES = [".aws", ".azure", ".gcloud", ".ssh", "secrets", "credentials", "ops-secrets", "credentials-prod"];
+const REPO_MAP_SECRET_FILE_GLOBS = [".git", ".env*", ".npmrc", ".pypirc", ".netrc", "*.pem", "*.key", "*.asc"];
+
+function buildRepoMapPruneSequence(kind: "d" | "f", names: readonly string[]): string {
+  return names.map((name) => `-type ${kind} -name ${shellQuote(name)} -prune`).join(" -o ");
+}
+
+export function buildRepoMapCommand(): string {
+  return `find . -maxdepth 2 ${buildRepoMapPruneSequence("d", REPO_MAP_PRUNED_DIR_NAMES)} -o ${buildRepoMapPruneSequence("d", REPO_MAP_SECRET_DIR_NAMES)} -o ${buildRepoMapPruneSequence("f", REPO_MAP_SECRET_FILE_GLOBS)} -o -type f -print | sort | head -n 120`;
+}
+
+export const REPO_MAP_COMMAND = buildRepoMapCommand();
+
 export function buildCommandIntent(mode: DraftMode, signals: RepoSignals): CommandIntent[] {
   if (mode === "analysis") {
-    const commands: CommandIntent[] = [{ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20, source: "heuristic" }];
+    const commands: CommandIntent[] = [{ name: "repo-map", run: REPO_MAP_COMMAND, timeout: 20, source: "heuristic" }];
     if (signals.hasGit) commands.unshift({ name: "git-log", run: "git log --oneline -10", timeout: 20, source: "heuristic" });
     return commands;
   }
@@ -1313,7 +1327,7 @@ export function buildCommandIntent(mode: DraftMode, signals: RepoSignals): Comma
   if (signals.buildCommand) commands.push({ name: "build", run: signals.buildCommand, timeout: 120, source: "repo-signal" });
   if (signals.lintCommand) commands.push({ name: "lint", run: signals.lintCommand, timeout: 90, source: "repo-signal" });
   if (signals.hasGit) commands.push({ name: "git-log", run: "git log --oneline -10", timeout: 20, source: "heuristic" });
-  if (commands.length === 0) commands.push({ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20, source: "heuristic" });
+  if (commands.length === 0) commands.push({ name: "repo-map", run: REPO_MAP_COMMAND, timeout: 20, source: "heuristic" });
   return commands;
 }
 

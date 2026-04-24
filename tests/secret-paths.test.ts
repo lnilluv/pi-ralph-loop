@@ -15,6 +15,8 @@ test("secret-bearing path detection uses exact rules and ignores similarly named
     ".pypirc",
     ".netrc",
     ".aws/config",
+    ".azure/config",
+    ".gcloud/config",
     ".ssh/id_rsa",
     "config/secrets/prod.json",
     "config/credentials/service.json",
@@ -32,12 +34,36 @@ test("secret-bearing path detection uses exact rules and ignores similarly named
   }
 });
 
+test("secret-bearing path detection includes .env* directories", () => {
+  for (const path of [
+    ".env/config.json",
+    ".env.local/config.json",
+    "config/.env/settings.json",
+    "config/.env.local/settings.json",
+  ]) {
+    assert.equal(isSecretBearingPath(path), true, path);
+  }
+
+  const protectedFiles = [SECRET_PATH_POLICY_TOKEN];
+
+  for (const filePath of [
+    ".env/config.json",
+    ".env.local/config.json",
+    "config/.env/settings.json",
+    "config/.env.local/settings.json",
+  ]) {
+    assert.equal(matchesProtectedPath(filePath, protectedFiles), true, filePath);
+  }
+});
+
 test("policy token protects secret-bearing paths and ignores a non-secret control", () => {
   const protectedFiles = [SECRET_PATH_POLICY_TOKEN];
 
   for (const filePath of [
     "credentials/api.json",
     "credentials/payments/service-account.json",
+    ".azure/config",
+    ".gcloud/config",
     ".ssh/config",
     ".npmrc",
     "releases/signing-key.asc",

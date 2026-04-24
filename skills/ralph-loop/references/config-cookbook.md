@@ -15,6 +15,7 @@ completion_promise: DONE
 completion_gate: required
 required_outputs:
   - TEST_REPORT.md
+  - OPEN_QUESTIONS.md
 stop_on_error: true
 guardrails:
   block_commands:
@@ -22,7 +23,7 @@ guardrails:
 ---
 ```
 
-Use when you want a hard stop only after tests pass and the output file exists.
+Use when you want a hard stop only after tests pass, TEST_REPORT.md exists, and OPEN_QUESTIONS.md is clear.
 
 ## 2. Make a migration
 
@@ -40,6 +41,7 @@ completion_promise: DONE
 completion_gate: required
 required_outputs:
   - MIGRATION_NOTES.md
+  - OPEN_QUESTIONS.md
 stop_on_error: false
 guardrails:
   block_commands:
@@ -47,7 +49,7 @@ guardrails:
 ---
 ```
 
-Use when the loop should keep going through multiple passes and the deliverable is mandatory.
+Use when the loop should keep going through multiple passes and the deliverable and OPEN_QUESTIONS.md are mandatory.
 
 ## 3. Draft documentation
 
@@ -93,13 +95,14 @@ Use when the loop should gather evidence and write a report, but the stopping co
 ---
 commands:
   - name: scan
-    run: npm test
+    run: npm audit --omit=dev
     timeout: 120
 max_iterations: 20
 completion_promise: DONE
 completion_gate: required
 required_outputs:
   - SECURITY_FINDINGS.md
+  - OPEN_QUESTIONS.md
 stop_on_error: true
 guardrails:
   block_commands:
@@ -113,7 +116,7 @@ guardrails:
 ---
 ```
 
-Use when missing evidence should keep the loop running until the report is present.
+Use when missing evidence should keep the loop running until the report and OPEN_QUESTIONS.md are ready.
 
 ## 6. Loop without a completion gate
 

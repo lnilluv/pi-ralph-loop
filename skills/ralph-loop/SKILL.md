@@ -24,7 +24,7 @@ A ralph loop is the right tool when the task is **repetitive, verifiable, or pro
 
 ## Commands
 
-You have eleven commands available:
+You have ten command names available:
 
 | Command | Purpose |
 |---|---|
@@ -177,12 +177,14 @@ completion_promise: DONE
 completion_gate: required
 required_outputs:
   - COVERAGE_REPORT.md
+  - OPEN_QUESTIONS.md
 ```
 
 ```markdown
 Stop with <promise>DONE</promise> only when:
 1. All tests pass
 2. COVERAGE_REPORT.md exists and is complete
+3. OPEN_QUESTIONS.md exists and has no unresolved P0/P1 items
 ```
 
 If the promise appears but files are missing, the loop continues with a rejection notice.

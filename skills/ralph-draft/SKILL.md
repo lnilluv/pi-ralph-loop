@@ -26,7 +26,7 @@ Use only the bounded signals the shipped draft generator collects.
 
 | Signal | What it detects | How to use it in the draft |
 |---|---|---|
-| Package manifest | `package.json` plus the package manager in use | If `scripts.test` or `scripts.lint` exist, surface those exact package scripts |
+| Package manifest | `package.json` plus the package manager in use | If `scripts.test`, `scripts.lint`, `scripts.typecheck`, `scripts.check`, `scripts.build`, or `scripts.verify` exist, surface those exact package scripts |
 | Git repository | presence of `.git` | Include `git log --oneline -10` when available |
 | Top-level context | a bounded root scan of directories/files | Summarize the top-level shape of the repo without recursing indefinitely |
 | Secret filtering | secret-bearing names are excluded from the root scan | Do not mention filtered secret paths in the draft |
