@@ -184,6 +184,50 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRpcIteration fails when handshake acknowledgements do not arrive before the timeout", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const logFile = join(cwd, "handshake-timeout.log");
+    const mockScript = await writeMockScript(cwd, "mock-pi-handshake-timeout.sh", `#!/bin/bash
+set -euo pipefail
+log_file="$1"
+read -r model_line
+printf 'model_line=%s\n' "$model_line" >> "$log_file"
+read -r thinking_line
+printf 'thinking_line=%s\n' "$thinking_line" >> "$log_file"
+if read -r -t 6 prompt_line; then
+  printf 'prompt_line=%s\n' "$prompt_line" >> "$log_file"
+  echo '{"type":"response","command":"prompt","success":true}'
+  echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+else
+  printf 'prompt_line=none\n' >> "$log_file"
+fi
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 10_000,
+      handshakeTimeoutMs: 100,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript, logFile],
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-20250514",
+      thinkingLevel: "high",
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.error ?? "", /RPC handshake timed out waiting for set_model and set_thinking_level acknowledgements/);
+    assert.equal(result.telemetry.promptSentAt, undefined);
+    const logLines = readFileSync(logFile, "utf8").trim().split("\n");
+    assert.equal(logLines[0], `model_line=${JSON.stringify({ type: "set_model", provider: "anthropic", modelId: "claude-sonnet-4-20250514" })}`);
+    assert.equal(logLines[1], `thinking_line=${JSON.stringify({ type: "set_thinking_level", level: "high" })}`);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runRpcIteration captures close telemetry after agent_end", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {

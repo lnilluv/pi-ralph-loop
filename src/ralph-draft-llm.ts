@@ -1,4 +1,4 @@
-import { complete, type AssistantMessage, type Context, type Model } from "@mariozechner/pi-ai";
+import { complete, type Api, type AssistantMessage, type Context, type Model } from "@mariozechner/pi-ai";
 import { basename } from "node:path";
 import { filterSecretBearingTopLevelNames } from "./secret-paths.ts";
 import {
@@ -16,9 +16,9 @@ import {
 export const DRAFT_LLM_TIMEOUT_MS = 20_000;
 
 export type StrengthenDraftRuntime = {
-  model: Model<string> | undefined;
+  model: Model<Api> | undefined;
   modelRegistry: {
-    getApiKeyAndHeaders(model: Model<string>): Promise<AuthResult | AuthFailure>;
+    getApiKeyAndHeaders(model: Model<Api>): Promise<AuthResult | AuthFailure>;
   };
 };
 
