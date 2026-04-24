@@ -233,6 +233,72 @@ type ToolResultEvent = PiToolResultEvent;
 
 type EventContext = ExtensionContext;
 
+type NewSessionOptions = NonNullable<Parameters<NonNullable<CommandContext["newSession"]>>[0]>;
+type ForkOptions = NonNullable<Parameters<NonNullable<CommandContext["fork"]>>[1]>;
+type SwitchSessionOptions = NonNullable<Parameters<NonNullable<CommandContext["switchSession"]>>[1]>;
+type SessionReplacementWithSession = NonNullable<NewSessionOptions["withSession"]>;
+type SessionReplacementContext = Parameters<SessionReplacementWithSession>[0];
+type SessionReplacementOptions = {
+  withSession?: SessionReplacementWithSession;
+};
+
+function resolveSessionUi(ctx: CommandContext): CommandContext["ui"] {
+  return ctx.ui;
+}
+
+function installSessionReplacementHooks(
+  ctx: CommandContext,
+  onSessionReplacement: (replacementCtx: SessionReplacementContext) => void,
+): () => void {
+  const commandCtx = ctx as CommandContext & {
+    newSession?: NonNullable<CommandContext["newSession"]>;
+    fork?: NonNullable<CommandContext["fork"]>;
+    switchSession?: NonNullable<CommandContext["switchSession"]>;
+  };
+  const restorers: Array<() => void> = [];
+
+  const wrapOptions = <T extends { withSession?: SessionReplacementWithSession } | undefined>(options: T): T => {
+    const existingWithSession = options?.withSession;
+    return {
+      ...(options ?? {}),
+      withSession: async (replacementCtx: SessionReplacementContext) => {
+        onSessionReplacement(replacementCtx);
+        await existingWithSession?.(replacementCtx);
+      },
+    } as T;
+  };
+
+  const originalNewSession = commandCtx.newSession;
+  if (originalNewSession) {
+    commandCtx.newSession = ((options?: NewSessionOptions) => originalNewSession.call(commandCtx, wrapOptions(options))) as typeof originalNewSession;
+    restorers.push(() => {
+      commandCtx.newSession = originalNewSession;
+    });
+  }
+
+  const originalFork = commandCtx.fork;
+  if (originalFork) {
+    commandCtx.fork = ((entryId: string, options?: ForkOptions) => originalFork.call(commandCtx, entryId, wrapOptions(options))) as typeof originalFork;
+    restorers.push(() => {
+      commandCtx.fork = originalFork;
+    });
+  }
+
+  const originalSwitchSession = commandCtx.switchSession;
+  if (originalSwitchSession) {
+    commandCtx.switchSession = ((sessionPath: string, options?: SwitchSessionOptions) =>
+      originalSwitchSession.call(commandCtx, sessionPath, wrapOptions(options))) as typeof originalSwitchSession;
+    restorers.push(() => {
+      commandCtx.switchSession = originalSwitchSession;
+    });
+  }
+
+  return () => {
+    while (restorers.length > 0) {
+      restorers.pop()?.();
+    }
+  };
+}
 
 function validateFrontmatter(fm: Frontmatter, ctx: Pick<CommandContext, "ui">): boolean {
   const error = validateFrontmatterMessage(fm);
@@ -262,7 +328,13 @@ export async function runCommands(
     const blockedPattern = shellPolicyBlocked ?? findBlockedCommandPattern(semanticRun, guardrails.blockCommands);
     const resolvedRun = resolveCommandRun(cmd.run, runtimeArgs);
     if (blockedPattern) {
-      pi.appendEntry?.("ralph-blocked-command", { name: cmd.name, command: semanticRun, blockedPattern, cwd: repoCwd, taskDir });
+      try {
+        pi.appendEntry?.("ralph-blocked-command", { name: cmd.name, command: semanticRun, blockedPattern, cwd: repoCwd, taskDir });
+      } catch (err) {
+        if (!isKnownPiStaleExtensionContextError(err)) {
+          throw err;
+        }
+      }
       results.push({ name: cmd.name, output: `[blocked by guardrail: ${blockedPattern}]` });
       continue;
     }
@@ -387,8 +459,36 @@ function readPersistedLoopState(ctx: Pick<CommandContext, "sessionManager">): Pe
   return undefined;
 }
 
+function isKnownPiStaleExtensionContextError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const normalizedMessage = message.toLowerCase();
+  return (
+    normalizedMessage.includes("stale extension ctx") ||
+    normalizedMessage.includes("stale extension context") ||
+    normalizedMessage.includes("extension instance is stale after session replacement or reload") ||
+    normalizedMessage.includes("provided replacement-session context") ||
+    normalizedMessage.includes("replacement-session context")
+  );
+}
+
+function appendLoopEntryBestEffort(pi: ExtensionAPI, customType: string, data: unknown) {
+  try {
+    pi.appendEntry?.(customType, data);
+  } catch (err) {
+    if (isKnownPiStaleExtensionContextError(err)) {
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    try {
+      process.stderr.write(`Ralph append logging failed for ${customType}: ${message}\n`);
+    } catch {
+      // Best-effort surfacing only.
+    }
+  }
+}
+
 function persistLoopState(pi: ExtensionAPI, data: PersistedLoopState) {
-  pi.appendEntry("ralph-loop-state", data);
+  appendLoopEntryBestEffort(pi, "ralph-loop-state", data);
 }
 
 function toPersistedLoopState(state: LoopState, overrides: Partial<PersistedLoopState> = {}): PersistedLoopState {
@@ -1396,6 +1496,9 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     try {
       pi.appendEntry?.(customType, data);
     } catch (err) {
+      if (isKnownPiStaleExtensionContextError(err)) {
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       try {
         process.stderr.write(`Ralph proof logging failed for ${customType}: ${message}\n`);
@@ -1460,6 +1563,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   };
 
   async function startRalphLoop(ralphPath: string, ctx: CommandContext, runLoopFn: typeof runRalphLoop = runRalphLoop, runtimeArgs: RuntimeArgs = {}) {
+    let currentCommandCtx: CommandContext = ctx;
+    const sessionPi = pi;
     let name: string;
     let currentStopOnError = true;
     try {
@@ -1501,6 +1606,9 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       return;
     }
     ctx.ui.notify(`Ralph loop started: ${name} (max ${loopState.maxIterations} iterations)`, "info");
+    const restoreSessionReplacementHooks = installSessionReplacementHooks(ctx, (replacementCtx) => {
+      currentCommandCtx = replacementCtx as CommandContext;
+    });
 
     try {
       const result = await runLoopFn({
@@ -1515,10 +1623,12 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         thinkingLevel: ctx.model?.reasoning ? "high" : undefined,
         runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir) => runCommands(commands, guardrails, commandPi as ExtensionAPI, runtimeArgs, cwd, taskDir),
         onStatusChange(status) {
-          ctx.ui.setStatus("ralph", status === "running" || status === "initializing" ? `🔁 ${name}: running` : undefined);
+          const runtimeUi = resolveSessionUi(currentCommandCtx);
+          runtimeUi.setStatus("ralph", status === "running" || status === "initializing" ? `🔁 ${name}: running` : undefined);
         },
         onNotify(message, level) {
-          ctx.ui.notify(message, level);
+          const runtimeUi = resolveSessionUi(currentCommandCtx);
+          runtimeUi.notify(message, level);
         },
         onIterationComplete(record) {
           loopState.iteration = record.iteration;
@@ -1531,7 +1641,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
             noProgressStreak: record.noProgressStreak,
           };
           loopState.iterationSummaries.push(summary);
-          pi.appendEntry("ralph-iteration", {
+          appendLoopEntryBestEffort(sessionPi, "ralph-iteration", {
             iteration: record.iteration,
             duration: summary.duration,
             ralphPath: loopState.ralphPath,
@@ -1539,47 +1649,49 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
             changedFiles: record.changedFiles,
             noProgressStreak: record.noProgressStreak,
           });
-          persistLoopState(pi, toPersistedLoopState(loopState, { active: true, stopRequested: false }));
+          persistLoopState(sessionPi, toPersistedLoopState(loopState, { active: true, stopRequested: false }));
         },
-        pi,
+        pi: sessionPi,
       });
 
       // Map runner result to UI notifications
       const total = loopState.iterationSummaries.reduce((a, s) => a + s.duration, 0);
+      const runtimeUi = resolveSessionUi(currentCommandCtx);
       switch (result.status) {
         case "complete":
-          ctx.ui.notify(`Ralph loop complete: completion promise matched on iteration ${result.iterations.length} (${total}s total)`, "info");
+          runtimeUi.notify(`Ralph loop complete: completion promise matched on iteration ${result.iterations.length} (${total}s total)`, "info");
           break;
         case "max-iterations":
-          ctx.ui.notify(`Ralph loop reached max iterations: ${result.iterations.length} iterations, ${total}s total`, "info");
+          runtimeUi.notify(`Ralph loop reached max iterations: ${result.iterations.length} iterations, ${total}s total`, "info");
           break;
         case "no-progress-exhaustion":
-          ctx.ui.notify(`Ralph loop exhausted without verified progress: ${result.iterations.length} iterations, ${total}s total`, "warning");
+          runtimeUi.notify(`Ralph loop exhausted without verified progress: ${result.iterations.length} iterations, ${total}s total`, "warning");
           break;
         case "stopped":
-          ctx.ui.notify(`Ralph loop stopped: ${result.iterations.length} iterations, ${total}s total`, "info");
+          runtimeUi.notify(`Ralph loop stopped: ${result.iterations.length} iterations, ${total}s total`, "info");
           break;
         case "timeout":
-          ctx.ui.notify(`Ralph loop stopped after a timeout: ${result.iterations.length} iterations, ${total}s total`, "warning");
+          runtimeUi.notify(`Ralph loop stopped after a timeout: ${result.iterations.length} iterations, ${total}s total`, "warning");
           break;
         case "error":
-          ctx.ui.notify(`Ralph loop failed: ${result.iterations.length} iterations, ${total}s total`, "error");
+          runtimeUi.notify(`Ralph loop failed: ${result.iterations.length} iterations, ${total}s total`, "error");
           break;
         default:
-          ctx.ui.notify(`Ralph loop ended: ${result.status} (${total}s total)`, "info");
+          runtimeUi.notify(`Ralph loop ended: ${result.status} (${total}s total)`, "info");
           break;
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      ctx.ui.notify(`Ralph loop failed: ${message}`, "error");
+      resolveSessionUi(currentCommandCtx).notify(`Ralph loop failed: ${message}`, "error");
     } finally {
       failCounts.clear();
       pendingIterations.clear();
       loopState.active = false;
       loopState.stopRequested = false;
       loopState.loopToken = undefined;
-      ctx.ui.setStatus("ralph", undefined);
-      persistLoopState(pi, toPersistedLoopState(loopState, { active: false, stopRequested: false }));
+      restoreSessionReplacementHooks();
+      resolveSessionUi(currentCommandCtx).setStatus("ralph", undefined);
+      persistLoopState(sessionPi, toPersistedLoopState(loopState, { active: false, stopRequested: false }));
     }
   }
 

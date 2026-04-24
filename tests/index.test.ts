@@ -525,6 +525,40 @@ test("runCommands surfaces blocked-command appendEntry failures", async () => {
   }
 });
 
+test("runCommands suppresses stale blocked-command appendEntry failures", async () => {
+  const repoCwd = createTempDir();
+  const taskDir = join(repoCwd, "task");
+  mkdirSync(taskDir, { recursive: true });
+  const stderrWrites: string[] = [];
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = ((chunk: any, ...args: any[]) => {
+      stderrWrites.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+
+    let execCalls = 0;
+    const pi = {
+      appendEntry: () => {
+        throw new Error("This extension instance is stale after session replacement or reload. Use the provided replacement-session context instead.");
+      },
+      exec: async () => {
+        execCalls += 1;
+        return { killed: false, stdout: "", stderr: "" };
+      },
+    } as any;
+
+    const result = await runCommands([{ name: "blocked", run: "git push origin main", timeout: 1 }], ["git\\s+push"], pi, {}, repoCwd, taskDir);
+
+    assert.deepEqual(result, [{ name: "blocked", output: "[blocked by guardrail: git\\s+push]" }]);
+    assert.equal(execCalls, 0);
+    assert.equal(stderrWrites.some((entry) => entry.toLowerCase().includes("stale")), false);
+  } finally {
+    process.stderr.write = originalStderrWrite;
+    rmSync(repoCwd, { recursive: true, force: true });
+  }
+});
+
 test("/ralph-stop writes the durable stop flag from persisted active loop state after reload", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -1767,6 +1801,252 @@ test("/ralph rejects raw invalid completion_promise values before parsing loop s
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0]?.level, "error");
   assert.match(notifications[0]?.message ?? "", /Invalid completion_promise/);
+});
+
+test("/ralph --path waits for the loop promise before returning in noninteractive mode", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const task = "Fix flaky auth tests";
+  const target = createTarget(cwd, task);
+  const draft = generateDraft(task, target, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    lintCommand: "npm run lint",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  mkdirSync(target.dirPath, { recursive: true });
+  writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+
+  let loopStarted = false;
+  let resolveLoop: (() => void) | undefined;
+  const loopFinished = new Promise<void>((resolve) => {
+    resolveLoop = resolve;
+  });
+  t.after(() => resolveLoop?.());
+  const harness = createHarness({
+    runRalphLoopFn: async () => {
+      loopStarted = true;
+      await loopFinished;
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: () => undefined,
+      select: async () => {
+        throw new Error("should not prompt");
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+
+  let handlerResolved = false;
+  const handlerPromise = handler(`--path ${target.ralphPath}`, ctx).then(() => {
+    handlerResolved = true;
+  });
+
+  for (let i = 0; i < 10 && !loopStarted; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(loopStarted, true);
+  assert.equal(handlerResolved, false);
+
+  resolveLoop?.();
+  await handlerPromise;
+
+  assert.equal(handlerResolved, true);
+});
+
+test("/ralph --path keeps using the live command context after session replacement", { concurrency: false }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const task = "Fix flaky auth tests";
+  const target = createTarget(cwd, task);
+  const draft = generateDraft(task, target, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    lintCommand: "npm run lint",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  mkdirSync(target.dirPath, { recursive: true });
+  writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+
+  const staleNotifications: Array<{ message: string; level: string }> = [];
+  const staleStatuses: Array<{ key: string; text: string | undefined }> = [];
+  const liveNotifications: Array<{ message: string; level: string }> = [];
+  const liveStatuses: Array<{ key: string; text: string | undefined }> = [];
+  const appendedEntries: Array<any> = [];
+  const stderrWrites: string[] = [];
+  let stale = false;
+  let resolveLoop: (() => void) | undefined;
+  const loopFinished = new Promise<void>((resolve) => {
+    resolveLoop = resolve;
+  });
+  t.after(() => resolveLoop?.());
+
+  const liveReplacementCtx = {
+    sendMessage: async () => undefined,
+    sendUserMessage: async () => undefined,
+    ui: {
+      notify: (message: string, level: string) => {
+        liveNotifications.push({ message, level });
+      },
+      setStatus: (key: string, text: string | undefined) => {
+        liveStatuses.push({ key, text });
+      },
+      input: async () => undefined,
+      select: async () => undefined,
+      editor: async () => undefined,
+    },
+  };
+
+  const userWithSession = async (replacementCtx: typeof liveReplacementCtx) => {
+    assert.equal(replacementCtx, liveReplacementCtx);
+    assert.equal(typeof replacementCtx.sendMessage, "function");
+    assert.equal(typeof replacementCtx.sendUserMessage, "function");
+    assert.equal(replacementCtx.ui, liveReplacementCtx.ui);
+  };
+
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  (process.stderr as any).write = (chunk: unknown) => {
+    stderrWrites.push(String(chunk));
+    return true;
+  };
+  t.after(() => {
+    (process.stderr as any).write = originalStderrWrite;
+  });
+
+  const handlers = new Map<string, (args: string, ctx: any) => Promise<any>>();
+  const pi = {
+    on: () => undefined,
+    registerCommand: (name: string, spec: { handler: (args: string, ctx: any) => Promise<any> }) => {
+      handlers.set(name, spec.handler);
+    },
+    appendEntry: (customType: string, data: unknown) => {
+      if (stale) {
+        throw new Error("This extension instance is stale after session replacement or reload. Use the provided replacement-session context instead.");
+      }
+      appendedEntries.push({ type: "custom", customType, data });
+    },
+    sendUserMessage: async () => undefined,
+    exec: async () => ({ killed: false, stdout: "", stderr: "" }),
+  } as any;
+
+  const runtimeUi = {
+    notify: (message: string, level: string) => {
+      if (stale) {
+        throw new Error("stale runtime notify");
+      }
+      staleNotifications.push({ message, level });
+    },
+    setStatus: (key: string, text: string | undefined) => {
+      if (stale) {
+        throw new Error("stale runtime setStatus");
+      }
+      staleStatuses.push({ key, text });
+    },
+    input: async () => undefined,
+    select: async () => undefined,
+    editor: async () => undefined,
+  };
+  const runtimeSessionManager = createSessionManager([], "session-a");
+  const ctx = {
+    get cwd() {
+      if (stale) {
+        throw new Error("stale command cwd");
+      }
+      return cwd;
+    },
+    hasUI: false,
+    get ui() {
+      if (stale) {
+        throw new Error("stale command ui");
+      }
+      return runtimeUi;
+    },
+    get sessionManager() {
+      if (stale) {
+        throw new Error("stale command sessionManager");
+      }
+      return runtimeSessionManager;
+    },
+    newSession: async (options?: { withSession?: (replacementCtx: typeof liveReplacementCtx) => Promise<void> | void }) => {
+      assert.equal(typeof options?.withSession, "function");
+      assert.notEqual(options?.withSession, userWithSession);
+      stale = true;
+      await options?.withSession?.(liveReplacementCtx);
+      return { cancelled: false };
+    },
+    waitForIdle: async () => undefined,
+  };
+  const originalNewSession = ctx.newSession;
+
+  let runLoopEntered = false;
+  registerRalphCommands(pi, {
+    runRalphLoopFn: async (config: RunnerConfig) => {
+      config.onStatusChange?.("running");
+      runLoopEntered = true;
+      const result = await ctx.newSession({ withSession: userWithSession });
+      assert.equal(result.cancelled, false);
+      config.onNotify?.("rebound notification", "info");
+      config.onIterationComplete?.({
+        iteration: 1,
+        status: "complete",
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        durationMs: 1,
+        progress: true,
+        changedFiles: ["src/index.ts"],
+        noProgressStreak: 0,
+      } as IterationRecord);
+      config.onStatusChange?.("complete");
+      await loopFinished;
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  } as any);
+
+  const handler = handlers.get("ralph");
+  assert.ok(handler);
+
+  let handlerResolved = false;
+  const handlerPromise = handler(`--path ${target.ralphPath}`, ctx).then(() => {
+    handlerResolved = true;
+  });
+
+  for (let i = 0; i < 10 && !runLoopEntered; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(runLoopEntered, true);
+  assert.equal(handlerResolved, false);
+  assert.ok(staleNotifications.some(({ message }) => message.includes("Ralph loop started:")));
+  assert.ok(staleStatuses.some(({ text }) => text?.includes("running")));
+  assert.ok(liveNotifications.some(({ message }) => message === "rebound notification"));
+  assert.equal(appendedEntries.length, 0);
+
+  resolveLoop?.();
+  await handlerPromise;
+
+  assert.equal(handlerResolved, true);
+  assert.equal(ctx.newSession, originalNewSession);
+  assert.equal(stale, true);
+  assert.ok(liveNotifications.some(({ message }) => message.startsWith("Ralph loop complete:")));
+  assert.ok(liveStatuses.some(({ text }) => text === undefined));
+  assert.equal(appendedEntries.length, 0);
+  assert.equal(stderrWrites.some((line) => /stale extension (?:ctx|context)/i.test(line)), false);
 });
 
 test("/ralph rejects raw malformed guardrails shapes before starting the loop", async (t) => {
