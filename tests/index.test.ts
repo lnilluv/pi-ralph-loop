@@ -4492,3 +4492,68 @@ test("/ralph-stop refuses to guess when multiple durable active loops exist", as
   assert.ok(notifications.some(({ message }) => message.toLowerCase().includes("multiple active ralph loops")));
   assert.ok(notifications.some(({ message }) => message.toLowerCase().includes("explicit target path")));
 });
+
+test("before_agent_start injects task directory context for iteration 1 (no previous summaries)", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(taskDir, { recursive: true });
+
+  // Set up persisted loop state for iteration 1 with no summaries
+  const entries = [
+    {
+      type: "custom",
+      customType: "ralph-loop-state",
+      data: {
+        active: true,
+        loopToken: "test-loop-token",
+        cwd,
+        taskDir,
+        iteration: 1,
+        maxIterations: 10,
+        noProgressStreak: 0,
+        iterationSummaries: [],
+        guardrails: { blockCommands: [], protectedFiles: [] },
+        stopRequested: false,
+      },
+    },
+  ];
+
+  const harness = createHarness();
+  const handler = harness.event("before_agent_start");
+  const ctx = {
+    sessionManager: {
+      getEntries: () => entries,
+      getSessionFile: () => "session-a",
+    },
+  };
+  const event = {
+    systemPrompt: "You are an AI assistant.",
+  };
+
+  const result = await handler(event, ctx);
+
+  assert.ok(result, "should return a response with system prompt modifications");
+  assert.ok(
+    typeof result === "object" && result !== null && "systemPrompt" in result,
+    "response should include a systemPrompt field",
+  );
+  const systemPrompt = (result as { systemPrompt: string }).systemPrompt;
+  assert.ok(
+    systemPrompt.includes("Task directory:"),
+    "system prompt should include 'Task directory:' for iteration 1",
+  );
+  assert.ok(
+    systemPrompt.includes("Ralph Loop Context"),
+    "system prompt should include 'Ralph Loop Context' section",
+  );
+  assert.ok(
+    systemPrompt.includes("Persist findings to files in the Ralph task directory"),
+    "system prompt should include instructions to persist in task directory",
+  );
+  assert.ok(
+    systemPrompt.includes("Iteration 1/10"),
+    "system prompt should include iteration count",
+  );
+});

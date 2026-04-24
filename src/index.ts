@@ -1886,8 +1886,6 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     const persisted = resolveActiveLoopState(ctx);
     if (!persisted) return;
     const summaries = persisted?.iterationSummaries ?? [];
-    if (summaries.length === 0) return;
-
     const history = summaries
       .map((summary) => {
         const status = summarizeIterationProgress(summary);
