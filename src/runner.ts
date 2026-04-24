@@ -5,10 +5,12 @@ import {
   inspectDraftContent,
   renderRalphBody,
   renderIterationPrompt,
+  resolveCompletionGateMode,
   shouldStopForCompletionPromise,
   validateRuntimeArgs,
   type CommandDef,
   type CommandOutput,
+  type Frontmatter,
   type RuntimeArgs,
 } from "./ralph.ts";
 import { runCommands } from "./index.ts";
@@ -59,7 +61,7 @@ export type RunnerConfig = {
   stopOnError?: boolean;
   /** Completion promise string from RALPH.md */
   completionPromise?: string;
-  guardrails: { blockCommands: string[]; protectedFiles: string[] };
+  guardrails: Frontmatter["guardrails"];
   /** Override for the RPC spawn command, for testing */
   spawnCommand?: string;
   /** Override for the RPC spawn args, for testing */
@@ -83,7 +85,7 @@ export type RunnerConfig = {
   /** Extension API for running commands */
   runCommandsFn?: (
     commands: CommandDef[],
-    blockPatterns: string[],
+    guardrails: Frontmatter["guardrails"],
     pi: unknown,
     cwd?: string,
     taskDir?: string,
@@ -374,6 +376,8 @@ export function validateCompletionReadiness(taskDir: string, requiredOutputs: st
   const reasons: string[] = [];
 
   for (const requiredOutput of requiredOutputs) {
+    if (basename(requiredOutput) === RALPH_PROGRESS_FILE) continue;
+
     const filePath = join(taskDir, requiredOutput);
     if (!existsSync(filePath) || !statSync(filePath).isFile()) {
       addReadinessReason(reasons, `Missing required output: ${requiredOutput}`);
@@ -426,6 +430,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
   let currentMaxIterations = initialMaxIterations;
   let currentTimeout = timeout;
   let currentCompletionPromise = initialCompletionPromise;
+  let currentCompletionGateMode: "required" | "optional" | "disabled" = initialCompletionPromise ? "required" : "disabled";
   let currentRequiredOutputs: string[] = [];
   let currentInterIterationDelay = 0;
   let currentGuardrails = initialGuardrails;
@@ -448,7 +453,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     timeout: currentTimeout,
     completionPromise: currentCompletionPromise,
     startedAt: new Date().toISOString(),
-    guardrails: { blockCommands: currentGuardrails.blockCommands, protectedFiles: currentGuardrails.protectedFiles },
+    guardrails: currentGuardrails,
   };
   let latestRegistryStatus = initialStatus;
   const syncActiveLoopRegistry = (statusFile: RunnerStatusFile): void => {
@@ -533,9 +538,10 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       currentMaxIterations = fm.maxIterations;
       currentTimeout = fm.timeout;
       currentCompletionPromise = fm.completionPromise;
+      currentCompletionGateMode = resolveCompletionGateMode(fm);
       currentRequiredOutputs = fm.requiredOutputs ?? [];
       currentInterIterationDelay = fm.interIterationDelay;
-      currentGuardrails = { blockCommands: fm.guardrails.blockCommands, protectedFiles: fm.guardrails.protectedFiles };
+      currentGuardrails = fm.guardrails;
       currentStopOnError = config.stopOnError ?? fm.stopOnError;
 
       // Update status to running
@@ -546,7 +552,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         maxIterations: currentMaxIterations,
         timeout: currentTimeout,
         completionPromise: currentCompletionPromise,
-        guardrails: { blockCommands: currentGuardrails.blockCommands, protectedFiles: currentGuardrails.protectedFiles },
+        guardrails: currentGuardrails,
       };
       writeStatusFile(taskDir, runningStatus);
       syncActiveLoopRegistry(runningStatus);
@@ -569,7 +575,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
       // Run commands
       const commandsOutput: CommandOutput[] = runCommandsFn && pi
-        ? await runCommandsFn(fm.commands, currentGuardrails.blockCommands, pi, cwd, taskDir)
+        ? await runCommandsFn(fm.commands, currentGuardrails, pi, cwd, taskDir)
         : [];
 
       // Before snapshot
@@ -579,7 +585,24 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       const body = renderRalphBody(rawBody, commandsOutput, { iteration: i, name, maxIterations: currentMaxIterations }, runtimeArgs);
       const progressMemory = readProgressMemory(taskDir);
       const promptBody = progressMemory !== undefined ? `${renderProgressMemoryPrompt(progressMemory)}\n\n${body}` : body;
-      const prompt = renderIterationPrompt(promptBody, i, currentMaxIterations, currentCompletionPromise ? { completionPromise: currentCompletionPromise, requiredOutputs: currentRequiredOutputs, failureReasons: completionGateFailureReasons, rejectionReasons: completionGateRejectionReasons } : undefined);
+      const prompt = renderIterationPrompt(
+        promptBody,
+        i,
+        currentMaxIterations,
+        currentCompletionPromise && currentCompletionGateMode !== "disabled"
+          ? {
+              completionPromise: currentCompletionPromise,
+              requiredOutputs: currentRequiredOutputs,
+              completionGateMode: currentCompletionGateMode,
+              failureReasons: completionGateFailureReasons,
+              rejectionReasons: completionGateRejectionReasons,
+            }
+          : undefined,
+        {
+          itemsPerIteration: fm.itemsPerIteration,
+          reflectEvery: fm.reflectEvery,
+        },
+      );
       const writeIterationTranscriptSafe = (record: IterationRecord, assistantText?: string, note?: string) => {
         try {
           writeIterationTranscript(taskDir, { record, prompt, commandOutputs: commandsOutput, assistantText, note });
@@ -823,7 +846,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       }
 
       let completionGate: CompletionReadiness | undefined;
-      if (completionPromiseMatched && progress !== false) {
+      if (completionPromiseMatched && progress !== false && currentCompletionGateMode !== "disabled") {
         completionGate = validateCompletionReadiness(taskDir, currentRequiredOutputs);
         if (completionRecord) {
           completionRecord.gateChecked = true;
@@ -861,7 +884,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         if (!completionGate.ready) {
           completionGateFailureReasons = completionGate.reasons;
           onNotify?.(
-            `Completion gate blocked on iteration ${i}: ${completionGate.reasons.join("; ")}`,
+            `${currentCompletionGateMode === "required" ? "Completion gate blocked" : "Completion gate not ready"} on iteration ${i}: ${completionGate.reasons.join("; ")}`,
             "warning",
           );
         } else {
@@ -931,7 +954,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
             `Completion promise matched on iteration ${i}, but no durable progress was detected. Continuing.`,
             "warning",
           );
-        } else if (completionGate && !completionGate.ready) {
+        } else if (currentCompletionGateMode === "required" && completionGate && !completionGate.ready) {
           onNotify?.(
             `completion promise matched on iteration ${i}, but the completion gate failed. Continuing.`,
             "warning",
@@ -990,6 +1013,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       status: finalStatus,
       currentIteration: iterations.length > 0 ? iterations[iterations.length - 1].iteration : 0,
       completedAt,
+      guardrails: currentGuardrails,
     };
     writeStatusFile(taskDir, finalStatusFile);
     syncActiveLoopRegistry(finalStatusFile);

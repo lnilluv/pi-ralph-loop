@@ -13,6 +13,8 @@ export type RpcSubprocessConfig = {
   prompt: string;
   cwd: string;
   timeoutMs: number;
+  /** Optional timeout for the handshake acks before the prompt is sent. Defaults to 5000. */
+  handshakeTimeoutMs?: number;
   /** Override the spawn command for testing. Defaults to "pi" */
   spawnCommand?: string;
   /** Override spawn args for testing. Defaults to ["--mode", "rpc", "--no-session"] */
@@ -124,6 +126,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     prompt,
     cwd,
     timeoutMs,
+    handshakeTimeoutMs = 5000,
     spawnCommand = "pi",
     spawnArgs,
     env,
@@ -196,8 +199,10 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     let promptSent = false;
     let promptAcknowledged = false;
     let sawAgentEnd = false;
-    let modelSetAcknowledged = !(modelProvider && modelModelId); // true if no set_model needed
-    let thinkingLevelAcknowledged = !thinkingLevel; // true if no set_thinking_level needed
+    const requiresModelHandshake = Boolean(modelProvider && modelModelId);
+    const requiresThinkingHandshake = Boolean(thinkingLevel);
+    let modelSetAcknowledged = !requiresModelHandshake;
+    let thinkingLevelAcknowledged = !requiresThinkingHandshake;
 
     const nowIso = () => new Date().toISOString();
     const markStdoutEvent = (eventType: string) => {
@@ -208,6 +213,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     };
 
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let handshakeTimeout: ReturnType<typeof setTimeout> | undefined;
 
     const onAbort = () => {
       if (settled) return;
@@ -219,6 +225,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
         // process may already be dead
       }
       clearTimeout(timeout);
+      clearTimeout(handshakeTimeout);
       resolve(buildResult({
         success: false,
         lastAssistantText,
@@ -263,6 +270,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
 
     const cleanup = () => {
       clearTimeout(timeout);
+      clearTimeout(handshakeTimeout);
       endStdin();
       signal?.removeEventListener("abort", onAbort);
     };
@@ -308,12 +316,20 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
           const resp = event as { command?: string; success?: boolean };
           if (resp.command === "set_model" && resp.success === true) {
             modelSetAcknowledged = true;
+            if (requiresModelHandshake && requiresThinkingHandshake && !modelSetAcknowledged) {
+              // no-op; handled below
+            }
           }
           if (resp.command === "set_thinking_level" && resp.success === true) {
             thinkingLevelAcknowledged = true;
           }
           if (resp.command === "prompt" && resp.success === true) {
             promptAcknowledged = true;
+          }
+
+          if (!settled && !promptSent && (!requiresModelHandshake || modelSetAcknowledged) && (!requiresThinkingHandshake || thinkingLevelAcknowledged)) {
+            clearTimeout(handshakeTimeout);
+            sendPrompt();
           }
           continue;
         }
@@ -377,6 +393,78 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       }));
     });
 
+    const sendPrompt = () => {
+      const promptCommand = JSON.stringify({
+        type: "prompt",
+        id: `ralph-${randomUUID()}`,
+        message: prompt,
+      });
+
+      try {
+        telemetry.promptSentAt = telemetry.promptSentAt ?? nowIso();
+        childProcess.stdin?.write(promptCommand + "\n");
+        promptSent = true;
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        telemetry.error = error;
+        settle(buildResult({
+          success: false,
+          lastAssistantText,
+          agentEndMessages,
+          timedOut: false,
+          error,
+        }));
+      }
+    };
+
+    const handshakeMissingRequirements = (): string[] => {
+      const missing: string[] = [];
+      if (requiresModelHandshake && !modelSetAcknowledged) missing.push("set_model");
+      if (requiresThinkingHandshake && !thinkingLevelAcknowledged) missing.push("set_thinking_level");
+      return missing;
+    };
+
+    const failHandshakeTimeout = () => {
+      const missing = handshakeMissingRequirements();
+      if (missing.length === 0) return;
+      const error =
+        missing.length === 1
+          ? `RPC handshake timed out waiting for ${missing[0]} ack`
+          : `RPC handshake timed out waiting for ${missing.join(" and ")} acknowledgements`;
+      telemetry.error = error;
+      settled = true;
+      try {
+        childProcess.kill("SIGKILL");
+      } catch {
+        // process may already be dead
+      }
+      clearTimeout(timeout);
+      clearTimeout(handshakeTimeout);
+      resolve(buildResult({
+        success: false,
+        lastAssistantText,
+        agentEndMessages,
+        timedOut: false,
+        error,
+      }));
+    };
+
+    const checkHandshakeReady = () => {
+      if (settled || promptSent) return;
+      if (!requiresModelHandshake && !requiresThinkingHandshake) {
+        sendPrompt();
+        return;
+      }
+      if (requiresModelHandshake && !modelSetAcknowledged) return;
+      if (requiresThinkingHandshake && !thinkingLevelAcknowledged) return;
+      clearTimeout(handshakeTimeout);
+      sendPrompt();
+    };
+
+    if (requiresModelHandshake || requiresThinkingHandshake) {
+      handshakeTimeout = setTimeout(failHandshakeTimeout, handshakeTimeoutMs);
+    }
+
     // Send set_model command if provider/model are specified
     if (modelProvider && modelModelId) {
       const setModelCommand = JSON.stringify({
@@ -422,48 +510,6 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       }
     }
 
-    // Wait for set_model acknowledgment before sending prompt
-    const sendPrompt = () => {
-      // Send the prompt command
-      const promptCommand = JSON.stringify({
-        type: "prompt",
-        id: `ralph-${randomUUID()}`,
-        message: prompt,
-      });
-
-      try {
-        telemetry.promptSentAt = telemetry.promptSentAt ?? nowIso();
-        childProcess.stdin?.write(promptCommand + "\n");
-        promptSent = true;
-      } catch (err) {
-        const error = err instanceof Error ? err.message : String(err);
-        telemetry.error = error;
-        settle(buildResult({
-          success: false,
-          lastAssistantText,
-          agentEndMessages,
-          timedOut: false,
-          error,
-        }));
-      }
-    };
-
-    if (modelSetAcknowledged && thinkingLevelAcknowledged) {
-      sendPrompt();
-    } else {
-      const waitForAcknowledgements = async () => {
-        const deadline = Date.now() + 5000;
-        while (!settled && !promptSent && Date.now() < deadline) {
-          if (modelSetAcknowledged && thinkingLevelAcknowledged) break;
-          await new Promise<void>((resolveWait) => setTimeout(resolveWait, 50));
-        }
-      };
-
-      void waitForAcknowledgements().then(() => {
-        if (!settled && !promptSent) {
-          sendPrompt();
-        }
-      });
-    }
+    checkHandshakeReady();
   });
 }

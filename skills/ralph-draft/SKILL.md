@@ -1,280 +1,214 @@
 ---
 name: ralph-draft
-description: Use when creating a RALPH.md from a plain-language task description. Covers task classification, project detection, frontmatter generation, and guardrail selection.
+description: Use when turning a plain-language task into a RALPH.md or scaffolding a loop prompt. Covers task classification, bounded project detection, frontmatter generation, and guardrail selection.
 ---
 
 # Draft a RALPH.md
 
-Create an effective RALPH.md from a plain-language task description. This skill covers how to classify the task, detect the project environment, generate appropriate frontmatter, and write an effective prompt body.
+Create an effective `RALPH.md` from a plain-language task description. Match the task to the shipped mode, inspect only the bounded repo signals the generator actually uses, and keep the prompt body aligned with what `/ralph-draft` emits today.
 
 ## Phase 1: Classify the task
 
-Map the user's description to a task category. Each category has different needs.
+The shipped classifier only produces four modes.
 
-| Category | Signals | Default settings |
+| Mode | Signals | Typical draft shape |
 |---|---|---|
-| **fix** | "bug", "broken", "failing", "error", "crash" | `stop_on_error: true`, test commands, completion promise |
-| **test** | "coverage", "tests", "unit test", "integration" | `stop_on_error: true`, coverage commands, completion promise |
-| **migrate** | "migrate", "upgrade", "refactor", "convert" | `stop_on_error: false`, build + test commands, required_outputs |
-| **docs** | "document", "readme", "docs", "explain" | `stop_on_error: false`, build commands, required_outputs |
-| **research** | "research", "investigate", "analyze", "audit" | `stop_on_error: false`, minimal commands, required_outputs |
-| **security** | "security", "vulnerability", "audit", "cve" | `stop_on_error: true`, strict guardrails, required_outputs |
-| **general** | anything else | `stop_on_error: true`, basic commands |
+| **analysis** | `reverse engineer`, `analy[sz]e`, `understand`, `investigate`, `map`, `audit`, `explore` | read-only inspection, repo map, no edits |
+| **fix** | `fix`, `debug`, `repair`, `failing test`, `flaky`, `failure`, `broken` | tests first, regression coverage, smallest fix |
+| **migration** | `migrate`, `upgrade`, `convert`, `port`, `modernize` | targeted transformation, verify build/tests, one slice per iteration |
+| **general** | fallback for everything else | smallest safe next step |
+
+Do not invent extra categories such as docs, research, or security.
 
 ## Phase 2: Detect the project environment
 
-Scan the project directory for signals. Use these to pick appropriate commands.
+Use only the bounded signals the shipped draft generator collects.
 
-| Signal | Detection | Implication |
+| Signal | What it detects | How to use it in the draft |
 |---|---|---|
-| Node.js | `package.json` exists | `npm test`, `npm run build`, `npm run lint` |
-| Python | `pyproject.toml` or `setup.py` | `pytest`, `ruff check .`, `mypy .` |
-| Go | `go.mod` exists | `go test ./...`, `go vet ./...` |
-| Rust | `Cargo.toml` exists | `cargo test`, `cargo clippy` |
-| Tests present | `__tests__/`, `tests/`, `*_test.*`, `*.test.*` | Include test command |
-| Linter config | `.eslintrc*`, `ruff.toml`, `.golangci.yml` | Include lint command |
-| CI config | `.github/workflows/`, `.gitlab-ci.yml` | Read CI to find test/lint commands |
-| TODO/PLAN file | `TODO.md`, `PLAN.md`, `BUGS.md` exists | Use as task source |
+| Package manifest | `package.json` plus the package manager in use | If `scripts.test`, `scripts.lint`, `scripts.typecheck`, `scripts.check`, `scripts.build`, or `scripts.verify` exist, surface those exact package scripts |
+| Git repository | presence of `.git` | Include `git log --oneline -10` when available |
+| Top-level context | a bounded root scan of directories/files | Summarize the top-level shape of the repo without recursing indefinitely |
+| Secret filtering | secret-bearing names are excluded from the root scan | Do not mention filtered secret paths in the draft |
 
-Always include `git log --oneline -10` as a command. It gives the agent iteration-over-iteration memory.
+The deterministic baseline comes from these bounded repo signals only. The bounded repo-context snapshot is a strengthening input: it may add a small set of additional files via bounded sampling. Treat that extra context as guidance, not as proof of exhaustive repository discovery.
+
+Keep the scan bounded. The shipped implementation only inspects the repo root, filters secret-bearing names, and keeps a small set of top-level dirs/files. It does not promise deep filesystem discovery or language-specific tooling beyond the detected package scripts.
 
 ## Phase 3: Generate frontmatter
 
-### Tasks by category
+Baseline drafts include the detected commands, iteration limit, timeout, and guardrails. `stop_on_error` defaults to `true` and is typically omitted from generated drafts unless it is `false`.
 
-#### fix / test
+Baseline drafts do **not** automatically add `completion_promise`, `completion_gate`, or `required_outputs`.
+
+### Baseline draft example
 
 ```yaml
 ---
 commands:
   - name: tests
-    run: <detected-test-command>
+    run: npm test
     timeout: 60
   - name: git-log
     run: git log --oneline -10
-max_iterations: 20
-completion_promise: DONE
-guardrails:
-  block_commands:
-    - 'git\s+push'
----
-```
-
-#### migrate
-
-```yaml
----
-commands:
-  - name: build
-    run: <detected-build-command>
-    timeout: 60
-  - name: tests
-    run: <detected-test-command>
-    timeout: 120
-  - name: git-log
-    run: git log --oneline -10
-max_iterations: 30
-completion_promise: DONE
-required_outputs:
-  - MIGRATION_NOTES.md
-stop_on_error: false
-guardrails:
-  block_commands:
-    - 'git\s+push'
----
-```
-
-#### docs
-
-```yaml
----
-commands:
-  - name: build
-    run: <detected-build-command>
-    timeout: 60
-  - name: git-log
-    run: git log --oneline -10
-max_iterations: 15
-completion_promise: DONE
-required_outputs:
-  - DOCS_INDEX.md
-stop_on_error: false
----
-```
-
-#### research
-
-```yaml
----
-commands:
-  - name: git-log
-    run: git log --oneline -15
-max_iterations: 20
+    timeout: 20
+max_iterations: 25
 timeout: 300
-completion_promise: DONE
-required_outputs:
-  - REPORT.md
----
-```
-
-#### security
-
-```yaml
----
-commands:
-  - name: scan
-    run: <detected-security-scanner>
-    timeout: 60
-  - name: tests
-    run: <detected-test-command>
-    timeout: 120
-  - name: git-log
-    run: git log --oneline -10
-max_iterations: 20
-completion_promise: DONE
-required_outputs:
-  - SECURITY_FINDINGS.md
 guardrails:
   block_commands:
     - 'git\s+push'
-    - 'npm\s+publish'
-  protected_files:
-    - '.env*'
-    - '*.pem'
-    - '*.key'
-    - 'policy:secret-bearing-paths'
 ---
 ```
 
-## Phase 4: Write the prompt body
+### Add completion gating manually when you want a hard stop
 
-Follow the five-section structure:
+Only add these keys when the task needs an explicit stop condition:
 
-### Orientation (always include)
-
-```markdown
-You are an autonomous coding agent running in a loop.
-Each iteration starts with a fresh context.
-Your progress lives in the code and git history.
+```yaml
+completion_promise: DONE
+completion_gate: required
+required_outputs:
+  - ARCHITECTURE.md
 ```
 
-### Evidence (include detected commands)
+`required` means the loop waits for three things before stopping:
 
-```markdown
-## Test results
+1. The promise is emitted
+2. Every file in `required_outputs` exists
+3. `OPEN_QUESTIONS.md` is ready to stop, meaning it has no remaining P0/P1 items
 
-{{ commands.tests }}
+If `RALPH_PROGRESS.md` is listed in `required_outputs`, it is ignored and does not block completion.
 
-## Recent commits
+Use `optional` when you want the prompt to remind the agent about outputs and `OPEN_QUESTIONS.md`, but you still want the loop to stop on the promise alone. Use `disabled` when you want to suppress the gate reminders and checks entirely.
 
-{{ commands.git-log }}
-
-If tests are failing, fix them before starting new work.
-```
-
-### Task (one thing per iteration)
-
-For **fix/test** tasks:
-```markdown
-Pick the top-priority issue and fix it.
-Write a regression test that proves the fix.
-Commit with `fix: resolve <description>`.
-```
-
-For **migrate** tasks:
-```markdown
-Read MIGRATION_TODO.md and pick the first incomplete item.
-Migrate that one file or pattern.
-Verify the build and tests pass.
-Mark it complete and commit.
-```
-
-For **research** tasks:
-```markdown
-Read REPORT.md to see what exists.
-Identify the weakest section.
-Research and write detailed findings.
-Commit your changes.
-```
-
-### Rules (task-specific constraints)
-
-Common rules for all tasks:
-- One task per iteration
-- No placeholder code
-- Descriptive commit messages
-
-Additional rules by category:
-
-| Category | Extra rules |
-|---|---|
-| fix | Always write a regression test before fixing |
-| test | Cover edge cases, not just happy paths |
-| migrate | Only change behavior for the migration pattern |
-| docs | Include working code examples |
-| security | Never suppress warnings — fix root causes |
-| research | Cite sources, don't fabricate references |
-
-### Completion (explicit stop condition)
-
-Always include both `completion_promise` in frontmatter AND a completion section in the body:
+If you add a gate, include a short body section that names the stop condition explicitly:
 
 ```markdown
 ## Completion
 
-Stop with <promise>DONE</promise> when <specific condition>.
+Stop with <promise>DONE</promise> when ARCHITECTURE.md exists and OPEN_QUESTIONS.md has no remaining P0/P1 items.
 ```
 
-Match the condition to `required_outputs` if you set them.
+## Phase 4: Write the prompt body
+
+### What `/ralph-draft` emits today
+
+The generated body is compact. It does **not** include the richer Orientation / Evidence / Rules / Completion scaffold below unless you add that manually.
+
+#### Analysis mode
+
+```markdown
+Task: Reverse engineer this app
+
+Recent git history:
+{{ commands.git-log }}
+
+Latest repo-map output:
+{{ commands.repo-map }}
+
+Start with read-only inspection. Avoid edits and commits until you have a clear plan.
+Map the architecture, identify entry points, and summarize the important moving parts.
+End each iteration with concrete findings, open questions, and the next files to inspect.
+Iteration {{ ralph.iteration }} of {{ ralph.name }}.
+```
+
+#### Fix mode
+
+```markdown
+Task: Fix the failing auth tests
+
+Latest tests output:
+{{ commands.tests }}
+
+Latest lint output:
+{{ commands.lint }}
+
+Recent git history:
+{{ commands.git-log }}
+
+If tests or lint are failing, fix those failures before starting new work.
+Prefer concrete, verifiable progress. Explain why your change works.
+Iteration {{ ralph.iteration }} of {{ ralph.name }}.
+```
+
+#### Migration / general modes
+
+```markdown
+Task: Migrate the auth flow to v2
+
+Latest tests output:
+{{ commands.tests }}
+
+Latest lint output:
+{{ commands.lint }}
+
+Recent git history:
+{{ commands.git-log }}
+
+Make the smallest safe change that moves the task forward.
+Prefer concrete, verifiable progress. Explain why your change works.
+Iteration {{ ralph.iteration }} of {{ ralph.name }}.
+```
+
+Notes:
+
+- The command sections are plain label-plus-placeholder blocks.
+- `git-log` is rendered as `Recent git history`; every other command is rendered as `Latest <command> output`.
+- If the generator falls back to `repo-map`, the label is `Latest repo-map output:`.
+- The current body does not add separate evidence, rules, or completion sections automatically.
+
+### Manual enhancement guidance, not generator output
+
+If you want a richer hand-authored prompt, you can layer it on top of the shipped baseline. Keep the manual guidance clearly labeled so it does not read like emitted output.
+
+A practical enhancement shape is:
+
+```markdown
+## Orientation
+
+You are an autonomous coding agent running in a loop.
+Each iteration starts with a fresh context.
+Your progress lives in the code and git history.
+
+## Evidence
+
+{{ commands.tests }}
+{{ commands.git-log }}
+
+## Task
+
+Pick the top-priority issue and fix it.
+Write a regression test that proves the fix.
+
+## Rules
+
+- One task per iteration
+- No placeholder code
+- Descriptive commit messages
+
+## Completion
+
+Stop with <promise>DONE</promise> when the required outputs exist and OPEN_QUESTIONS.md is ready.
+```
+
+Use that only as an enhancement path. It is not what the current generator emits.
 
 ## Phase 5: Assemble and present
 
-1. Create the task directory (e.g., `fix-auth-tests/`)
-2. Write `RALPH.md` with the generated frontmatter and body
-3. If a task source file is needed (TODO.md, BUGS.md), create it
-4. Present to the user for review before starting
+1. Create the task directory
+2. Write `RALPH.md`
+3. Add any helper files the task needs
+4. Present the draft for review before starting
 
 Tell the user:
-- What task category you detected
-- What commands you included and why
-- What guardrails you set and why
-- What the completion criteria are
+- What mode you detected
+- Which commands you included and why
+- Which guardrails you set and why
+- What the completion criteria are, if you added them
 
-## Guardrail selection guide
+## Quick examples
 
-| Task type | block_commands | protected_files | stop_on_error |
-|---|---|---|---|
-| fix | `git push` | none | true |
-| test | `git push` | none | true |
-| migrate | `git push` | none | false |
-| docs | `git push` | none | false |
-| research | none | none | false |
-| security | `git push`, `npm publish` | `.env*`, `*.pem`, `*.key`, `policy:secret-bearing-paths` | true |
-
-Always block `git push` unless the task explicitly needs it. Always protect secret-bearing paths for security tasks.
-
-## Quick templates
-
-### From plain language
-
-```
-/ralph "fix the failing auth tests"
-```
-
-→ Classifies as **fix**, detects test framework, generates appropriate frontmatter.
-
-### From existing folder
-
-```
-/ralph --path ./my-task --arg env=staging
-```
-
-→ Uses the RALPH.md that already exists in `./my-task/`.
-
-### From scaffold
-
-```
-/ralph-scaffold my-task
-```
-
-→ Creates `my-task/RALPH.md` with a starter template. Edit it, then run with `/ralph --path my-task`.
+- `/ralph-draft "reverse engineer this app"` → analysis
+- `/ralph-draft "fix the failing auth tests"` → fix
+- `/ralph-draft "migrate the auth flow to v2"` → migration
+- `/ralph-draft "draft a release note"` → general

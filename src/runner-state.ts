@@ -26,9 +26,14 @@ export type CompletionRecord = {
   blockingReasons: string[];
 };
 
+export type ShellPolicy =
+  | { mode: "blocklist" }
+  | { mode: "allowlist"; allow: string[] };
+
 export type Guardrails = {
   blockCommands: string[];
   protectedFiles: string[];
+  shellPolicy?: ShellPolicy;
 };
 
 export type IterationRecord = {
@@ -302,13 +307,24 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
+function isShellPolicy(value: unknown): value is ShellPolicy {
+  if (!isRecord(value) || typeof value.mode !== "string") return false;
+  if (value.mode === "allowlist") {
+    return Array.isArray(value.allow) && value.allow.length > 0 && value.allow.every((entry) => typeof entry === "string");
+  }
+  if (value.mode === "blocklist") {
+    return value.allow === undefined || (Array.isArray(value.allow) && value.allow.length === 0);
+  }
+  return false;
+}
+
 function isProgressState(value: unknown): value is ProgressState {
   return value === true || value === false || value === "unknown";
 }
 
 function isGuardrails(value: unknown): value is Guardrails {
   if (!isRecord(value)) return false;
-  return isStringArray(value.blockCommands) && isStringArray(value.protectedFiles);
+  return isStringArray(value.blockCommands) && isStringArray(value.protectedFiles) && (value.shellPolicy === undefined || isShellPolicy(value.shellPolicy));
 }
 
 function isCompletionRecord(value: unknown): value is CompletionRecord {

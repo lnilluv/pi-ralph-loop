@@ -6,19 +6,26 @@ import { SECRET_PATH_POLICY_TOKEN, filterSecretBearingTopLevelNames, isSecretBea
 export type CommandDef = { name: string; run: string; timeout: number };
 export type DraftSource = "deterministic" | "llm-strengthened" | "fallback";
 export type DraftStrengtheningScope = "body-only" | "body-and-commands";
+export type CompletionGateMode = "required" | "optional" | "disabled";
 export type CommandIntent = CommandDef & { source: "heuristic" | "repo-signal" };
 export type RuntimeArg = { name: string; value: string };
 export type RuntimeArgs = Record<string, string>;
+export type ShellPolicy =
+  | { mode: "blocklist" }
+  | { mode: "allowlist"; allow: string[] };
 export type Frontmatter = {
   commands: CommandDef[];
   args?: string[];
   maxIterations: number;
   interIterationDelay: number;
+  itemsPerIteration?: number;
+  reflectEvery?: number;
   timeout: number;
   completionPromise?: string;
+  completionGate?: CompletionGateMode;
   requiredOutputs?: string[];
   stopOnError: boolean;
-  guardrails: { blockCommands: string[]; protectedFiles: string[] };
+  guardrails: { blockCommands: string[]; protectedFiles: string[]; shellPolicy?: ShellPolicy };
   invalidCommandEntries?: number[];
   invalidArgEntries?: number[];
 };
@@ -68,6 +75,10 @@ export type PlannedTaskTarget =
 export type RepoSignals = {
   packageManager?: "npm" | "pnpm" | "yarn" | "bun";
   testCommand?: string;
+  typecheckCommand?: string;
+  checkCommand?: string;
+  buildCommand?: string;
+  verifyCommand?: string;
   lintCommand?: string;
   hasGit: boolean;
   topLevelDirs: string[];
@@ -156,6 +167,11 @@ function parseStringArray(value: unknown): { values: string[]; invalidEntries?: 
   return { values, invalidEntries: invalidEntries.length > 0 ? invalidEntries : undefined };
 }
 
+function parseOptionalNumber(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  return Number(value);
+}
+
 function isUniversalProtectedGlob(pattern: string): boolean {
   const trimmed = pattern.trim().replace(/\/+$/, "");
   if (!trimmed) return true;
@@ -192,6 +208,40 @@ function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | nul
     !Array.isArray(guardrails.protected_files)
   ) {
     return "Invalid RALPH frontmatter: guardrails.protected_files must be a YAML sequence";
+  }
+  if (Object.prototype.hasOwnProperty.call(guardrails, "shell_policy")) {
+    const shellPolicy = guardrails.shell_policy;
+    if (!isRecord(shellPolicy)) {
+      return "Invalid RALPH frontmatter: guardrails.shell_policy must be a YAML mapping";
+    }
+    if (Object.prototype.hasOwnProperty.call(shellPolicy, "mode") && typeof shellPolicy.mode !== "string") {
+      return "Invalid RALPH frontmatter: guardrails.shell_policy.mode must be a YAML string";
+    }
+    if (Object.prototype.hasOwnProperty.call(shellPolicy, "allow") && !Array.isArray(shellPolicy.allow)) {
+      return "Invalid RALPH frontmatter: guardrails.shell_policy.allow must be a YAML sequence";
+    }
+    if (Array.isArray(shellPolicy.allow)) {
+      for (const [index, entry] of shellPolicy.allow.entries()) {
+        if (typeof entry !== "string") {
+          return `Invalid RALPH frontmatter: guardrails.shell_policy.allow[${index}] must be a YAML string`;
+        }
+      }
+      if (shellPolicy.mode === "blocklist" && shellPolicy.allow.length > 0) {
+        return "Invalid RALPH frontmatter: guardrails.shell_policy.allow must be absent or empty when mode is blocklist";
+      }
+    }
+  }
+  return null;
+}
+
+function validateRawCompletionGateShape(rawFrontmatter: UnknownRecord): string | null {
+  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "completion_gate")) {
+    return null;
+  }
+
+  const completionGate = rawFrontmatter.completion_gate;
+  if (typeof completionGate !== "string") {
+    return "Invalid RALPH frontmatter: completion_gate must be a YAML string";
   }
   return null;
 }
@@ -258,6 +308,13 @@ function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | nu
     }
   }
 
+  if (Object.prototype.hasOwnProperty.call(rawFrontmatter, "completion_gate")) {
+    const completionGateError = validateRawCompletionGateShape(rawFrontmatter);
+    if (completionGateError) {
+      return completionGateError;
+    }
+  }
+
   if (
     Object.prototype.hasOwnProperty.call(rawFrontmatter, "required_outputs")
   ) {
@@ -279,6 +336,18 @@ function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | nu
     (typeof rawFrontmatter.max_iterations !== "number" || !Number.isFinite(rawFrontmatter.max_iterations))
   ) {
     return "Invalid RALPH frontmatter: max_iterations must be a YAML number";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(rawFrontmatter, "items_per_iteration") &&
+    (typeof rawFrontmatter.items_per_iteration !== "number" || !Number.isFinite(rawFrontmatter.items_per_iteration))
+  ) {
+    return "Invalid RALPH frontmatter: items_per_iteration must be a YAML number";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(rawFrontmatter, "reflect_every") &&
+    (typeof rawFrontmatter.reflect_every !== "number" || !Number.isFinite(rawFrontmatter.reflect_every))
+  ) {
+    return "Invalid RALPH frontmatter: reflect_every must be a YAML number";
   }
   if (
     Object.prototype.hasOwnProperty.call(rawFrontmatter, "inter_iteration_delay") &&
@@ -342,6 +411,15 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
   } else if (guardrails.blockCommands.length > 0) {
     labels.push(`blocks ${guardrails.blockCommands.length} command pattern${guardrails.blockCommands.length === 1 ? "" : "s"}`);
   }
+  if (guardrails.shellPolicy?.mode === "allowlist") {
+    labels.push(
+      guardrails.shellPolicy.allow.length > 0
+        ? `shell allowlist with ${guardrails.shellPolicy.allow.length} regex${guardrails.shellPolicy.allow.length === 1 ? "" : "es"}`
+        : "shell allowlist",
+    );
+  } else if (guardrails.shellPolicy?.mode === "blocklist") {
+    labels.push("shell command blocklist");
+  }
   if (guardrails.protectedFiles.some((pattern) => pattern === SECRET_PATH_POLICY_TOKEN || isSecretBearingPath(pattern))) {
     labels.push("blocks write/edit to secret files");
   } else if (guardrails.protectedFiles.length > 0) {
@@ -350,28 +428,48 @@ function summarizeSafetyLabel(guardrails: Frontmatter["guardrails"]): string {
   return labels.length > 0 ? labels.join(" and ") : "No extra safety rules";
 }
 
+export function resolveCompletionGateMode(frontmatter: Frontmatter): CompletionGateMode {
+  return frontmatter.completionGate ?? (frontmatter.completionPromise ? "required" : "disabled");
+}
+
 function summarizeFinishLabel(frontmatter: Frontmatter): string {
   const requiredOutputs = frontmatter.requiredOutputs ?? [];
   const labels = [`Stop after ${frontmatter.maxIterations} iterations or /ralph-stop`];
-  if (requiredOutputs.length > 0) {
-    labels.push(`required outputs: ${requiredOutputs.join(", ")}`);
+  if (frontmatter.completionPromise) {
+    labels.push(`completion gate: ${resolveCompletionGateMode(frontmatter)}`);
+    if (requiredOutputs.length > 0) {
+      labels.push(`required outputs: ${requiredOutputs.join(", ")}`);
+    }
   }
   return labels.join("; ");
 }
 
 function summarizeFinishBehavior(frontmatter: Frontmatter): string[] {
   const requiredOutputs = frontmatter.requiredOutputs ?? [];
+  const gateMode = resolveCompletionGateMode(frontmatter);
   const lines = [
     `- Stop after ${frontmatter.maxIterations} iterations or /ralph-stop`,
     `- Stop if an iteration exceeds ${frontmatter.timeout}s`,
   ];
 
   if (frontmatter.completionPromise) {
-    if (requiredOutputs.length > 0) {
-      lines.push(`- Required outputs must exist before stopping: ${requiredOutputs.join(", ")}`);
+    if (gateMode === "disabled") {
+      lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
+      lines.push("- Completion gate is disabled, so required outputs and OPEN_QUESTIONS.md are not checked.");
+    } else if (gateMode === "optional") {
+      if (requiredOutputs.length > 0) {
+        lines.push(`- Required outputs should exist before stopping: ${requiredOutputs.join(", ")}`);
+      }
+      lines.push("- OPEN_QUESTIONS.md should have no remaining P0/P1 items before stopping.");
+      lines.push("- Completion gate is advisory; the loop may still stop when the promise is emitted.");
+      lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
+    } else {
+      if (requiredOutputs.length > 0) {
+        lines.push(`- Required outputs must exist before stopping: ${requiredOutputs.join(", ")}`);
+      }
+      lines.push("- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.");
+      lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
     }
-    lines.push("- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.");
-    lines.push(`- Stop early on <promise>${frontmatter.completionPromise}</promise>`);
   }
 
   return lines;
@@ -415,25 +513,30 @@ function detectPackageManager(cwd: string): RepoSignals["packageManager"] {
 
 function packageRunCommand(packageManager: RepoSignals["packageManager"], script: string): string {
   if (packageManager === "pnpm") return `pnpm ${script}`;
-  if (packageManager === "yarn") return `yarn ${script}`;
+  if (packageManager === "yarn") return `yarn run ${script}`;
   if (packageManager === "bun") return `bun run ${script}`;
   if (script === "test") return "npm test";
   return `npm run ${script}`;
 }
 
-function detectPackageScripts(cwd: string, packageManager: RepoSignals["packageManager"]): Pick<RepoSignals, "testCommand" | "lintCommand"> {
+function detectPackageScripts(cwd: string, packageManager: RepoSignals["packageManager"]): Pick<RepoSignals, "testCommand" | "typecheckCommand" | "checkCommand" | "buildCommand" | "verifyCommand" | "lintCommand"> {
   const packageJsonPath = join(cwd, "package.json");
   if (!existsSync(packageJsonPath)) return {};
 
   try {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { scripts?: Record<string, unknown> };
     const scripts = isRecord(packageJson.scripts) ? packageJson.scripts : {};
-    const testValue = typeof scripts.test === "string" ? scripts.test : undefined;
-    const lintValue = typeof scripts.lint === "string" ? scripts.lint : undefined;
+    const result: Partial<Pick<RepoSignals, "testCommand" | "typecheckCommand" | "checkCommand" | "buildCommand" | "verifyCommand" | "lintCommand">> = {};
 
-    const testCommand = testValue && !/no test specified/i.test(testValue) ? packageRunCommand(packageManager, "test") : undefined;
-    const lintCommand = lintValue ? packageRunCommand(packageManager, "lint") : undefined;
-    return { testCommand, lintCommand };
+    const testValue = typeof scripts.test === "string" ? scripts.test : undefined;
+    if (testValue && !/no test specified/i.test(testValue)) result.testCommand = packageRunCommand(packageManager, "test");
+    if (typeof scripts.typecheck === "string") result.typecheckCommand = packageRunCommand(packageManager, "typecheck");
+    if (typeof scripts.check === "string") result.checkCommand = packageRunCommand(packageManager, "check");
+    if (typeof scripts.build === "string") result.buildCommand = packageRunCommand(packageManager, "build");
+    if (typeof scripts.verify === "string") result.verifyCommand = packageRunCommand(packageManager, "verify");
+    if (typeof scripts.lint === "string") result.lintCommand = packageRunCommand(packageManager, "lint");
+
+    return result;
   } catch {
     return {};
   }
@@ -469,10 +572,27 @@ function renderCommandsYaml(commands: CommandDef[]): string[] {
     "commands:",
     ...commands.flatMap((command) => [
       `  - name: ${command.name}`,
-      `    run: ${command.run}`,
+      `    run: ${yamlQuote(command.run)}`,
       `    timeout: ${command.timeout}`,
     ]),
   ];
+}
+
+function shellPolicyAllowPatterns(shellPolicy?: ShellPolicy): string[] {
+  return shellPolicy?.mode === "allowlist" ? shellPolicy.allow : [];
+}
+
+function renderShellPolicyYaml(shellPolicy?: ShellPolicy): string[] {
+  if (!shellPolicy) return [];
+  return shellPolicy.mode === "allowlist"
+    ? [
+        "  shell_policy:",
+        "    mode: allowlist",
+        ...(shellPolicy.allow.length > 0
+          ? ["    allow:", ...shellPolicy.allow.map((pattern) => `      - ${yamlQuote(pattern)}`)]
+          : ["    allow: []"]),
+      ]
+    : ["  shell_policy:", "    mode: blocklist"];
 }
 
 function bodySection(title: string, placeholder: string): string {
@@ -504,6 +624,9 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
   });
   const parsedArgs = parseStringArray(yaml.args);
   const guardrails = isRecord(yaml.guardrails) ? yaml.guardrails : {};
+  const rawShellPolicy = isRecord(guardrails.shell_policy) ? guardrails.shell_policy : undefined;
+  const itemsPerIteration = parseOptionalNumber(yaml.items_per_iteration);
+  const reflectEvery = parseOptionalNumber(yaml.reflect_every);
 
   return {
     frontmatter: {
@@ -511,14 +634,25 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
       ...(parsedArgs.values.length > 0 ? { args: parsedArgs.values } : {}),
       maxIterations: Number(yaml.max_iterations ?? 50),
       interIterationDelay: Number(yaml.inter_iteration_delay ?? 0),
+      ...(itemsPerIteration !== undefined ? { itemsPerIteration } : {}),
+      ...(reflectEvery !== undefined ? { reflectEvery } : {}),
       timeout: Number(yaml.timeout ?? 300),
       completionPromise:
         typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
+      ...(typeof yaml.completion_gate === "string" && yaml.completion_gate.trim() ? { completionGate: yaml.completion_gate as CompletionGateMode } : {}),
       requiredOutputs: toStringArray(yaml.required_outputs),
       stopOnError: yaml.stop_on_error === false ? false : true,
       guardrails: {
         blockCommands: toStringArray(guardrails.block_commands),
         protectedFiles: toStringArray(guardrails.protected_files),
+        ...(rawShellPolicy
+          ? {
+              shellPolicy:
+                String(rawShellPolicy.mode ?? "") === "allowlist"
+                  ? { mode: "allowlist", allow: toStringArray(rawShellPolicy.allow) }
+                  : ({ mode: String(rawShellPolicy.mode ?? "") as ShellPolicy["mode"] } as ShellPolicy),
+            }
+          : {}),
       },
       invalidCommandEntries: invalidCommandEntries.length > 0 ? invalidCommandEntries : undefined,
       ...(parsedArgs.invalidEntries ? { invalidArgEntries: parsedArgs.invalidEntries } : {}),
@@ -540,11 +674,20 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
   if (!Number.isFinite(fm.interIterationDelay) || !Number.isInteger(fm.interIterationDelay) || fm.interIterationDelay < 0) {
     return "Invalid inter_iteration_delay: must be a non-negative integer";
   }
+  if (fm.itemsPerIteration !== undefined && (!Number.isFinite(fm.itemsPerIteration) || !Number.isInteger(fm.itemsPerIteration) || fm.itemsPerIteration < 1 || fm.itemsPerIteration > 20)) {
+    return "Invalid items_per_iteration: must be an integer between 1 and 20";
+  }
+  if (fm.reflectEvery !== undefined && (!Number.isFinite(fm.reflectEvery) || !Number.isInteger(fm.reflectEvery) || fm.reflectEvery < 2 || fm.reflectEvery > 20)) {
+    return "Invalid reflect_every: must be an integer between 2 and 20";
+  }
   if (!Number.isFinite(fm.timeout) || fm.timeout <= 0 || fm.timeout > 300) {
     return "Invalid timeout: must be greater than 0 and at most 300";
   }
   if (fm.completionPromise !== undefined && !isSafeCompletionPromise(fm.completionPromise)) {
     return "Invalid completion_promise: must be a single-line string without line breaks or angle brackets";
+  }
+  if (fm.completionGate !== undefined && !["required", "optional", "disabled"].includes(fm.completionGate)) {
+    return "Invalid completion_gate: must be required, optional, or disabled";
   }
   const args = fm.args ?? [];
   const seenArgNames = new Set<string>();
@@ -574,6 +717,27 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
       new RegExp(pattern);
     } catch {
       return `Invalid block_commands regex: ${pattern}`;
+    }
+  }
+  const shellPolicy = fm.guardrails.shellPolicy;
+  if (shellPolicy !== undefined) {
+    if (shellPolicy.mode !== "blocklist" && shellPolicy.mode !== "allowlist") {
+      return "Invalid shell_policy.mode: must be blocklist or allowlist";
+    }
+    if (shellPolicy.mode === "allowlist") {
+      const allow = (shellPolicy as { allow?: string[] }).allow;
+      if (!Array.isArray(allow) || allow.length === 0) {
+        return "Invalid shell_policy.allow: allowlist mode requires at least one regex";
+      }
+      for (const pattern of allow) {
+        try {
+          new RegExp(pattern);
+        } catch {
+          return `Invalid shell_policy.allow regex: ${pattern}`;
+        }
+      }
+    } else if ((shellPolicy as { allow?: string[] }).allow?.length) {
+      return "Invalid shell_policy.allow: blocklist mode must be absent or empty when mode is blocklist";
     }
   }
   for (const pattern of fm.guardrails.protectedFiles) {
@@ -651,9 +815,13 @@ export function acceptStrengthenedDraft(request: DraftRequest, strengthenedDraft
   if (baseline.parsed.frontmatter.timeout < strengthened.parsed.frontmatter.timeout) {
     return null;
   }
+  const baselineShellPolicy = baseline.parsed.frontmatter.guardrails.shellPolicy;
+  const strengthenedShellPolicy = strengthened.parsed.frontmatter.guardrails.shellPolicy;
   if (
     baseline.parsed.frontmatter.guardrails.blockCommands.join("\n") !== strengthened.parsed.frontmatter.guardrails.blockCommands.join("\n") ||
-    baseline.parsed.frontmatter.guardrails.protectedFiles.join("\n") !== strengthened.parsed.frontmatter.guardrails.protectedFiles.join("\n")
+    baseline.parsed.frontmatter.guardrails.protectedFiles.join("\n") !== strengthened.parsed.frontmatter.guardrails.protectedFiles.join("\n") ||
+    baselineShellPolicy?.mode !== strengthenedShellPolicy?.mode ||
+    shellPolicyAllowPatterns(baselineShellPolicy).join("\n") !== shellPolicyAllowPatterns(strengthenedShellPolicy).join("\n")
   ) {
     return null;
   }
@@ -697,6 +865,22 @@ export function findBlockedCommandPattern(command: string, blockPatterns: string
     }
   }
   return undefined;
+}
+
+export function findAllowedCommandPattern(command: string, allowPatterns: string[]): string | undefined {
+  for (const pattern of allowPatterns) {
+    try {
+      if (new RegExp(`^(?:${pattern})$`).test(command)) return pattern;
+    } catch {
+      // ignore malformed regexes; validateFrontmatter should catch these first
+    }
+  }
+  return undefined;
+}
+
+export function findShellPolicyBlockedCommandPattern(command: string, shellPolicy?: Frontmatter["guardrails"]["shellPolicy"]): string | undefined {
+  if (!shellPolicy || shellPolicy.mode !== "allowlist") return undefined;
+  return findAllowedCommandPattern(command, shellPolicy.allow) ? undefined : "shell_policy.allowlist";
 }
 
 function hasRuntimeArgToken(text: string): boolean {
@@ -1050,8 +1234,7 @@ export function inspectRepo(cwd: string): RepoSignals {
 
   return {
     packageManager,
-    testCommand: packageScripts.testCommand,
-    lintCommand: packageScripts.lintCommand,
+    ...packageScripts,
     hasGit: existsSync(join(cwd, ".git")),
     topLevelDirs,
     topLevelFiles,
@@ -1066,6 +1249,10 @@ export function buildRepoContext(signals: RepoSignals): RepoContext {
     summaryLines: [
       `package manager: ${signals.packageManager ?? "unknown"}`,
       `test command: ${signals.testCommand ?? "none"}`,
+      ...(signals.typecheckCommand ? [`typecheck command: ${signals.typecheckCommand}`] : []),
+      ...(signals.checkCommand ? [`check command: ${signals.checkCommand}`] : []),
+      ...(signals.buildCommand ? [`build command: ${signals.buildCommand}`] : []),
+      ...(signals.verifyCommand ? [`verify command: ${signals.verifyCommand}`] : []),
       `lint command: ${signals.lintCommand ?? "none"}`,
       `git repository: ${signals.hasGit ? "present" : "absent"}`,
       `top-level dirs: ${topLevelDirs.length > 0 ? topLevelDirs.join(", ") : "none"}`,
@@ -1103,18 +1290,44 @@ function normalizeRepoContext(repoContext: RepoContext | undefined, signals: Rep
   return buildRepoContext(signals);
 }
 
+const REPO_MAP_PRUNED_DIR_NAMES = [".git", ".env*", "node_modules", "dist", "build", "coverage", ".cache", ".turbo", "vendor"];
+const REPO_MAP_SECRET_DIR_NAMES = [".aws", ".azure", ".gcloud", ".ssh", "secrets", "credentials", "ops-secrets", "credentials-prod"];
+const REPO_MAP_SECRET_FILE_GLOBS = [".git", ".env*", ".npmrc", ".pypirc", ".netrc", "*.pem", "*.key", "*.asc"];
+
+function buildRepoMapPruneSequence(kind: "d" | "f", names: readonly string[]): string {
+  return names.map((name) => `-type ${kind} -name ${shellQuote(name)} -prune`).join(" -o ");
+}
+
+export function buildRepoMapCommand(): string {
+  return `find . -maxdepth 2 ${buildRepoMapPruneSequence("d", REPO_MAP_PRUNED_DIR_NAMES)} -o ${buildRepoMapPruneSequence("d", REPO_MAP_SECRET_DIR_NAMES)} -o ${buildRepoMapPruneSequence("f", REPO_MAP_SECRET_FILE_GLOBS)} -o -type f -print | sort | head -n 120`;
+}
+
+export const REPO_MAP_COMMAND = buildRepoMapCommand();
+
 export function buildCommandIntent(mode: DraftMode, signals: RepoSignals): CommandIntent[] {
   if (mode === "analysis") {
-    const commands: CommandIntent[] = [{ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20, source: "heuristic" }];
+    const commands: CommandIntent[] = [{ name: "repo-map", run: REPO_MAP_COMMAND, timeout: 20, source: "heuristic" }];
     if (signals.hasGit) commands.unshift({ name: "git-log", run: "git log --oneline -10", timeout: 20, source: "heuristic" });
     return commands;
   }
 
   const commands: CommandIntent[] = [];
-  if (signals.testCommand) commands.push({ name: "tests", run: signals.testCommand, timeout: 120, source: "repo-signal" });
+  if (signals.testCommand) {
+    commands.push({ name: "tests", run: signals.testCommand, timeout: 120, source: "repo-signal" });
+  } else if (signals.verifyCommand) {
+    commands.push({ name: "verify", run: signals.verifyCommand, timeout: 120, source: "repo-signal" });
+  }
+
+  if (signals.typecheckCommand) {
+    commands.push({ name: "typecheck", run: signals.typecheckCommand, timeout: 120, source: "repo-signal" });
+  } else if (signals.checkCommand) {
+    commands.push({ name: "check", run: signals.checkCommand, timeout: 120, source: "repo-signal" });
+  }
+
+  if (signals.buildCommand) commands.push({ name: "build", run: signals.buildCommand, timeout: 120, source: "repo-signal" });
   if (signals.lintCommand) commands.push({ name: "lint", run: signals.lintCommand, timeout: 90, source: "repo-signal" });
   if (signals.hasGit) commands.push({ name: "git-log", run: "git log --oneline -10", timeout: 20, source: "heuristic" });
-  if (commands.length === 0) commands.push({ name: "repo-map", run: "find . -maxdepth 2 -type f | sort | head -n 120", timeout: 20, source: "heuristic" });
+  if (commands.length === 0) commands.push({ name: "repo-map", run: REPO_MAP_COMMAND, timeout: 20, source: "heuristic" });
   return commands;
 }
 
@@ -1189,6 +1402,7 @@ function renderDraftPlan(task: string, mode: DraftMode, target: DraftTarget, fro
       : []),
     ...(frontmatter.completionPromise ? [`completion_promise: ${yamlQuote(frontmatter.completionPromise)}`] : []),
     "guardrails:",
+    ...(frontmatter.guardrails.shellPolicy ? renderShellPolicyYaml(frontmatter.guardrails.shellPolicy) : []),
     ...(frontmatter.guardrails.blockCommands.length > 0
       ? ["  block_commands:", ...frontmatter.guardrails.blockCommands.map((pattern) => `    - ${yamlQuote(pattern)}`)]
       : ["  block_commands: []"]),
@@ -1424,29 +1638,53 @@ export function renderIterationPrompt(
   body: string,
   iteration: number,
   maxIterations: number,
-  completionGate?: { completionPromise?: string; requiredOutputs?: string[]; failureReasons?: string[]; rejectionReasons?: string[] },
+  completionGate?: { completionPromise?: string; requiredOutputs?: string[]; completionGateMode?: CompletionGateMode; failureReasons?: string[]; rejectionReasons?: string[] },
+  pacing?: { itemsPerIteration?: number; reflectEvery?: number },
 ): string {
-  if (!completionGate) {
-    return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
+  const extraBlocks: string[] = [];
+
+  const pacingLines: string[] = [];
+  if (pacing?.itemsPerIteration !== undefined) {
+    pacingLines.push("[pacing]", `- Keep this iteration to at most ${pacing.itemsPerIteration} items.`);
+  }
+  if (pacing?.reflectEvery !== undefined && iteration % pacing.reflectEvery === 0) {
+    pacingLines.push("[reflection checkpoint]", `- This iteration is a reflection checkpoint. Pause to reflect on progress, remaining work, and blockers before continuing.`);
+  }
+  if (pacingLines.length > 0) {
+    extraBlocks.push(pacingLines.join("\n"));
   }
 
-  const requiredOutputs = completionGate.requiredOutputs ?? [];
-  const failureReasons = completionGate.failureReasons ?? [];
-  const rejectionReasons = completionGate.rejectionReasons ?? [];
-  const completionPromise = completionGate.completionPromise ?? "DONE";
-  const gateLines = [
-    "[completion gate]",
-    `- Required outputs must exist before stopping${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`,
-    "- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.",
-    "- Label inferred claims as HYPOTHESIS.",
-    ...(rejectionReasons.length > 0
-      ? ["[completion gate rejection]", `- Still missing: ${rejectionReasons.join("; ")}`]
-      : []),
-    ...(failureReasons.length > 0 ? [`- Previous gate failures: ${failureReasons.join("; ")}`] : []),
-    `- Emit <promise>${completionPromise}</promise> only when the gate is truly satisfied.`,
-  ];
+  if (completionGate) {
+    const requiredOutputs = completionGate.requiredOutputs ?? [];
+    const failureReasons = completionGate.failureReasons ?? [];
+    const rejectionReasons = completionGate.rejectionReasons ?? [];
+    const completionPromise = completionGate.completionPromise ?? "DONE";
+    const completionGateMode = completionGate.completionGateMode ?? "required";
+    if (completionGateMode !== "disabled") {
+      const gateLines = [
+        "[completion gate]",
+        completionGateMode === "optional"
+          ? `- Completion gate is advisory${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`
+          : `- Required outputs must exist before stopping${requiredOutputs.length > 0 ? `: ${requiredOutputs.join(", ")}` : "."}`,
+        completionGateMode === "optional"
+          ? "- OPEN_QUESTIONS.md should have no remaining P0/P1 items before stopping."
+          : "- OPEN_QUESTIONS.md must have no remaining P0/P1 items before stopping.",
+        "- Label inferred claims as HYPOTHESIS.",
+        ...(rejectionReasons.length > 0
+          ? ["[completion gate rejection]", `- Still missing: ${rejectionReasons.join("; ")}`]
+          : []),
+        ...(failureReasons.length > 0 ? [`- Previous gate failures: ${failureReasons.join("; ")}`] : []),
+        completionGateMode === "optional"
+          ? `- Emit <promise>${completionPromise}</promise> once the work is complete, even if advisory outputs are still missing.`
+          : `- Emit <promise>${completionPromise}</promise> only when the gate is truly satisfied.`,
+      ];
+      extraBlocks.push(gateLines.join("\n"));
+    }
+  }
 
-  return `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}\n\n${gateLines.join("\n")}`;
+  return extraBlocks.length > 0
+    ? `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}\n\n${extraBlocks.join("\n\n")}`
+    : `[ralph: iteration ${iteration}/${maxIterations}]\n\n${body}`;
 }
 
 export function shouldWarnForBashFailure(output: string): boolean {

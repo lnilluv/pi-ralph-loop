@@ -119,6 +119,10 @@ function promptText(prompt: ReturnType<typeof buildStrengtheningPrompt>): string
   return [prompt.systemPrompt ?? "", ...prompt.messages.map((message) => (typeof message.content === "string" ? message.content : ""))].join("\n");
 }
 
+function promptTextBeforeBaselineDraft(prompt: ReturnType<typeof buildStrengtheningPrompt>): string {
+  return promptText(prompt).split("\nDeterministic baseline draft:")[0];
+}
+
 test("buildStrengtheningPrompt includes the full prompt contract and repo signals", () => {
   const request = makeRequest();
   const prompt = buildStrengtheningPrompt(request, "body-only");
@@ -176,7 +180,7 @@ test("buildStrengtheningPrompt omits secret-bearing top-level repo names", (t) =
     buildRepoContext(repoSignals),
   );
   const prompt = buildStrengtheningPrompt(request, "body-only");
-  const text = promptText(prompt);
+  const text = promptTextBeforeBaselineDraft(prompt);
 
   assert.ok(repoSignals.topLevelFiles.includes("package.json"));
   assert.ok(repoSignals.topLevelDirs.includes("src"));
@@ -212,7 +216,7 @@ test("buildStrengtheningPrompt omits .env* top-level repo names from repo signal
     buildRepoContext(repoSignals),
   );
   const prompt = buildStrengtheningPrompt(request, "body-only");
-  const text = promptText(prompt);
+  const text = promptTextBeforeBaselineDraft(prompt);
 
   assert.ok(repoSignals.topLevelFiles.includes("package.json"));
   assert.ok(!repoSignals.topLevelFiles.includes(".envrc"));

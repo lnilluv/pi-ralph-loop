@@ -1,4 +1,4 @@
-import { complete, type AssistantMessage, type Context, type Model } from "@mariozechner/pi-ai";
+import { complete, type Api, type AssistantMessage, type Context, type Model } from "@mariozechner/pi-ai";
 import { basename } from "node:path";
 import { filterSecretBearingTopLevelNames } from "./secret-paths.ts";
 import {
@@ -16,9 +16,9 @@ import {
 export const DRAFT_LLM_TIMEOUT_MS = 20_000;
 
 export type StrengthenDraftRuntime = {
-  model: Model<string> | undefined;
+  model: Model<Api> | undefined;
   modelRegistry: {
-    getApiKeyAndHeaders(model: Model<string>): Promise<AuthResult | AuthFailure>;
+    getApiKeyAndHeaders(model: Model<Api>): Promise<AuthResult | AuthFailure>;
   };
 };
 
@@ -109,6 +109,10 @@ function summarizeRepoSignals(request: DraftRequest): string[] {
   return [
     `package manager: ${request.repoSignals.packageManager ?? "unknown"}`,
     `test command: ${request.repoSignals.testCommand ?? "none"}`,
+    ...(request.repoSignals.typecheckCommand ? [`typecheck command: ${request.repoSignals.typecheckCommand}`] : []),
+    ...(request.repoSignals.checkCommand ? [`check command: ${request.repoSignals.checkCommand}`] : []),
+    ...(request.repoSignals.buildCommand ? [`build command: ${request.repoSignals.buildCommand}`] : []),
+    ...(request.repoSignals.verifyCommand ? [`verify command: ${request.repoSignals.verifyCommand}`] : []),
     `lint command: ${request.repoSignals.lintCommand ?? "none"}`,
     `git repository: ${request.repoSignals.hasGit ? "present" : "absent"}`,
     `top-level dirs: ${topLevelDirs.length > 0 ? topLevelDirs.join(", ") : "none"}`,
