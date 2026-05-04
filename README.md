@@ -238,6 +238,8 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 | `/ralph-scaffold [--preset <name>] <name-or-path>` | Create a starter `RALPH.md` template |
 | `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>]` | Export run artifacts to a directory |
 
+Ralph runs each iteration in a child `pi --mode rpc` process. The child explicitly loads the Ralph extension but disables normal Pi extension discovery, so unrelated local extensions or MCP gateways do not slow or alter loop startup.
+
 ### Argument passing
 
 `--arg name=value` is only valid with `--path` to an existing `RALPH.md`:

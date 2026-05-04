@@ -635,6 +635,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       "--mode",
       "rpc",
       "--no-session",
+      "--no-extensions",
       "-e",
       fileURLToPath(new URL("../src/index.ts", import.meta.url)),
     ]);

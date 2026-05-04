@@ -14,6 +14,7 @@ You know how to code. This skill teaches you when and how to run autonomous loop
 - `pi --help` does not list extension slash commands. Use `pi list` to check that `npm:@lnilluv/pi-ralph-loop` is installed.
 - If you are preparing a loop for the user, create or edit the task folder and `RALPH.md`, then tell the user to run `/ralph --path ./task`.
 - For explicit noninteractive smoke tests, run Pi itself with the slash command as the prompt, for example `pi -p "/ralph --path ./task"`. Do not confuse that with running `/ralph` in bash.
+- Ralph runs each iteration in a nested `pi --mode rpc` child. The child loads the Ralph extension explicitly and disables normal extension discovery, so unrelated local Pi extensions or MCP gateways should not delay loop startup.
 - `RALPH.md` YAML uses `snake_case` keys. Common camelCase aliases are accepted for compatibility, but new files should use `max_iterations`, `inter_iteration_delay`, `completion_promise`, `completion_gate`, `required_outputs`, `stop_on_error`, `guardrails.block_commands`, and `guardrails.protected_files`.
 
 ## When to loop

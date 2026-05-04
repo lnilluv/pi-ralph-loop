@@ -17,7 +17,7 @@ export type RpcSubprocessConfig = {
   handshakeTimeoutMs?: number;
   /** Override the spawn command for testing. Defaults to "pi" */
   spawnCommand?: string;
-  /** Override spawn args for testing. Defaults to ["--mode", "rpc", "--no-session"] */
+  /** Override spawn args for testing. Defaults to ["--mode", "rpc", "--no-session", "--no-extensions", "-e", <ralph extension>] */
   spawnArgs?: string[];
   /** Additional environment variables for the subprocess */
   env?: Record<string, string>;
@@ -179,7 +179,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   }
 
   const extensionPath = fileURLToPath(new URL("./index.ts", import.meta.url));
-  const args = spawnArgs ?? ["--mode", "rpc", "--no-session", "-e", extensionPath];
+  const args = spawnArgs ?? ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extensionPath];
   const subprocessEnv = { ...process.env, ...env };
   const telemetry: RpcTelemetry = {
     spawnedAt: new Date().toISOString(),
