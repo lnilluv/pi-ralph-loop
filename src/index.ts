@@ -1,12 +1,10 @@
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionEvent, SessionEntry, AgentEndEvent as PiAgentEndEvent, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 
-type ToolExecutionStartEvent = Extract<ExtensionEvent, { type: "tool_execution_start" }>;
-type ToolExecutionEndEvent = Extract<ExtensionEvent, { type: "tool_execution_end" }>;
 import {
   buildMissionBrief,
   inspectExistingTarget,
@@ -14,12 +12,9 @@ import {
   parseCommandArgs,
   parseRalphMarkdown,
   planTaskDraftTarget,
-  renderIterationPrompt,
-  renderRalphBody,
   resolveCommandRun,
   replaceArgsPlaceholders,
   runtimeArgEntriesToMap,
-  shouldStopForCompletionPromise,
   shouldWarnForBashFailure,
   shouldValidateExistingDraft,
   validateDraftContent,
@@ -40,7 +35,6 @@ import {
   checkStopSignal,
   createStopSignal,
   createCancelSignal,
-  checkCancelSignal,
   listActiveLoopRegistryEntries,
   readActiveLoopRegistry,
   readIterationRecords,
@@ -76,7 +70,6 @@ type LoopState = {
   noProgressStreak: number;
   iterationSummaries: IterationSummary[];
   guardrails: Frontmatter["guardrails"];
-  observedTaskDirWrites: Set<string>;
   loopToken?: string;
 };
 type PersistedLoopState = {
@@ -104,7 +97,6 @@ const RALPH_RUNNER_NO_PROGRESS_STREAK_ENV = "RALPH_RUNNER_NO_PROGRESS_STREAK";
 const RALPH_RUNNER_GUARDRAILS_ENV = "RALPH_RUNNER_GUARDRAILS";
 
 type CommandContext = ExtensionCommandContext;
-type CommandSessionEntry = SessionEntry;
 
 type DraftPlanFactory = (
   task: string,
@@ -231,7 +223,6 @@ function resolveRalphTarget(
   return { kind: "resolved", taskDir: activeEntries[0].taskDir };
 }
 
-type AgentEndEvent = PiAgentEndEvent;
 
 type ToolResultEvent = PiToolResultEvent;
 
@@ -242,13 +233,6 @@ type ForkOptions = NonNullable<Parameters<NonNullable<CommandContext["fork"]>>[1
 type SwitchSessionOptions = NonNullable<Parameters<NonNullable<CommandContext["switchSession"]>>[1]>;
 type SessionReplacementWithSession = NonNullable<NewSessionOptions["withSession"]>;
 type SessionReplacementContext = Parameters<SessionReplacementWithSession>[0];
-type SessionReplacementOptions = {
-  withSession?: SessionReplacementWithSession;
-};
-
-function resolveSessionUi(ctx: CommandContext): CommandContext["ui"] {
-  return ctx.ui;
-}
 
 function installSessionReplacementHooks(
   ctx: CommandContext,
@@ -504,78 +488,6 @@ export async function runCommands(
   return results;
 }
 
-const SNAPSHOT_IGNORED_DIR_NAMES = new Set([
-  ".git",
-  "node_modules",
-  ".next",
-  ".turbo",
-  ".cache",
-  "coverage",
-  "dist",
-  "build",
-  ".ralph-runner",
-]);
-const SNAPSHOT_MAX_FILES = 200;
-const SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
-const SNAPSHOT_POST_IDLE_POLL_INTERVAL_MS = 20;
-const SNAPSHOT_POST_IDLE_POLL_WINDOW_MS = 100;
-const RALPH_PROGRESS_FILE = "RALPH_PROGRESS.md";
-
-type WorkspaceSnapshot = {
-  files: Map<string, string>;
-  truncated: boolean;
-  errorCount: number;
-};
-
-type ProgressAssessment = {
-  progress: ProgressState;
-  changedFiles: string[];
-  snapshotTruncated: boolean;
-  snapshotErrorCount: number;
-};
-
-type IterationCompletion = {
-  messages: PiAgentEndEvent["messages"];
-  observedTaskDirWrites: Set<string>;
-  error?: Error;
-};
-
-type Deferred<T> = {
-  promise: Promise<T>;
-  resolve(value: T): void;
-  reject(reason?: unknown): void;
-  settled: boolean;
-};
-
-type PendingIterationState = {
-  prompt: string;
-  completion: Deferred<IterationCompletion>;
-  toolCallPaths: Map<string, string>;
-  observedTaskDirWrites: Set<string>;
-};
-
-function createDeferred<T>(): Deferred<T> {
-  let resolvePromise!: (value: T) => void;
-  let rejectPromise!: (reason?: unknown) => void;
-  const deferred: Deferred<T> = {
-    promise: new Promise<T>((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
-    }),
-    resolve(value: T) {
-      if (deferred.settled) return;
-      deferred.settled = true;
-      resolvePromise(value);
-    },
-    reject(reason?: unknown) {
-      if (deferred.settled) return;
-      deferred.settled = true;
-      rejectPromise(reason);
-    },
-    settled: false,
-  };
-  return deferred;
-}
 
 function defaultLoopState(): LoopState {
   return {
@@ -590,7 +502,6 @@ function defaultLoopState(): LoopState {
     noProgressStreak: 0,
     iterationSummaries: [],
     guardrails: { blockCommands: [], protectedFiles: [] },
-    observedTaskDirWrites: new Set(),
     loopToken: undefined,
     cwd: "",
   };
@@ -707,17 +618,6 @@ function cloneGuardrails(guardrails: { blockCommands: string[]; protectedFiles: 
   };
 }
 
-function sanitizeGuardrails(value: unknown): Frontmatter["guardrails"] {
-  if (!value || typeof value !== "object") {
-    return { blockCommands: [], protectedFiles: [] };
-  }
-  const guardrails = value as { blockCommands?: unknown; protectedFiles?: unknown; shellPolicy?: unknown };
-  return cloneGuardrails({
-    blockCommands: sanitizeStringArray(guardrails.blockCommands),
-    protectedFiles: sanitizeStringArray(guardrails.protectedFiles),
-    ...(isShellPolicy(guardrails.shellPolicy) ? { shellPolicy: guardrails.shellPolicy } : {}),
-  });
-}
 
 function sanitizeProgressState(value: unknown): ProgressState {
   return value === true || value === false || value === "unknown" ? value : "unknown";
@@ -952,126 +852,6 @@ function pathsReferToSameLocation(left: string, right: string): boolean {
   return comparablePath(left) === comparablePath(right);
 }
 
-function normalizeSnapshotPath(filePath: string): string {
-  return filePath.split("\\").join("/");
-}
-
-function captureTaskDirectorySnapshot(ralphPath: string): WorkspaceSnapshot {
-  const taskDir = dirname(ralphPath);
-  const progressMemoryPath = join(taskDir, RALPH_PROGRESS_FILE);
-  const files = new Map<string, string>();
-  let truncated = false;
-  let bytesRead = 0;
-  let errorCount = 0;
-
-  const walk = (dirPath: string) => {
-    let entries;
-    try {
-      entries = readdirSync(dirPath, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
-    } catch {
-      errorCount += 1;
-      return;
-    }
-
-    for (const entry of entries) {
-      if (truncated) return;
-      const fullPath = join(dirPath, entry.name);
-
-      if (entry.isDirectory()) {
-        if (SNAPSHOT_IGNORED_DIR_NAMES.has(entry.name)) continue;
-        walk(fullPath);
-        continue;
-      }
-      if (!entry.isFile() || fullPath === ralphPath || fullPath === progressMemoryPath) continue;
-      if (files.size >= SNAPSHOT_MAX_FILES) {
-        truncated = true;
-        return;
-      }
-
-      const relPath = normalizeSnapshotPath(relative(taskDir, fullPath));
-      if (!relPath || relPath.startsWith("..")) continue;
-
-      let content;
-      try {
-        content = readFileSync(fullPath);
-      } catch {
-        errorCount += 1;
-        continue;
-      }
-      if (bytesRead + content.byteLength > SNAPSHOT_MAX_BYTES) {
-        truncated = true;
-        return;
-      }
-
-      bytesRead += content.byteLength;
-      files.set(relPath, `${content.byteLength}:${createHash("sha1").update(content).digest("hex")}`);
-    }
-  };
-
-  if (existsSync(taskDir)) walk(taskDir);
-  return { files, truncated, errorCount };
-}
-
-function diffTaskDirectorySnapshots(before: WorkspaceSnapshot, after: WorkspaceSnapshot): string[] {
-  const changed = new Set<string>();
-  for (const [filePath, fingerprint] of before.files) {
-    if (after.files.get(filePath) !== fingerprint) changed.add(filePath);
-  }
-  for (const filePath of after.files.keys()) {
-    if (!before.files.has(filePath)) changed.add(filePath);
-  }
-  return [...changed].sort((a, b) => a.localeCompare(b));
-}
-
-function resolveTaskDirObservedPath(taskDir: string, cwd: string, filePath: string): string | undefined {
-  if (!taskDir || !cwd || !filePath) return undefined;
-  const relPath = normalizeSnapshotPath(relative(resolve(taskDir), resolve(cwd, filePath)));
-  if (!relPath || relPath === "." || relPath.startsWith("..")) return undefined;
-  return relPath;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolveDelay) => {
-    setTimeout(resolveDelay, ms);
-  });
-}
-
-async function assessTaskDirectoryProgress(
-  ralphPath: string,
-  before: WorkspaceSnapshot,
-  observedTaskDirWrites: ReadonlySet<string>,
-): Promise<ProgressAssessment> {
-  let after = captureTaskDirectorySnapshot(ralphPath);
-  let changedFiles = diffTaskDirectorySnapshots(before, after);
-  let snapshotTruncated = before.truncated || after.truncated;
-  let snapshotErrorCount = before.errorCount + after.errorCount;
-
-  if (changedFiles.length > 0) {
-    return { progress: true, changedFiles, snapshotTruncated, snapshotErrorCount };
-  }
-
-  for (let remainingMs = SNAPSHOT_POST_IDLE_POLL_WINDOW_MS; remainingMs > 0; remainingMs -= SNAPSHOT_POST_IDLE_POLL_INTERVAL_MS) {
-    await delay(Math.min(SNAPSHOT_POST_IDLE_POLL_INTERVAL_MS, remainingMs));
-    after = captureTaskDirectorySnapshot(ralphPath);
-    changedFiles = diffTaskDirectorySnapshots(before, after);
-    snapshotTruncated ||= after.truncated;
-    snapshotErrorCount += after.errorCount;
-    if (changedFiles.length > 0) {
-      return { progress: true, changedFiles, snapshotTruncated, snapshotErrorCount };
-    }
-  }
-
-  if (observedTaskDirWrites.size > 0) {
-    return { progress: "unknown", changedFiles: [], snapshotTruncated, snapshotErrorCount };
-  }
-
-  return {
-    progress: snapshotTruncated || snapshotErrorCount > 0 ? "unknown" : false,
-    changedFiles,
-    snapshotTruncated,
-    snapshotErrorCount,
-  };
-}
 
 function summarizeChangedFiles(changedFiles: string[]): string {
   if (changedFiles.length === 0) return "none";
@@ -1667,7 +1447,6 @@ async function editExistingDraft(ralphPath: string, ctx: Pick<CommandContext, "c
 }
 
 async function chooseRecoveryMode(
-  input: string,
   dirPath: string,
   ctx: Pick<CommandContext, "cwd" | "ui">,
   allowTaskFallback = true,
@@ -1993,10 +1772,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   if (registeredPi[RALPH_EXTENSION_REGISTERED]) return;
   registeredPi[RALPH_EXTENSION_REGISTERED] = true;
   const failCounts = new Map<string, number>();
-  const pendingIterations = new Map<string, PendingIterationState>();
   let selectedThinkingLevel: string | undefined;
   const draftPlanFactory = services.createDraftPlan ?? createDraftPlanService;
-  const isLoopSession = (ctx: Pick<CommandContext, "sessionManager">): boolean => resolveActiveLoopState(ctx) !== undefined;
   const appendLoopProofEntry = (customType: string, data: Record<string, unknown>): void => {
     try {
       pi.appendEntry?.(customType, data);
@@ -2011,60 +1788,6 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         // Best-effort surfacing only.
       }
     }
-  };
-  const getPendingIteration = (ctx: Pick<CommandContext, "sessionManager">): PendingIterationState | undefined => {
-    const state = resolveActiveIterationState(ctx);
-    return state ? pendingIterations.get(getLoopIterationKey(state.loopToken, state.iteration)) : undefined;
-  };
-  const registerPendingIteration = (loopToken: string, iteration: number, prompt: string): PendingIterationState => {
-    const pending: PendingIterationState = {
-      prompt,
-      completion: createDeferred<IterationCompletion>(),
-      toolCallPaths: new Map(),
-      observedTaskDirWrites: new Set(),
-    };
-    pendingIterations.set(getLoopIterationKey(loopToken, iteration), pending);
-    return pending;
-  };
-  const clearPendingIteration = (loopToken: string, iteration: number) => {
-    pendingIterations.delete(getLoopIterationKey(loopToken, iteration));
-  };
-  const resolvePendingIteration = (ctx: EventContext, event: AgentEndEvent) => {
-    const state = resolveActiveIterationState(ctx);
-    if (!state) return;
-    const pendingKey = getLoopIterationKey(state.loopToken, state.iteration);
-    const pending = pendingIterations.get(pendingKey);
-    if (!pending) return;
-    pendingIterations.delete(pendingKey);
-    const rawError = (event as { error?: unknown }).error;
-    const error = rawError instanceof Error ? rawError : rawError ? new Error(String(rawError)) : undefined;
-    pending.completion.resolve({
-      messages: event.messages ?? [],
-      observedTaskDirWrites: new Set(pending.observedTaskDirWrites),
-      error,
-    });
-  };
-  const recordPendingToolPath = (ctx: EventContext, event: ToolCallEvent | ToolExecutionStartEvent) => {
-    const pending = getPendingIteration(ctx);
-    if (!pending) return;
-    if (event.toolName !== "write" && event.toolName !== "edit") return;
-    const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-    const filePath = ("input" in event ? event.input : event.args)?.path ?? "";
-    if (toolCallId && filePath) pending.toolCallPaths.set(toolCallId, filePath);
-  };
-  const recordSuccessfulTaskDirWrite = (ctx: EventContext, event: ToolExecutionEndEvent) => {
-    const pending = getPendingIteration(ctx);
-    if (!pending) return;
-    if (event.toolName !== "write" && event.toolName !== "edit") return;
-    const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-    const filePath = toolCallId ? pending.toolCallPaths.get(toolCallId) : undefined;
-    if (toolCallId) pending.toolCallPaths.delete(toolCallId);
-    if (event.isError === true || !filePath) return;
-    const persisted = resolveActiveLoopState(ctx);
-    const taskDirPath = persisted?.taskDir ?? loopState.taskDir;
-    const cwd = persisted?.cwd ?? loopState.cwd;
-    const relPath = resolveTaskDirObservedPath(taskDirPath ?? "", cwd ?? taskDirPath ?? "", filePath);
-    if (relPath && relPath !== RALPH_PROGRESS_FILE) pending.observedTaskDirWrites.add(relPath);
   };
 
   async function startRalphLoop(ralphPath: string, ctx: CommandContext, runLoopFn: typeof runRalphLoop = runRalphLoop, runtimeArgs: RuntimeArgs = {}) {
@@ -2108,7 +1831,6 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         noProgressStreak: 0,
         iterationSummaries: [],
         guardrails: cloneGuardrails(frontmatter.guardrails),
-        observedTaskDirWrites: new Set(),
         loopToken: randomUUID(),
       };
     } catch (err) {
@@ -2133,12 +1855,10 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         thinkingLevel: getSelectedThinkingLevel(ctx, selectedThinkingLevel),
         runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir, commandRuntimeArgs) => runCommands(commands, guardrails, commandPi as ExtensionAPI, commandRuntimeArgs ?? runtimeArgs, cwd, taskDir),
         onStatusChange(status) {
-          const runtimeUi = resolveSessionUi(currentCommandCtx);
-          runtimeUi.setStatus("ralph", status === "running" || status === "initializing" ? `🔁 ${name}: running` : undefined);
+          currentCommandCtx.ui.setStatus("ralph", status === "running" || status === "initializing" ? `🔁 ${name}: running` : undefined);
         },
         onNotify(message, level) {
-          const runtimeUi = resolveSessionUi(currentCommandCtx);
-          runtimeUi.notify(message, level);
+          currentCommandCtx.ui.notify(message, level);
         },
         onIterationComplete(record) {
           loopState.iteration = record.iteration;
@@ -2166,7 +1886,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
       // Map runner result to UI notifications
       const total = loopState.iterationSummaries.reduce((a, s) => a + s.duration, 0);
-      const runtimeUi = resolveSessionUi(currentCommandCtx);
+      const runtimeUi = currentCommandCtx.ui;
       switch (result.status) {
         case "complete":
           runtimeUi.notify(`Ralph loop complete: completion promise matched on iteration ${result.iterations.length} (${total}s total)`, "info");
@@ -2192,15 +1912,14 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      resolveSessionUi(currentCommandCtx).notify(`Ralph loop failed: ${message}`, "error");
+      currentCommandCtx.ui.notify(`Ralph loop failed: ${message}`, "error");
     } finally {
       failCounts.clear();
-      pendingIterations.clear();
       loopState.active = false;
       loopState.stopRequested = false;
       loopState.loopToken = undefined;
       restoreSessionReplacementHooks();
-      resolveSessionUi(currentCommandCtx).setStatus("ralph", undefined);
+      currentCommandCtx.ui.setStatus("ralph", undefined);
       persistLoopState(sessionPi, toPersistedLoopState(loopState, { active: false, stopRequested: false }));
     }
   }
@@ -2255,7 +1974,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
             ctx.ui.notify("Draft review requires an interactive session. Pass a task folder or RALPH.md path instead.", "warning");
             return undefined;
           }
-          const recovery = await chooseRecoveryMode(input, inspection.dirPath, ctx, !explicitPath);
+          const recovery = await chooseRecoveryMode(inspection.dirPath, ctx, !explicitPath);
           if (recovery === "cancel") return undefined;
           if (recovery === "task") {
             return handleTaskFlow(input);
@@ -2352,20 +2071,9 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
     }
 
-    recordPendingToolPath(ctx, event);
   });
 
-  pi.on("tool_execution_start", async (event: ToolExecutionStartEvent, ctx: EventContext) => {
-    recordPendingToolPath(ctx, event);
-  });
 
-  pi.on("tool_execution_end", async (event: ToolExecutionEndEvent, ctx: EventContext) => {
-    recordSuccessfulTaskDirWrite(ctx, event);
-  });
-
-  pi.on("agent_end", async (event: AgentEndEvent, ctx: EventContext) => {
-    resolvePendingIteration(ctx, event);
-  });
 
   pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: EventContext) => {
     const persisted = resolveActiveLoopState(ctx);

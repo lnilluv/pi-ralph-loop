@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { StringDecoder } from "node:string_decoder";
 
 // --- Types ---
 
@@ -333,10 +334,28 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     });
 
     // Set up stdout line reader
-    let stdoutBuffer = "";
+    const stdoutDecoder = new StringDecoder("utf8");
+    let stdoutLineParts: string[] = [];
+    let stdoutLineChars = 0;
+    let stdoutLineBytes = 0;
+    const appendStdoutLinePart = (part: string) => {
+      if (!part) return;
+      stdoutLineParts.push(part);
+      stdoutLineChars += part.length;
+      stdoutLineBytes += Buffer.byteLength(part, "utf8");
+    };
+    const takeStdoutLine = () => {
+      const line = stdoutLineParts.join("");
+      stdoutLineParts = [];
+      stdoutLineChars = 0;
+      stdoutLineBytes = 0;
+      return line;
+    };
     const failStdoutBufferLimit = () => {
-      const stdoutBufferBytes = Buffer.byteLength(stdoutBuffer, "utf8");
-      stdoutBuffer = "";
+      const stdoutBufferBytes = stdoutLineBytes;
+      stdoutLineParts = [];
+      stdoutLineChars = 0;
+      stdoutLineBytes = 0;
       telemetry.stdoutBufferBytes = stdoutBufferBytes;
       const error = `RPC stdout line exceeded ${STDOUT_LINE_MAX_CHARS} chars before newline (${stdoutBufferBytes} bytes buffered)`;
       telemetry.error = error;
@@ -349,97 +368,114 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
         error,
       }));
     };
+    const processStdoutLine = (line: string): boolean => {
+      const trimmedLine = line.endsWith("\r") ? line.slice(0, -1) : line;
+      if (!trimmedLine) return true;
+
+      const event = parseRpcEvent(trimmedLine);
+      markStdoutEvent(event.type);
+      onEvent?.(event);
+
+      if (event.type === "response") {
+        const resp = event as { command?: string; success?: boolean; error?: unknown };
+        if (resp.command === "set_model" && resp.success === false) {
+          const error = `set_model failed${resp.error ? `: ${String(resp.error)}` : ""}`;
+          telemetry.error = error;
+          settle(buildResult({
+            success: false,
+            lastAssistantText,
+            agentEndMessages,
+            timedOut: false,
+            error,
+          }));
+          return false;
+        }
+        if (resp.command === "set_thinking_level" && resp.success === false) {
+          const error = `set_thinking_level failed${resp.error ? `: ${String(resp.error)}` : ""}`;
+          telemetry.error = error;
+          settle(buildResult({
+            success: false,
+            lastAssistantText,
+            agentEndMessages,
+            timedOut: false,
+            error,
+          }));
+          return false;
+        }
+        if (resp.command === "prompt" && resp.success === false) {
+          const error = `prompt failed${resp.error ? `: ${String(resp.error)}` : ""}`;
+          telemetry.error = error;
+          settle(buildResult({
+            success: false,
+            lastAssistantText,
+            agentEndMessages,
+            timedOut: false,
+            error,
+          }));
+          return false;
+        }
+        if (resp.command === "set_model" && resp.success === true) {
+          modelSetAcknowledged = true;
+        }
+        if (resp.command === "set_thinking_level" && resp.success === true) {
+          thinkingLevelAcknowledged = true;
+        }
+        if (resp.command === "prompt" && resp.success === true) {
+          promptAcknowledged = true;
+        }
+
+        if (!settled && !promptSent && (!requiresModelHandshake || modelSetAcknowledged) && (!requiresThinkingHandshake || thinkingLevelAcknowledged)) {
+          clearTimeout(handshakeTimeout);
+          sendPrompt();
+        }
+        return !settled;
+      }
+
+      if (event.type === "agent_end") {
+        const endEvent = event as { messages?: unknown[] };
+        sawAgentEnd = true;
+        agentEndMessages = Array.isArray(endEvent.messages) ? endEvent.messages : [];
+        lastAssistantText = extractAssistantText(agentEndMessages);
+        endStdin();
+      }
+      return !settled;
+    };
+
+    const consumeStdoutChunk = (chunk: string): boolean => {
+      let segmentStart = 0;
+      let newlineIndex: number;
+      while ((newlineIndex = chunk.indexOf("\n", segmentStart)) !== -1) {
+        appendStdoutLinePart(chunk.slice(segmentStart, newlineIndex));
+        if (stdoutLineChars > STDOUT_LINE_MAX_CHARS) {
+          failStdoutBufferLimit();
+          return false;
+        }
+        const line = takeStdoutLine();
+        segmentStart = newlineIndex + 1;
+        if (!processStdoutLine(line)) return false;
+      }
+
+      appendStdoutLinePart(chunk.slice(segmentStart));
+      if (stdoutLineChars > STDOUT_LINE_MAX_CHARS) {
+        failStdoutBufferLimit();
+        return false;
+      }
+      return true;
+    };
+
+    let stdoutEnded = false;
+    const flushStdout = () => {
+      if (stdoutEnded || settled) return;
+      stdoutEnded = true;
+      if (!consumeStdoutChunk(stdoutDecoder.end()) || settled || stdoutLineChars === 0) return;
+      processStdoutLine(takeStdoutLine());
+    };
+
     childProcess.stdout?.on("data", (data: Buffer) => {
       if (settled) return;
-      stdoutBuffer += data.toString("utf8");
-
-      // Parse complete lines
-      let newlineIndex: number;
-      while ((newlineIndex = stdoutBuffer.indexOf("\n")) !== -1) {
-        if (newlineIndex > STDOUT_LINE_MAX_CHARS) {
-          failStdoutBufferLimit();
-          return;
-        }
-        const line = stdoutBuffer.slice(0, newlineIndex);
-        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-
-        // Handle \r\n
-        const trimmedLine = line.endsWith("\r") ? line.slice(0, -1) : line;
-        if (!trimmedLine) continue;
-
-        const event = parseRpcEvent(trimmedLine);
-        markStdoutEvent(event.type);
-        onEvent?.(event);
-
-        if (event.type === "response") {
-          const resp = event as { command?: string; success?: boolean; error?: unknown };
-          if (resp.command === "set_model" && resp.success === false) {
-            const error = `set_model failed${resp.error ? `: ${String(resp.error)}` : ""}`;
-            telemetry.error = error;
-            settle(buildResult({
-              success: false,
-              lastAssistantText,
-              agentEndMessages,
-              timedOut: false,
-              error,
-            }));
-            return;
-          }
-          if (resp.command === "set_thinking_level" && resp.success === false) {
-            const error = `set_thinking_level failed${resp.error ? `: ${String(resp.error)}` : ""}`;
-            telemetry.error = error;
-            settle(buildResult({
-              success: false,
-              lastAssistantText,
-              agentEndMessages,
-              timedOut: false,
-              error,
-            }));
-            return;
-          }
-          if (resp.command === "prompt" && resp.success === false) {
-            const error = `prompt failed${resp.error ? `: ${String(resp.error)}` : ""}`;
-            telemetry.error = error;
-            settle(buildResult({
-              success: false,
-              lastAssistantText,
-              agentEndMessages,
-              timedOut: false,
-              error,
-            }));
-            return;
-          }
-          if (resp.command === "set_model" && resp.success === true) {
-            modelSetAcknowledged = true;
-          }
-          if (resp.command === "set_thinking_level" && resp.success === true) {
-            thinkingLevelAcknowledged = true;
-          }
-          if (resp.command === "prompt" && resp.success === true) {
-            promptAcknowledged = true;
-          }
-
-          if (!settled && !promptSent && (!requiresModelHandshake || modelSetAcknowledged) && (!requiresThinkingHandshake || thinkingLevelAcknowledged)) {
-            clearTimeout(handshakeTimeout);
-            sendPrompt();
-          }
-          continue;
-        }
-
-        if (event.type === "agent_end") {
-          const endEvent = event as { messages?: unknown[] };
-          sawAgentEnd = true;
-          agentEndMessages = Array.isArray(endEvent.messages) ? endEvent.messages : [];
-          lastAssistantText = extractAssistantText(agentEndMessages);
-          endStdin();
-          continue;
-        }
-      }
-
-      if (stdoutBuffer.length > STDOUT_LINE_MAX_CHARS) {
-        failStdoutBufferLimit();
-      }
+      consumeStdoutChunk(stdoutDecoder.write(data));
     });
+    childProcess.stdout?.on("end", flushStdout);
 
     childProcess.on("error", (err: Error) => {
       telemetry.error = err.message;
@@ -465,6 +501,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     });
 
     childProcess.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      flushStdout();
       if (settled) return;
       telemetry.exitedAt = nowIso();
       telemetry.exitCode = code;

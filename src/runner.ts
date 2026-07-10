@@ -13,7 +13,6 @@ import {
   type Frontmatter,
   type RuntimeArgs,
 } from "./ralph.ts";
-import { runCommands } from "./index.ts";
 import {
   type CommandOutcomeRecord,
   type CompletionRecord,
@@ -27,13 +26,9 @@ import {
   checkCancelSignal,
   checkStopSignal,
   clearCancelSignal,
-  clearRunnerDir,
   clearStopSignal,
-  createCancelSignal,
   ensureRunnerDir,
   readActiveLoopRegistry,
-  readIterationRecords,
-  readStatusFile,
   recordActiveLoopStopObservation,
   writeActiveLoopRegistryEntry,
   writeIterationTranscript,
@@ -48,9 +43,8 @@ import { createHash } from "node:crypto";
 import {
   readdirSync,
   readFileSync as readFileSyncForSnapshot,
-  statSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 
 // --- Types ---
 

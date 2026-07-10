@@ -6,9 +6,8 @@ import test from "node:test";
 
 import { assessTaskDirectoryProgress, captureTaskDirectorySnapshot, runRalphLoop, validateCompletionReadiness } from "../src/runner.ts";
 import { runCommands } from "../src/index.ts";
-import { readStatusFile, readIterationRecords, readRunnerEvents, checkStopSignal, createCancelSignal, createStopSignal as createStopSignalFn, type RunnerEvent } from "../src/runner-state.ts";
-import { generateDraft } from "../src/ralph.ts";
-import type { DraftTarget, CommandOutput, CommandDef } from "../src/ralph.ts";
+import { readStatusFile, readIterationRecords, readRunnerEvents, createCancelSignal, createStopSignal as createStopSignalFn, type RunnerEvent } from "../src/runner-state.ts";
+import type { CommandOutput, CommandDef } from "../src/ralph.ts";
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-runner-"));
@@ -51,18 +50,6 @@ function hasIteration(event: RunnerEvent): event is Extract<RunnerEvent, { itera
   return "iteration" in event;
 }
 
-function makeMockSpawnScript(cwd: string, outputs: Array<{ text: string; promise?: string }>): string {
-  const lines = [
-    "#!/bin/bash",
-    "read line",
-    `echo '{"type":"response","command":"prompt","success":true}'`,
-  ];
-  for (const output of outputs) {
-    const text = output.text.replace(/"/g, '\\"');
-    lines.push(`echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"' + text + '"}]}]}'`);
-  }
-  return lines.join("\n");
-}
 
 test("runRalphLoop completes a single iteration with mock subprocess", async () => {
   const taskDir = createTempDir();
@@ -254,6 +241,80 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       assert.ok(result.iterations[0].changedFiles.includes("notes/findings.md"));
     }
     assert.ok(notifications.some((n) => n.message.includes("Iteration 1")));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop does not count pre-iteration command mutations as progress", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => {
+        writeFileSync(join(taskDir, "command-log.txt"), "before snapshot\n", "utf8");
+        return [];
+      },
+      pi: makeMockPi(),
+    });
+
+    assert.equal(existsSync(join(taskDir, "command-log.txt")), true);
+    assert.equal(result.iterations[0]?.progress, false);
+    assert.deepEqual(result.iterations[0]?.changedFiles, []);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop excludes RALPH_PROGRESS.md churn from progress", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo "rolling note" > "${taskDir}/RALPH_PROGRESS.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(existsSync(join(taskDir, "RALPH_PROGRESS.md")), true);
+    assert.equal(result.iterations[0]?.progress, false);
+    assert.deepEqual(result.iterations[0]?.changedFiles, []);
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }

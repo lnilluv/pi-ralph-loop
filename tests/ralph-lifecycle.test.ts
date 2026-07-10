@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import registerRalphCommands from "../src/index.ts";
-import { appendIterationRecord, checkCancelSignal, checkStopSignal, listActiveLoopRegistryEntries, writeActiveLoopRegistryEntry, writeStatusFile } from "../src/runner-state.ts";
+import { appendIterationRecord, checkCancelSignal, checkStopSignal, writeActiveLoopRegistryEntry, writeStatusFile } from "../src/runner-state.ts";
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-loop-lifecycle-"));

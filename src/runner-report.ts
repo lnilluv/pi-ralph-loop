@@ -1,5 +1,6 @@
 import { closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join, parse as parsePath, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 export type StaticRunnerReportResult = {
   reportPath: string;
@@ -113,12 +114,10 @@ function countNonEmptyLines(path: string): number {
     const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
     fd = openSync(path, fsConstants.O_RDONLY | noFollow);
     const buffer = Buffer.alloc(64 * 1024);
+    const decoder = new StringDecoder("utf8");
     let count = 0;
     let currentLineHasContent = false;
-    while (true) {
-      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      const chunk = buffer.toString("utf8", 0, bytesRead);
+    const consume = (chunk: string) => {
       for (const char of chunk) {
         if (char === "\n") {
           if (currentLineHasContent) count += 1;
@@ -127,7 +126,13 @@ function countNonEmptyLines(path: string): number {
           currentLineHasContent = true;
         }
       }
+    };
+    while (true) {
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      consume(decoder.write(buffer.subarray(0, bytesRead)));
     }
+    consume(decoder.end());
     if (currentLineHasContent) count += 1;
     return count;
   } catch {
@@ -633,8 +638,6 @@ pre { margin: 0; padding: 14px; overflow: auto; background: #29251f; color: #f6e
 
 function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iterationsArtifact: ArtifactText, eventsArtifact: ArtifactText, iterationLines: string[], eventLines: string[], totalIterations: number, totalEvents: number): string {
   const statusText = statusArtifact.text;
-  const iterationsJsonl = iterationsArtifact.text;
-  const eventsJsonl = eventsArtifact.text;
   const status = parseObject(statusText) ?? {};
   const parsedIterations = parseJsonl(iterationLines, totalIterations);
   const parsedEvents = parseJsonl(eventLines, totalEvents);
@@ -742,16 +745,20 @@ export function generateStaticRunnerReport(artifactsDir: string, reportName = "r
   }
 
   const status = readArtifact(join(artifactsDir, "status.json"));
-  const iterationsJsonl = readArtifact(join(artifactsDir, "iterations.jsonl"));
-  const eventsJsonl = readArtifact(join(artifactsDir, "events.jsonl"));
-  const iterationsTail = readArtifact(join(artifactsDir, "iterations.jsonl"), REPORT_ARTIFACT_PREVIEW_MAX_BYTES, "tail");
-  const eventsTail = readArtifact(join(artifactsDir, "events.jsonl"), REPORT_ARTIFACT_PREVIEW_MAX_BYTES, "tail");
   const iterationsPath = join(artifactsDir, "iterations.jsonl");
   const eventsPath = join(artifactsDir, "events.jsonl");
+  const iterationsJsonl = readArtifact(iterationsPath);
+  const eventsJsonl = readArtifact(eventsPath);
+  const iterationsTail = iterationsJsonl.truncated
+    ? readArtifact(iterationsPath, REPORT_ARTIFACT_PREVIEW_MAX_BYTES, "tail")
+    : iterationsJsonl;
+  const eventsTail = eventsJsonl.truncated
+    ? readArtifact(eventsPath, REPORT_ARTIFACT_PREVIEW_MAX_BYTES, "tail")
+    : eventsJsonl;
   const iterationLines = nonEmptyLines(iterationsTail.text);
   const eventLines = nonEmptyLines(eventsTail.text);
-  const totalIterations = countNonEmptyLines(iterationsPath);
-  const totalEvents = countNonEmptyLines(eventsPath);
+  const totalIterations = iterationsJsonl.truncated ? countNonEmptyLines(iterationsPath) : iterationLines.length;
+  const totalEvents = eventsJsonl.truncated ? countNonEmptyLines(eventsPath) : eventLines.length;
   const reportPath = join(artifactsDir, reportName);
   const html = buildHtml(artifactsDir, status, iterationsJsonl, eventsJsonl, iterationLines, eventLines, totalIterations, totalEvents);
 

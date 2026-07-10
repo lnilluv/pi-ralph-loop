@@ -16,6 +16,12 @@ Describe what you want done. The loop runs your agent, re-reads the task, feeds 
 
 A single agent run can fix a bug. But the real leverage is **sustained, autonomous work** — campaigns that run for hours, making progress one commit at a time while you do something else.
 
+### Ralph and `/goal` solve different layers
+
+`/goal` answers “what should this Pi session keep pursuing?” Ralph answers “how should a campaign be executed, verified, stopped, inspected, and resumed across fresh child Pi runs?”
+
+Use `/goal` for continuity inside one conversation. Use Ralph when the work needs fresh command evidence every iteration, acceptance checks after the agent claims completion, durable transcripts and reports, or process-level stop/cancel controls for unattended work. They are complementary: a goal defines intent; Ralph runs a bounded, evidence-producing campaign.
+
 | Without a loop | With a loop |
 |---|---|
 | Run an agent once, hope it finishes | Re-run until the work is done |
