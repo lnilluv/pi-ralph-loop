@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
@@ -26,6 +30,7 @@ import {
   readStatusFile,
   recordActiveLoopStopObservation,
   recordActiveLoopStopRequest,
+  updateActiveLoopRegistryEntry,
   writeActiveLoopRegistryEntry,
   writeIterationTranscript,
   writeStatusFile,
@@ -518,6 +523,46 @@ test("createCancelSignal writes cancel.flag and checkCancelSignal detects it", (
   }
 });
 
+test("control signals are token-bound and stale requests cannot stop a successor", () => {
+  const taskDir = createTempDir();
+  try {
+    const startedAt = new Date().toISOString();
+    const first: ActiveLoopRegistryEntry = {
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      cwd: taskDir,
+      loopToken: "first-signal-token",
+      status: "running",
+      currentIteration: 1,
+      maxIterations: 3,
+      startedAt,
+      updatedAt: startedAt,
+    };
+    assert.equal(writeActiveLoopRegistryEntry(taskDir, first), true);
+    assert.equal(createStopSignal(taskDir, first.loopToken), true);
+    assert.equal(checkStopSignal(taskDir, first.loopToken), true);
+
+    recordActiveLoopStopObservation(taskDir, taskDir, new Date().toISOString(), first.loopToken);
+    const successor: ActiveLoopRegistryEntry = {
+      ...first,
+      loopToken: "successor-signal-token",
+      status: "running",
+      currentIteration: 0,
+      updatedAt: new Date().toISOString(),
+    };
+    assert.equal(writeActiveLoopRegistryEntry(taskDir, successor), true);
+    assert.equal(checkStopSignal(taskDir, successor.loopToken), false);
+    assert.equal(checkStopSignal(taskDir), false);
+
+    assert.equal(createCancelSignal(taskDir, first.loopToken), false);
+    assert.equal(checkCancelSignal(taskDir), false);
+    assert.equal(createCancelSignal(taskDir, successor.loopToken), true);
+    assert.equal(checkCancelSignal(taskDir, successor.loopToken), true);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("clearCancelSignal is safe when cancel.flag does not exist", () => {
   const taskDir = createTempDir();
   try {
@@ -682,7 +727,7 @@ test("writeIterationTranscript caps oversized command output", () => {
   }
 });
 
-test("active loop registry prunes stale entries and preserves fresh ones", () => {
+test("active loop registry filters stale entries without deleting registry files", () => {
   const cwd = createTempDir();
   try {
     const taskDir = join(cwd, "fresh-task");
@@ -718,6 +763,8 @@ test("active loop registry prunes stale entries and preserves fresh ones", () =>
 
     const activeEntries = listActiveLoopRegistryEntries(cwd);
     assert.deepEqual(activeEntries.map((entry) => entry.taskDir), [taskDir]);
+    const registryFiles = readdirSync(join(cwd, ".ralph-runner", "active-loops")).filter((name) => name.endsWith(".json"));
+    assert.equal(registryFiles.length, 2);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -887,17 +934,234 @@ test("active loop registry records stop request and observation timestamps", () 
 
     writeActiveLoopRegistryEntry(cwd, entry);
 
+    const mismatched = recordActiveLoopStopRequest(cwd, taskDir, new Date().toISOString(), "other-loop-token");
+    assert.equal(mismatched, undefined);
+    assert.equal(readActiveLoopRegistry(cwd)[0]?.stopRequestedAt, undefined);
+
     const requestedAt = new Date().toISOString();
-    const requested = recordActiveLoopStopRequest(cwd, taskDir, requestedAt);
+    const requested = recordActiveLoopStopRequest(cwd, taskDir, requestedAt, entry.loopToken);
     assert.equal(requested?.stopRequestedAt, requestedAt);
     assert.equal(listActiveLoopRegistryEntries(cwd).length, 1);
 
     const observedAt = new Date(Date.now() + 1000).toISOString();
-    const observed = recordActiveLoopStopObservation(cwd, taskDir, observedAt);
+    const observed = recordActiveLoopStopObservation(cwd, taskDir, observedAt, entry.loopToken);
     assert.equal(observed?.stopObservedAt, observedAt);
     assert.equal(observed?.status, "stopped");
+    writeActiveLoopRegistryEntry(cwd, {
+      ...entry,
+      currentIteration: 5,
+      updatedAt: new Date(Date.now() + 2000).toISOString(),
+    });
+    const terminal = readActiveLoopRegistry(cwd)[0];
+    assert.equal(terminal?.status, "stopped");
+    assert.equal(terminal?.stopObservedAt, observedAt);
     assert.deepEqual(listActiveLoopRegistryEntries(cwd), []);
+    const cancelledEntry: ActiveLoopRegistryEntry = {
+      ...entry,
+      loopToken: "registry-cancel-token",
+      status: "running",
+      currentIteration: 1,
+      updatedAt: new Date(Date.now() + 3000).toISOString(),
+    };
+    assert.equal(writeActiveLoopRegistryEntry(cwd, cancelledEntry), true);
+    const cancelled = recordActiveLoopStopObservation(
+      cwd,
+      taskDir,
+      new Date(Date.now() + 4000).toISOString(),
+      cancelledEntry.loopToken,
+      "cancelled",
+    );
+    assert.equal(cancelled?.status, "cancelled");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+test("active loop registry refuses a different token while a run is active", (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const taskDir = join(cwd, "registry-claim-task");
+  mkdirSync(taskDir, { recursive: true });
+  const aliasDir = join(cwd, "registry-claim-alias");
+  symlinkSync(taskDir, aliasDir, "dir");
+  const first: ActiveLoopRegistryEntry = {
+    taskDir,
+    ralphPath: join(taskDir, "RALPH.md"),
+    cwd,
+    loopToken: "first-token",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 4,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  const successor: ActiveLoopRegistryEntry = {
+    ...first,
+    taskDir: aliasDir,
+    ralphPath: join(aliasDir, "RALPH.md"),
+    loopToken: "successor-token",
+    currentIteration: 0,
+  };
+
+  assert.equal(writeActiveLoopRegistryEntry(cwd, first), true);
+  assert.equal(writeActiveLoopRegistryEntry(cwd, successor), false);
+  assert.equal(readActiveLoopRegistry(cwd)[0]?.loopToken, first.loopToken);
+  const aliasRequest = recordActiveLoopStopRequest(cwd, aliasDir, new Date().toISOString());
+  assert.equal(aliasRequest?.loopToken, first.loopToken);
+
+  recordActiveLoopStopObservation(cwd, taskDir, new Date().toISOString(), first.loopToken);
+  assert.equal(writeActiveLoopRegistryEntry(cwd, successor), true);
+  assert.equal(readActiveLoopRegistry(cwd)[0]?.loopToken, successor.loopToken);
+});
+
+test("active loop registry serializes a stop request ahead of a heartbeat", { timeout: 5000 }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const taskDir = join(cwd, "registry-race-task");
+  mkdirSync(taskDir, { recursive: true });
+  const startedAt = new Date().toISOString();
+  const requestedAt = new Date(Date.now() + 1000).toISOString();
+  const initial: ActiveLoopRegistryEntry = {
+    taskDir,
+    ralphPath: join(taskDir, "RALPH.md"),
+    cwd,
+    loopToken: "registry-race-token",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 4,
+    startedAt,
+    updatedAt: startedAt,
+  };
+  writeActiveLoopRegistryEntry(cwd, initial);
+
+  const acquiredPath = join(cwd, "child-lock-acquired");
+  const releasePath = join(cwd, "release-child-lock");
+  execFileSync("mkfifo", [releasePath]);
+  const childScript = join(cwd, "registry-lock-child.ts");
+  const runnerStateUrl = pathToFileURL(join(process.cwd(), "src", "runner-state.ts")).href;
+  writeFileSync(
+    childScript,
+    `import { readFileSync, writeFileSync } from "node:fs";
+import { updateActiveLoopRegistryEntry } from ${JSON.stringify(runnerStateUrl)};
+const [cwd, taskDir, acquiredPath, releasePath, requestedAt] = process.argv.slice(2);
+updateActiveLoopRegistryEntry(cwd, taskDir, "registry-race-token", (entry) => {
+  writeFileSync(acquiredPath, "acquired");
+  readFileSync(releasePath);
+  return { ...entry, stopRequestedAt: requestedAt, updatedAt: requestedAt };
+});
+`,
+    "utf8",
+  );
+
+  const child = spawn(process.execPath, [
+    "--experimental-strip-types",
+    childScript,
+    cwd,
+    taskDir,
+    acquiredPath,
+    releasePath,
+    requestedAt,
+  ], { stdio: "inherit" });
+  t.after(() => child.kill("SIGKILL"));
+
+  if (!existsSync(acquiredPath)) {
+    const ready = Promise.withResolvers<void>();
+    const watcher = watch(cwd, () => {
+      if (!existsSync(acquiredPath)) return;
+      watcher.close();
+      ready.resolve();
+    });
+    t.after(() => watcher.close());
+    if (existsSync(acquiredPath)) {
+      watcher.close();
+      ready.resolve();
+    }
+    await ready.promise;
+  }
+
+  writeFileSync(releasePath, "release", "utf8");
+  writeActiveLoopRegistryEntry(cwd, {
+    ...initial,
+    currentIteration: 2,
+    updatedAt: new Date(Date.now() + 2000).toISOString(),
+  });
+  const [exitCode] = await once(child, "exit");
+  assert.equal(exitCode, 0);
+
+  const [final] = readActiveLoopRegistry(cwd);
+  assert.equal(final.currentIteration, 2);
+  assert.equal(final.stopRequestedAt, requestedAt);
+});
+
+test("active loop registry owner cleanup leaves a successor lock intact", { timeout: 5000 }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const taskDir = join(cwd, "registry-lock-owner-task");
+  mkdirSync(taskDir, { recursive: true });
+  const initial: ActiveLoopRegistryEntry = {
+    taskDir,
+    ralphPath: join(taskDir, "RALPH.md"),
+    cwd,
+    loopToken: "registry-owner-token",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 4,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  writeActiveLoopRegistryEntry(cwd, initial);
+
+  const acquiredPath = join(cwd, "owner-lock-acquired");
+  const releasePath = join(cwd, "release-owner-lock");
+  execFileSync("mkfifo", [releasePath]);
+  const childScript = join(cwd, "registry-owner-child.ts");
+  const runnerStateUrl = pathToFileURL(join(process.cwd(), "src", "runner-state.ts")).href;
+  writeFileSync(
+    childScript,
+    `import { readFileSync, writeFileSync } from "node:fs";
+import { updateActiveLoopRegistryEntry } from ${JSON.stringify(runnerStateUrl)};
+const [cwd, taskDir, acquiredPath, releasePath] = process.argv.slice(2);
+updateActiveLoopRegistryEntry(cwd, taskDir, "registry-owner-token", (entry) => {
+  writeFileSync(acquiredPath, "acquired");
+  readFileSync(releasePath);
+  return { ...entry, currentIteration: 2 };
+});
+`,
+    "utf8",
+  );
+
+  const child = spawn(process.execPath, [
+    "--experimental-strip-types",
+    childScript,
+    cwd,
+    taskDir,
+    acquiredPath,
+    releasePath,
+  ], { stdio: "inherit" });
+  t.after(() => child.kill("SIGKILL"));
+
+  if (!existsSync(acquiredPath)) {
+    const ready = Promise.withResolvers<void>();
+    const watcher = watch(cwd, () => {
+      if (!existsSync(acquiredPath)) return;
+      watcher.close();
+      ready.resolve();
+    });
+    t.after(() => watcher.close());
+    if (existsSync(acquiredPath)) {
+      watcher.close();
+      ready.resolve();
+    }
+    await ready.promise;
+  }
+
+  const registryHash = createHash("sha256").update(taskDir).digest("hex");
+  const lockPath = join(cwd, ".ralph-runner", "active-loops", `${registryHash}.json.lock`);
+  rmSync(lockPath, { force: true });
+  writeFileSync(lockPath, "replacement-owner", "utf8");
+  writeFileSync(releasePath, "release", "utf8");
+
+  const [exitCode] = await once(child, "exit");
+  assert.equal(exitCode, 0);
+  assert.equal(readFileSync(lockPath, "utf8"), "replacement-owner");
 });

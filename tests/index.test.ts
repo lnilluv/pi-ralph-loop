@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import registerRalphCommands, { parseLogExportArgs, parseStatusCommandArgs, runCommands } from "../src/index.ts";
+import registerRalphCommands, { parseLogExportArgs, parseRalphStartArgs, parseStatusCommandArgs, runCommands } from "../src/index.ts";
 import { SECRET_PATH_POLICY_TOKEN } from "../src/secret-paths.ts";
 import { generateDraft, inspectDraftContent, slugifyTask, type DraftPlan, type DraftTarget } from "../src/ralph.ts";
 import type { StrengthenDraftRuntime } from "../src/ralph-draft-llm.ts";
@@ -11,6 +11,8 @@ import type { RunnerConfig, RunnerResult } from "../src/runner.ts";
 import { runRalphLoop as realRunRalphLoop } from "../src/runner.ts";
 import {
   appendIterationRecord,
+  checkCancelSignal,
+  checkStopSignal,
   listActiveLoopRegistryEntries,
   readActiveLoopRegistry,
   writeActiveLoopRegistryEntry,
@@ -325,9 +327,12 @@ test("runCommands suppresses stale blocked-command appendEntry failures", async 
 test("/ralph-stop writes the durable stop flag from persisted active loop state after reload", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const outsideDir = createTempDir();
+  t.after(() => rmSync(outsideDir, { recursive: true, force: true }));
 
   const taskDir = join(cwd, "persisted-loop-task");
   mkdirSync(taskDir, { recursive: true });
+  symlinkSync(outsideDir, join(cwd, ".ralph-runner"), "dir");
   const persistedState = {
     active: true,
     loopToken: "persisted-loop-token",
@@ -368,6 +373,7 @@ test("/ralph-stop writes the durable stop flag from persisted active loop state 
 
   assert.equal(existsSync(join(taskDir, ".ralph-runner", "stop.flag")), true);
   assert.ok(notifications.some(({ message }) => message.includes("Ralph loop stopping after current iteration")));
+  assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("registry")));
   assert.equal(notifications.some(({ message }) => message.includes("No active ralph loop")), false);
 });
 
@@ -493,7 +499,7 @@ test("/ralph-cancel refuses when the loop already finished", async (t) => {
   assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("The loop already ended with status: complete.")));
 });
 
-test("/ralph-cancel refuses when no status.json exists", async (t) => {
+test("/ralph-cancel refuses when status is missing or belongs to a different run", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
 
@@ -538,6 +544,24 @@ test("/ralph-cancel refuses when no status.json exists", async (t) => {
 
   assert.equal(existsSync(join(taskDir, ".ralph-runner", "cancel.flag")), false);
   assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("No run data exists.")));
+
+  writeStatusFile(taskDir, {
+    loopToken: "newer-loop-token",
+    ralphPath: join(taskDir, "RALPH.md"),
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    timeout: 300,
+    startedAt: new Date().toISOString(),
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  notifications.length = 0;
+  await handler("", ctx);
+
+  assert.equal(existsSync(join(taskDir, ".ralph-runner", "cancel.flag")), false);
+  assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("belongs to a different run")));
 });
 
 test("/ralph-scaffold creates a parseable scaffold from a task name", async (t) => {
@@ -964,6 +988,26 @@ test("parseStatusCommandArgs treats --summary as an unquoted flag only", () => {
   assert.deepEqual(parseStatusCommandArgs('"my task" --summary'), { value: "my task", summary: true });
   assert.deepEqual(parseStatusCommandArgs('"my task --summary"'), { value: "my task --summary", summary: false });
   assert.deepEqual(parseStatusCommandArgs('"unterminated'), { value: "", summary: false, error: "Unterminated quote in /ralph-status arguments." });
+});
+
+test("parseRalphStartArgs removes only an unquoted standalone parallel flag", () => {
+  assert.deepEqual(parseRalphStartArgs('--path="my task/RALPH.md"'), {
+    value: '--path="my task/RALPH.md"',
+    parallel: false,
+  });
+  assert.deepEqual(parseRalphStartArgs('--parallel --path="my task/RALPH.md"'), {
+    value: ' --path="my task/RALPH.md"',
+    parallel: true,
+  });
+  assert.deepEqual(parseRalphStartArgs('"--parallel" --task="literal flag"'), {
+    value: '"--parallel" --task="literal flag"',
+    parallel: false,
+  });
+  assert.deepEqual(parseRalphStartArgs('--parallel "unterminated'), {
+    value: '--parallel "unterminated',
+    parallel: false,
+    error: "Unterminated quote in /ralph arguments.",
+  });
 });
 
 test("/ralph-logs generates final-summary instead of copying symlinked stale artifacts", async (t) => {
@@ -1748,6 +1792,71 @@ test("/ralph --path existing-task/RALPH.md with args resolves them safely at run
   assert.equal(notifications.some(({ message }) => message.includes("Invalid RALPH.md")), false);
 });
 
+test("/ralph keeps runtime args local to concurrent start handlers", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const targets = ["first-arg-task", "second-arg-task"].map((name) => {
+    const taskDir = join(cwd, name);
+    const ralphPath = join(taskDir, "RALPH.md");
+    mkdirSync(taskDir, { recursive: true });
+    writeFileSync(
+      ralphPath,
+      [
+        "---",
+        "args:",
+        "  - owner",
+        "commands: []",
+        "max_iterations: 1",
+        "timeout: 1",
+        "guardrails:",
+        "  block_commands: []",
+        "  protected_files: []",
+        "---",
+        "Hello {{ args.owner }}",
+      ].join("\n"),
+      "utf8",
+    );
+    return { taskDir, ralphPath };
+  });
+
+  const configs: RunnerConfig[] = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (config) => {
+      configs.push(config);
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: () => undefined,
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+    sessionManager: createSessionManager([], "session-a"),
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+  const handler = harness.handler("ralph");
+
+  await Promise.all([
+    handler(`--path ${targets[0].ralphPath} --arg owner=first`, ctx),
+    handler(`--parallel --path ${targets[1].ralphPath} --arg owner=second`, ctx),
+  ]);
+
+  assert.deepEqual(
+    configs.map((config) => ({ ralphPath: config.ralphPath, owner: config.runtimeArgs?.owner })),
+    [
+      { ralphPath: targets[0].ralphPath, owner: "first" },
+      { ralphPath: targets[1].ralphPath, owner: "second" },
+    ],
+  );
+});
+
 test("/ralph --path existing-task/RALPH.md rejects missing and extra args", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -2015,6 +2124,553 @@ test("/ralph --path waits for the loop promise before returning in noninteractiv
   await handlerPromise;
 
   assert.equal(handlerResolved, true);
+});
+
+test("/ralph removes a run handle when its initial UI update fails", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const target = createTarget(cwd, "Recover from stale UI");
+  const draft = generateDraft(target.slug, target, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  mkdirSync(target.dirPath, { recursive: true });
+  writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+
+  const configs: RunnerConfig[] = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (config) => {
+      configs.push(config);
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+  const notifications: string[] = [];
+  const sessionManager = createSessionManager([], "session-a");
+  const makeCtx = (setStatus: () => void) => ({
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus,
+      setWidget: () => undefined,
+    },
+    sessionManager,
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  });
+  const handler = harness.handler("ralph");
+
+  await handler(`--path ${target.ralphPath}`, makeCtx(() => {
+    throw new Error("stale UI");
+  }));
+  await handler(`--path ${target.ralphPath}`, makeCtx(() => undefined));
+
+  assert.equal(configs.length, 1);
+  assert.ok(notifications.some((message) => message.includes("stale UI")));
+});
+
+test("/ralph persists terminal state when its final UI update fails", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const target = createTarget(cwd, "Persist after stale final UI");
+  const draft = generateDraft(target.slug, target, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  mkdirSync(target.dirPath, { recursive: true });
+  writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+  const harness = createHarness({
+    runRalphLoopFn: async () => ({ status: "complete", iterations: [], totalDurationMs: 0 }),
+  });
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: () => undefined,
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: (_key: string, text: string | undefined) => {
+        if (text === undefined) throw new Error("stale final UI");
+      },
+      setWidget: () => undefined,
+    },
+    sessionManager: createSessionManager([], "session-a"),
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+
+  await harness.handler("ralph")(`--path ${target.ralphPath}`, ctx);
+
+  const terminalEntry = harness.appendedEntries.findLast((entry) => entry?.customType === "ralph-loop-state");
+  assert.equal(terminalEntry?.data?.active, false);
+});
+
+test("/ralph requires durable parallel consent and refuses mixed-source lifecycle ambiguity", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const durableTarget = createTarget(cwd, "Durable active task");
+  const requestedTarget = createTarget(cwd, "Requested task");
+  mkdirSync(durableTarget.dirPath, { recursive: true });
+  mkdirSync(requestedTarget.dirPath, { recursive: true });
+  const draft = generateDraft(requestedTarget.slug, requestedTarget, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  writeFileSync(requestedTarget.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+  const now = new Date().toISOString();
+  writeActiveLoopRegistryEntry(cwd, {
+    taskDir: durableTarget.dirPath,
+    ralphPath: durableTarget.ralphPath,
+    cwd,
+    loopToken: "durable-active-token",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 2,
+    startedAt: now,
+    updatedAt: now,
+  });
+
+  const runStarted = Promise.withResolvers<void>();
+  const runRelease = Promise.withResolvers<void>();
+  t.after(() => runRelease.resolve());
+
+  const configs: RunnerConfig[] = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (config) => {
+      configs.push(config);
+      runStarted.resolve();
+      await runRelease.promise;
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("noninteractive starts must not prompt");
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+    sessionManager: createSessionManager([], "session-a"),
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+  const handler = harness.handler("ralph");
+
+  await handler(`--path ${requestedTarget.ralphPath}`, ctx);
+  assert.equal(configs.length, 0);
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("--parallel")));
+
+  const runPromise = handler(`--parallel --path ${requestedTarget.ralphPath}`, ctx);
+  await runStarted.promise;
+  assert.equal(configs.length, 1);
+
+  await harness.handler("ralph-status")("", ctx);
+  await harness.handler("ralph-stop")("", ctx);
+  await harness.handler("ralph-cancel")("", ctx);
+  assert.equal(notifications.filter(({ message, level }) => level === "error" && message.includes("Multiple active")).length, 3);
+  assert.equal(checkStopSignal(requestedTarget.dirPath), false);
+  assert.equal(checkCancelSignal(requestedTarget.dirPath), false);
+
+  runRelease.resolve();
+  await runPromise;
+});
+
+test("/ralph requires --parallel for a second noninteractive run and keeps both runs independent", { timeout: 2000 }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const firstTarget = createTarget(cwd, "First parallel task");
+  const secondTarget = createTarget(cwd, "Second parallel task");
+  for (const target of [firstTarget, secondTarget]) {
+    const draft = generateDraft(target.slug, target, {
+      packageManager: "npm",
+      testCommand: "npm test",
+      hasGit: true,
+      topLevelDirs: ["src", "tests"],
+      topLevelFiles: ["package.json"],
+    });
+    mkdirSync(target.dirPath, { recursive: true });
+    writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+  }
+
+  const firstStarted = Promise.withResolvers<void>();
+  const secondStarted = Promise.withResolvers<void>();
+  const firstRelease = Promise.withResolvers<void>();
+  const secondRelease = Promise.withResolvers<void>();
+  t.after(() => {
+    firstRelease.resolve();
+    secondRelease.resolve();
+  });
+
+  const runConfigs: RunnerConfig[] = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (config) => {
+      runConfigs.push(config);
+      if (config.ralphPath === firstTarget.ralphPath) {
+        firstStarted.resolve();
+        await firstRelease.promise;
+      } else {
+        secondStarted.resolve();
+        await secondRelease.promise;
+      }
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+  const notifications: Array<{ message: string; level: string }> = [];
+  const statuses: Array<string | undefined> = [];
+  const widgets: Array<string[] | undefined> = [];
+  const ctx = {
+    cwd,
+    hasUI: false,
+    model: { provider: "provider", id: "first-model" },
+    thinkingLevel: "low",
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => {
+        throw new Error("noninteractive starts must not prompt");
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+      setWidget: (_key: string, lines: string[] | undefined) => widgets.push(lines),
+    },
+    sessionManager: createSessionManager([], "session-a"),
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+  const handler = harness.handler("ralph");
+  const publishIteration = (config: RunnerConfig, changedFile: string) => {
+    const timestamp = "2026-07-10T00:00:00.000Z";
+    config.onStatusChange?.("running");
+    config.onIterationComplete?.({
+      iteration: 1,
+      status: "complete",
+      startedAt: timestamp,
+      completedAt: timestamp,
+      durationMs: 1,
+      progress: true,
+      changedFiles: [changedFile],
+      noProgressStreak: 0,
+    });
+  };
+
+  const firstRun = handler(`--path ${firstTarget.ralphPath}`, ctx);
+  await firstStarted.promise;
+  ctx.model.id = "second-model";
+  ctx.thinkingLevel = "high";
+
+  await handler(`--parallel --path ${firstTarget.ralphPath}`, ctx);
+  assert.equal(runConfigs.length, 1);
+  assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("already active")));
+  const firstAlias = join(cwd, "first-task-alias");
+  symlinkSync(firstTarget.dirPath, firstAlias, "dir");
+  await handler(`--parallel --path ${join(firstAlias, "RALPH.md")}`, ctx);
+  assert.equal(runConfigs.length, 1);
+
+
+  await handler(`--path ${secondTarget.ralphPath}`, ctx);
+  assert.equal(runConfigs.length, 1);
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("--parallel")));
+
+  const secondRun = handler(`--parallel --path ${secondTarget.ralphPath}`, ctx);
+  const secondOutcome = await Promise.race([
+    secondStarted.promise.then(() => "started" as const),
+    secondRun.then(() => "returned" as const),
+  ]);
+  assert.equal(secondOutcome, "started");
+  assert.equal(runConfigs.length, 2);
+  assert.deepEqual(runConfigs.map(({ modelPattern }) => modelPattern), ["provider/first-model", "provider/second-model"]);
+  assert.deepEqual(runConfigs.map(({ thinkingLevel }) => thinkingLevel), ["low", "high"]);
+  assert.ok(statuses.some((text) => text === "Ralph: 2 active"));
+  assert.ok(widgets.some((lines) => lines?.length === 2));
+  publishIteration(runConfigs[1], "second.txt");
+  assert.ok(widgets.at(-1)?.some((line) => line.includes(secondTarget.slug) && line.includes("1/1")));
+  assert.ok(widgets.at(-1)?.some((line) => line.includes(firstTarget.slug) && line.includes("0/1")));
+
+
+  const parentGuardrailResult = await harness.event("tool_call")(
+    { toolName: "write", input: { path: "src/generated/output.ts" } },
+    {
+      sessionManager: {
+        getEntries: () => [{
+          type: "custom",
+          customType: "ralph-loop-state",
+          data: {
+            active: true,
+            loopToken: "latest-run",
+            iteration: 1,
+            guardrails: { blockCommands: [], protectedFiles: ["src/generated/**"] },
+          },
+        }],
+      },
+    },
+  );
+  assert.equal(parentGuardrailResult, undefined);
+
+  await harness.handler("ralph-status")("", ctx);
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("Multiple active")));
+
+  await harness.handler("ralph-stop")(`--path ${secondTarget.ralphPath}`, ctx);
+  assert.equal(checkStopSignal(secondTarget.dirPath), true);
+  assert.equal(checkStopSignal(firstTarget.dirPath), false);
+
+  await harness.handler("ralph-cancel")("", ctx);
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("Multiple active")));
+
+  await harness.handler("ralph-cancel")(`--path ${firstTarget.ralphPath}`, ctx);
+  assert.equal(checkCancelSignal(firstTarget.dirPath), true);
+  assert.equal(checkCancelSignal(secondTarget.dirPath), false);
+
+  secondRelease.resolve();
+  await secondRun;
+  publishIteration(runConfigs[0], "first.txt");
+  assert.equal(statuses.at(-1), `Ralph: ${firstTarget.slug} — running (1/1)`);
+  assert.equal(widgets.at(-1), undefined);
+
+  firstRelease.resolve();
+  await firstRun;
+
+  assert.equal(statuses.at(-1), undefined);
+  assert.equal(widgets.at(-1), undefined);
+});
+
+test("/ralph confirms an interactive parallel start and picks the requested run", { timeout: 2000 }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const firstTarget = createTarget(cwd, "Interactive first task");
+  const secondTarget = createTarget(cwd, "Interactive second task");
+  const durableTarget = createTarget(cwd, "Interactive durable task");
+  for (const target of [firstTarget, secondTarget]) {
+    const draft = generateDraft(target.slug, target, {
+      packageManager: "npm",
+      testCommand: "npm test",
+      hasGit: true,
+      topLevelDirs: ["src", "tests"],
+      topLevelFiles: ["package.json"],
+    });
+    mkdirSync(target.dirPath, { recursive: true });
+    writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+  }
+  mkdirSync(durableTarget.dirPath, { recursive: true });
+
+  const firstStarted = Promise.withResolvers<void>();
+  const secondStarted = Promise.withResolvers<void>();
+  const firstRelease = Promise.withResolvers<void>();
+  const secondRelease = Promise.withResolvers<void>();
+  t.after(() => {
+    firstRelease.resolve();
+    secondRelease.resolve();
+  });
+
+  const harness = createHarness({
+    runRalphLoopFn: async (config) => {
+      if (config.ralphPath === firstTarget.ralphPath) {
+        firstStarted.resolve();
+        await firstRelease.promise;
+      } else {
+        secondStarted.resolve();
+        await secondRelease.promise;
+      }
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+  const prompts: string[] = [];
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: () => undefined,
+      select: async (title: string, options: string[]) => {
+        prompts.push(title);
+        if (title.includes("/ralph-stop")) {
+          return options.find((option) => option.includes(secondTarget.slug));
+        }
+        if (title.includes("/ralph-cancel")) {
+          return options.find((option) => option.includes(durableTarget.slug));
+        }
+        return "Start in parallel";
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+      setWidget: () => undefined,
+    },
+    sessionManager: createSessionManager([], "session-a"),
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+
+  const firstRun = harness.handler("ralph")(`--path ${firstTarget.ralphPath}`, ctx);
+  await firstStarted.promise;
+  const secondRun = harness.handler("ralph")(`--path ${secondTarget.ralphPath}`, ctx);
+  const secondOutcome = await Promise.race([
+    secondStarted.promise.then(() => "started" as const),
+    secondRun.then(() => "returned" as const),
+  ]);
+  assert.equal(secondOutcome, "started");
+  assert.ok(prompts.some((prompt) => prompt.includes("does not lock files")));
+  const now = new Date().toISOString();
+  writeActiveLoopRegistryEntry(cwd, {
+    taskDir: durableTarget.dirPath,
+    ralphPath: durableTarget.ralphPath,
+    cwd,
+    loopToken: "interactive-durable-token",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 3,
+    startedAt: now,
+    updatedAt: now,
+  });
+
+  await harness.handler("ralph-stop")("", ctx);
+  assert.equal(checkStopSignal(secondTarget.dirPath), true);
+  assert.equal(checkStopSignal(firstTarget.dirPath), false);
+  assert.ok(prompts.some((prompt) => prompt.includes("/ralph-stop")));
+  await harness.handler("ralph-cancel")("", ctx);
+  assert.equal(checkCancelSignal(durableTarget.dirPath), true);
+  assert.equal(checkCancelSignal(firstTarget.dirPath), false);
+  assert.equal(checkCancelSignal(secondTarget.dirPath), false);
+  assert.ok(prompts.some((prompt) => prompt.includes("/ralph-cancel")));
+
+  secondRelease.resolve();
+  firstRelease.resolve();
+  await Promise.all([firstRun, secondRun]);
+});
+
+test("/ralph keeps every active run on successive replacement contexts", { timeout: 2000 }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const firstTarget = createTarget(cwd, "Replacement first task");
+  const secondTarget = createTarget(cwd, "Replacement second task");
+  for (const target of [firstTarget, secondTarget]) {
+    const draft = generateDraft(target.slug, target, {
+      packageManager: "npm",
+      testCommand: "npm test",
+      hasGit: true,
+      topLevelDirs: ["src", "tests"],
+      topLevelFiles: ["package.json"],
+    });
+    mkdirSync(target.dirPath, { recursive: true });
+    writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+  }
+
+  const firstStarted = Promise.withResolvers<void>();
+  const secondStarted = Promise.withResolvers<void>();
+  const firstRelease = Promise.withResolvers<void>();
+  const secondRelease = Promise.withResolvers<void>();
+  t.after(() => {
+    firstRelease.resolve();
+    secondRelease.resolve();
+  });
+
+  const configs: RunnerConfig[] = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (config) => {
+      configs.push(config);
+      if (config.ralphPath === firstTarget.ralphPath) {
+        firstStarted.resolve();
+        await firstRelease.promise;
+      } else {
+        secondStarted.resolve();
+        await secondRelease.promise;
+      }
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+  const baseNotifications: string[] = [];
+  const firstNotifications: string[] = [];
+  const secondNotifications: string[] = [];
+  const makeUi = (notifications: string[]) => ({
+    notify: (message: string) => notifications.push(message),
+    select: async () => undefined,
+    input: async () => undefined,
+    editor: async () => undefined,
+    setStatus: () => undefined,
+    setWidget: () => undefined,
+  });
+  const sessionManager = createSessionManager([], "session-a");
+  const secondCtx = {
+    cwd,
+    hasUI: false,
+    ui: makeUi(secondNotifications),
+    sessionManager,
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+  const firstCtx = {
+    cwd,
+    hasUI: false,
+    ui: makeUi(firstNotifications),
+    sessionManager,
+    newSession: async (options?: { withSession?: (replacementCtx: typeof secondCtx) => Promise<void> | void }) => {
+      await options?.withSession?.(secondCtx);
+      return { cancelled: false };
+    },
+    waitForIdle: async () => undefined,
+  };
+  const baseCtx = {
+    getRuntimeCtx: () => undefined,
+    cwd,
+    hasUI: false,
+    ui: makeUi(baseNotifications),
+    sessionManager,
+    newSession: async (options?: { withSession?: (replacementCtx: typeof firstCtx) => Promise<void> | void }) => {
+      await options?.withSession?.(firstCtx);
+      return { cancelled: false };
+    },
+    waitForIdle: async () => undefined,
+  };
+
+  const firstRun = harness.handler("ralph")(`--path ${firstTarget.ralphPath}`, baseCtx);
+  await firstStarted.promise;
+  const secondRun = harness.handler("ralph")(`--parallel --path ${secondTarget.ralphPath}`, baseCtx);
+  await secondStarted.promise;
+
+  await baseCtx.newSession({ withSession: async () => undefined });
+  await firstCtx.newSession({ withSession: async () => undefined });
+  for (const config of configs) config.onNotify?.("after-second-replacement", "info");
+
+  assert.deepEqual(
+    {
+      base: baseNotifications.filter((message) => message.includes("after-second-replacement")),
+      first: firstNotifications.filter((message) => message.includes("after-second-replacement")),
+      second: secondNotifications.filter((message) => message.includes("after-second-replacement")),
+    },
+    {
+      base: [],
+      first: [],
+      second: [
+        "[replacement-first-task] after-second-replacement",
+        "[replacement-second-task] after-second-replacement",
+      ],
+    },
+  );
+
+  secondRelease.resolve();
+  firstRelease.resolve();
+  await Promise.all([firstRun, secondRun]);
 });
 
 test("/ralph --path keeps using the live command context after session replacement", { concurrency: false }, async (t) => {

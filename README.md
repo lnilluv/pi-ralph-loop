@@ -112,6 +112,16 @@ The extension creates a `RALPH.md` draft and shows it for review. Edit, start, o
 /ralph --path ./my-task --arg owner="Ada"
 ```
 
+### Parallel runs
+
+One Pi session can own multiple independent Ralph child runs. When another run is active, interactive starts ask for confirmation; noninteractive starts must opt in explicitly:
+
+```
+/ralph --parallel --path ./second-task
+```
+
+Parallel current-workspace runs can edit the same repository. Ralph does not lock files or prevent conflicts, so use independent tasks. Only one active run may use a given Ralph task directory because its artifacts and stop/cancel signals are task-local.
+
 ### From a scaffold
 
 ```
@@ -254,7 +264,7 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 
 | Command | What it does |
 |---|---|
-| `/ralph [path-or-task]` | Start or draft+start a loop |
+| `/ralph [--parallel] [path-or-task]` | Start or draft+start a loop; `--parallel` explicitly permits a second noninteractive run |
 | `/ralph-draft [path-or-task]` | Create or edit a draft without starting |
 | `/ralph-list` | List active loops |
 | `/ralph-status [path] [--summary]` | Show durable status and the latest iteration summary; `--summary` renders a deterministic run summary |
@@ -266,6 +276,8 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 | `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>] [--report]` | Export run artifacts to a directory; optionally add a static HTML report |
 
 Ralph runs each iteration in a child `pi --mode rpc` process. The child explicitly loads the Ralph extension but disables normal Pi extension discovery, so unrelated local extensions or MCP gateways do not slow or alter loop startup.
+
+With one active run, the status line shows its name, phase, and iteration. With multiple active runs, the status line shows the active count and a widget lists each run.
 
 ### Argument passing
 
@@ -286,6 +298,8 @@ Ralph runs each iteration in a child `pi --mode rpc` process. The child explicit
 | Completion promise + gate | Stop when the promise is matched; `required` gates also wait for `required_outputs`, OPEN_QUESTIONS.md readiness, and successful `acceptance: true` reruns |
 | Max iterations reached | Stop after the last iteration |
 | No progress for all iterations | Stop with `no-progress-exhaustion` |
+
+With multiple active runs, an interactive stop, cancel, or pathless status command opens a picker. Noninteractive commands refuse ambiguous targeting and list the active task paths; an explicit task folder or `RALPH.md` path always wins.
 
 ## Completion gating
 
@@ -447,7 +461,9 @@ Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists, all tests pass
 | `events.jsonl` | Append-only runner events (progress, gates, starts, finishes) |
 | `final-summary.md` | Deterministic summary written when a run reaches a terminal state |
 | `transcripts/` | Per-iteration markdown transcripts |
-| `active-loops/` | Registry of running loops (pruned after 30 minutes) |
+
+The workspace-level active-run registry lives at `<cwd>/.ralph-runner/active-loops/`. Entries older than 30 minutes are ignored.
+Each task also keeps a token-scoped claim under `<task>/.ralph-runner/active-loops/`, so the same physical task cannot run concurrently from different working directories. Stop and cancel signals are bound to that claim token.
 
 ### Log export
 

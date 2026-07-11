@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { assessTaskDirectoryProgress, captureTaskDirectorySnapshot, runRalphLoop, validateCompletionReadiness } from "../src/runner.ts";
 import { runCommands } from "../src/index.ts";
-import { readStatusFile, readIterationRecords, readRunnerEvents, createCancelSignal, createStopSignal as createStopSignalFn, type RunnerEvent } from "../src/runner-state.ts";
+import { readActiveLoopRegistry, readStatusFile, readIterationRecords, readRunnerEvents, createCancelSignal, createStopSignal as createStopSignalFn, writeActiveLoopRegistryEntry, type RunnerEvent } from "../src/runner-state.ts";
 import type { CommandOutput, CommandDef } from "../src/ralph.ts";
 
 function createTempDir(): string {
@@ -199,6 +200,308 @@ test("runRalphLoop writes durable status files", async () => {
   }
 });
 
+test("runRalphLoop runs task directories concurrently with isolated artifacts", async () => {
+  const rootDir = createTempDir();
+  const taskDirs = [join(rootDir, "task-a"), join(rootDir, "task-b")];
+  const barrierDir = join(rootDir, "barrier");
+  try {
+    mkdirSync(barrierDir, { recursive: true });
+    execFileSync("mkfifo", [join(barrierDir, "a.fifo"), join(barrierDir, "b.fifo")]);
+    for (const taskDir of taskDirs) {
+      mkdirSync(taskDir, { recursive: true });
+    }
+
+    const ralphPaths = taskDirs.map((taskDir) => writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 })));
+    const scriptPaths = taskDirs.map((taskDir, index) => {
+      const taskName = index === 0 ? "a" : "b";
+      const peerName = index === 0 ? "b" : "a";
+      const scriptPath = join(taskDir, "mock-pi.sh");
+      const barrierScript = index === 0
+        ? `printf '%s\\n' "${taskName}" > "${join(barrierDir, `${peerName}.fifo`)}"
+read peer < "${join(barrierDir, `${taskName}.fifo`)}"`
+        : `read peer < "${join(barrierDir, `${taskName}.fifo`)}"
+printf '%s\\n' "${taskName}" > "${join(barrierDir, `${peerName}.fifo`)}"`;
+      writeFileSync(
+        scriptPath,
+        `#!/bin/bash
+read line
+touch "${join(barrierDir, `${taskName}.ready`)}"
+${barrierScript}
+touch "${join(barrierDir, `${taskName}.active`)}"
+echo "${taskName}" > "${join(taskDir, `${taskName}.marker`)}"
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+        { mode: 0o755 },
+      );
+      return scriptPath;
+    });
+
+    const results = await Promise.all(taskDirs.map((taskDir, index) => runRalphLoop({
+      ralphPath: ralphPaths[index],
+      cwd: rootDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPaths[index]],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    })));
+
+    assert.ok(existsSync(join(barrierDir, "a.active")));
+    assert.ok(existsSync(join(barrierDir, "b.active")));
+    assert.equal(readFileSync(join(taskDirs[0], "a.marker"), "utf8"), "a\n");
+    assert.equal(readFileSync(join(taskDirs[1], "b.marker"), "utf8"), "b\n");
+    assert.equal(existsSync(join(taskDirs[0], "b.marker")), false);
+    assert.equal(existsSync(join(taskDirs[1], "a.marker")), false);
+
+    const [firstStatus, secondStatus] = taskDirs.map((taskDir) => readStatusFile(taskDir));
+    assert.ok(firstStatus);
+    assert.ok(secondStatus);
+    assert.notEqual(firstStatus.loopToken, secondStatus.loopToken);
+    assert.deepEqual([firstStatus.taskDir, secondStatus.taskDir], taskDirs);
+    assert.deepEqual(readActiveLoopRegistry(rootDir).map((entry) => entry.taskDir).sort(), taskDirs);
+
+    const iterationRecords = taskDirs.map((taskDir) => readIterationRecords(taskDir));
+    assert.deepEqual(iterationRecords.map((records) => records.length), [1, 1]);
+    assert.deepEqual(iterationRecords.map((records) => records[0].changedFiles), [["a.marker"], ["b.marker"]]);
+    assert.deepEqual(results.map((result) => result.status), ["max-iterations", "max-iterations"]);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop refuses a second active claim before spawning a child", async () => {
+  const taskDir = createTempDir();
+  const workspaceDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+    const startedAt = new Date().toISOString();
+    assert.equal(writeActiveLoopRegistryEntry(taskDir, {
+      taskDir,
+      ralphPath,
+      cwd: taskDir,
+      loopToken: "existing-token",
+      status: "running",
+      currentIteration: 1,
+      maxIterations: 4,
+      startedAt,
+      updatedAt: startedAt,
+    }), true);
+
+    const markerPath = join(taskDir, "child-started");
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+touch "${markerPath}"
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+    const notifications: string[] = [];
+    let iterationsStarted = 0;
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: workspaceDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      onIterationStart: () => {
+        iterationsStarted += 1;
+      },
+      onNotify: (message) => notifications.push(message),
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "error");
+    assert.equal(result.iterations.length, 0);
+    assert.equal(iterationsStarted, 0);
+    assert.equal(existsSync(markerPath), false);
+    assert.equal(readStatusFile(taskDir), undefined);
+    assert.ok(notifications.some((message) => message.includes("already active")));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop reports registry claim failures without starting a child", async () => {
+  const taskDir = createTempDir();
+  const outsideDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+    symlinkSync(outsideDir, join(taskDir, ".ralph-runner"), "dir");
+    const markerPath = join(taskDir, "child-started");
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+touch "${markerPath}"
+`,
+      { mode: 0o755 },
+    );
+    const notifications: string[] = [];
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      onNotify: (message) => notifications.push(message),
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "error");
+    assert.equal(existsSync(markerPath), false);
+    assert.ok(notifications.some((message) => message.includes("claim active run")));
+  } finally {
+    rmSync(join(taskDir, ".ralph-runner"), { force: true });
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop marks its registry claim terminal when status setup fails", async () => {
+  const taskDir = createTempDir();
+  const outsideDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+    const runnerDir = join(taskDir, ".ralph-runner");
+    mkdirSync(runnerDir, { recursive: true });
+    const outsideStatus = join(outsideDir, "status.json");
+    writeFileSync(outsideStatus, "outside", "utf8");
+    symlinkSync(outsideStatus, join(runnerDir, "status.json"));
+
+    const markerPath = join(taskDir, "child-started");
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+touch "${markerPath}"
+`,
+      { mode: 0o755 },
+    );
+    const notifications: string[] = [];
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      onNotify: (message) => notifications.push(message),
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "error");
+    assert.equal(existsSync(markerPath), false);
+    assert.equal(readActiveLoopRegistry(taskDir)[0]?.status, "error");
+    assert.ok(notifications.some((message) => message.includes("initialize durable state")));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop ignores startup callback failures and still terminalizes its claim", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+    const markerPath = join(taskDir, "child-started");
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(scriptPath, `#!/bin/bash
+read line
+touch "${markerPath}"
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`, { mode: 0o755 });
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      onStatusChange: (status) => {
+        if (status === "initializing") throw new Error("stale startup UI");
+      },
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "max-iterations");
+    assert.equal(existsSync(markerPath), true);
+    assert.equal(readActiveLoopRegistry(taskDir)[0]?.status, "max-iterations");
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop returns an error and terminalizes the registry when final status persistence fails", async () => {
+  const taskDir = createTempDir();
+  const outsideDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+    const outsideStatus = join(outsideDir, "status.json");
+    writeFileSync(outsideStatus, "outside", "utf8");
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo "changed" > "${join(taskDir, "result.txt")}"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+    const notifications: string[] = [];
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => {
+        const statusPath = join(taskDir, ".ralph-runner", "status.json");
+        rmSync(statusPath, { force: true });
+        symlinkSync(outsideStatus, statusPath);
+        return [];
+      },
+      onNotify: (message) => notifications.push(message),
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "error");
+    assert.equal(readActiveLoopRegistry(taskDir)[0]?.status, "error");
+    assert.equal(readFileSync(outsideStatus, "utf8"), "outside");
+    assert.ok(notifications.some((message) => message.includes("final status")));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
 test("runRalphLoop detects task-dir file progress from subprocess writes", async () => {
   const taskDir = createTempDir();
   try {
@@ -350,7 +653,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       onIterationComplete() {
         iterationCount++;
         if (iterationCount >= 1) {
-          createStopSignalFn(taskDir);
+          createStopSignalFn(taskDir, readStatusFile(taskDir)!.loopToken);
         }
       },
       runCommandsFn: async () => [],
@@ -564,10 +867,13 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
-test("runRalphLoop cancels mid-iteration when cancel flag is written", async () => {
+test("runRalphLoop cancels mid-iteration when cancel flag is written", { timeout: 5000 }, async (t) => {
   const taskDir = createTempDir();
   try {
     const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 3 }));
+    const readyPath = join(taskDir, "child-ready");
+    const releasePath = join(taskDir, "cancel-release.fifo");
+    execFileSync("mkfifo", [releasePath]);
 
     const scriptPath = join(taskDir, "slow-pi.sh");
     writeFileSync(
@@ -575,15 +881,15 @@ test("runRalphLoop cancels mid-iteration when cancel flag is written", async () 
       `#!/bin/bash
 read line
 echo '{"type":"response","command":"prompt","success":true}'
-sleep 10
+touch "${readyPath}"
+read release < "${releasePath}"
 echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
 `,
       { mode: 0o755 },
     );
 
-    setTimeout(() => createCancelSignal(taskDir), 1000);
 
-    const result = await runRalphLoop({
+    const resultPromise = runRalphLoop({
       ralphPath,
       cwd: taskDir,
       timeout: 30,
@@ -594,6 +900,23 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       runCommandsFn: async () => [],
       pi: makeMockPi(),
     });
+
+    if (!existsSync(readyPath)) {
+      const ready = Promise.withResolvers<void>();
+      const watcher = watch(taskDir, () => {
+        if (!existsSync(readyPath)) return;
+        watcher.close();
+        ready.resolve();
+      });
+      t.after(() => watcher.close());
+      if (existsSync(readyPath)) {
+        watcher.close();
+        ready.resolve();
+      }
+      await ready.promise;
+    }
+    assert.equal(createCancelSignal(taskDir, readStatusFile(taskDir)!.loopToken), true);
+    const result = await resultPromise;
 
     assert.equal(result.status, "cancelled");
     assert.ok(result.iterations.length >= 1);
@@ -631,7 +954,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       onIterationComplete() {
         iterationCount++;
         if (iterationCount >= 1) {
-          createCancelSignal(taskDir);
+          createCancelSignal(taskDir, readStatusFile(taskDir)!.loopToken);
         }
       },
       runCommandsFn: async () => [],
@@ -639,6 +962,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     });
 
     assert.equal(result.status, "cancelled");
+    assert.equal(readActiveLoopRegistry(taskDir)[0]?.status, "cancelled");
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
@@ -747,7 +1071,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       onIterationComplete() {
         completedIterations += 1;
         if (completedIterations === 1) {
-          createStopSignalFn(taskDir);
+          createStopSignalFn(taskDir, readStatusFile(taskDir)!.loopToken);
         }
       },
       runCommandsFn: async () => [],
