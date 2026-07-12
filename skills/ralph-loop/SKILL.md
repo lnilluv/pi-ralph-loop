@@ -74,7 +74,7 @@ my-task/
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`), optional `acceptance: true` |
+| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Every entry requires string `name` and `run`; `command` is not an alias. Names must match `^\w[\w-]*$`. `timeout` is 1–3600s (default 60; must not exceed top-level `timeout`); `acceptance: true` is optional. |
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
@@ -194,6 +194,8 @@ Use `completion_promise` to define an early stop signal. Use `completion_gate` t
 - `required` — the default when `completion_promise` is set; the loop stops only when the promise, required outputs, OPEN_QUESTIONS.md, and any `commands[].acceptance: true` reruns are all ready
 - `optional` — the prompt still reminds the agent about outputs and OPEN_QUESTIONS.md, but `complete` can happen once the promise is emitted
 - `disabled` — the loop skips completion-gate reminders and checks, so `complete` can happen once the promise is emitted
+Commands with `acceptance: true` require `completion_promise` and an effective `required` gate. Migrate by adding `completion_promise` plus `completion_gate: required` (or omitting the gate so it defaults to `required`), or remove `acceptance: true`.
+
 
 ```yaml
 completion_promise: DONE

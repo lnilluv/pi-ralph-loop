@@ -176,6 +176,25 @@ test("generateStaticRunnerReport bounds large inline JSONL previews", (t) => {
   assert.ok(Buffer.byteLength(html, "utf8") < 900_000);
 });
 
+test("generateStaticRunnerReport counts split UTF-8 whitespace consistently in large artifacts", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ralph-report-utf8-count-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const artifact = Buffer.concat([
+    Buffer.alloc(64 * 1024 - 1, 0x20),
+    Buffer.from("\u3000\n"),
+    Buffer.from('{"iteration":1}\n'),
+    Buffer.alloc(300_000, 0x20),
+  ]);
+  writeFileSync(join(dir, "iterations.jsonl"), artifact);
+  writeFileSync(join(dir, "events.jsonl"), artifact);
+
+  const result = generateStaticRunnerReport(dir);
+
+  assert.equal(result.iterations, 1);
+  assert.equal(result.events, 1);
+});
+
 test("generateStaticRunnerReport rejects path-like report names", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ralph-report-name-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

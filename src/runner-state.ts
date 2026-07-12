@@ -1,6 +1,6 @@
-import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 // --- Types ---
 
@@ -272,6 +272,10 @@ const STATUS_FILE_MAX_BYTES = 64 * 1024;
 const JSONL_ARTIFACT_MAX_BYTES = 1024 * 1024;
 const JSONL_ARTIFACT_MAX_RECORDS = 1000;
 const ACTIVE_LOOP_REGISTRY_MAX_BYTES = 64 * 1024;
+const ACTIVE_LOOP_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
+const ACTIVE_LOOP_REGISTRY_LOCK_STALE_AFTER_MS = 30_000;
+const ACTIVE_LOOP_REGISTRY_LOCK_RETRY_MS = 5;
+const activeLoopRegistryLockWait = new Int32Array(new SharedArrayBuffer(4));
 
 // --- Helper ---
 
@@ -414,7 +418,8 @@ export function readStatusFile(taskDir: string): RunnerStatusFile | undefined {
   const raw = readRegularFileNoFollowBounded(filePath, STATUS_FILE_MAX_BYTES);
   if (raw === undefined) return undefined;
   try {
-    return JSON.parse(raw) as RunnerStatusFile;
+    const parsed: unknown = JSON.parse(raw);
+    return isRunnerStatusFile(parsed) ? parsed : undefined;
   } catch {
     return undefined;
   }
@@ -463,6 +468,31 @@ function isNumber(value: unknown): value is number {
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
+
+function isRunnerStatusFile(value: unknown): value is RunnerStatusFile {
+  if (!isRecord(value)) return false;
+  return (
+    isString(value.loopToken)
+    && value.loopToken.length > 0
+    && isString(value.ralphPath)
+    && isString(value.taskDir)
+    && isString(value.cwd)
+    && isRunnerStatus(value.status)
+    && Number.isInteger(value.currentIteration)
+    && isNumber(value.currentIteration)
+    && value.currentIteration >= 0
+    && Number.isInteger(value.maxIterations)
+    && isNumber(value.maxIterations)
+    && value.maxIterations > 0
+    && isNumber(value.timeout)
+    && value.timeout > 0
+    && (value.completionPromise === undefined || isString(value.completionPromise))
+    && isString(value.startedAt)
+    && (value.completedAt === undefined || isString(value.completedAt))
+    && isGuardrails(value.guardrails)
+  );
+}
+
 
 function isShellPolicy(value: unknown): value is ShellPolicy {
   if (!isRecord(value) || typeof value.mode !== "string") return false;
@@ -792,13 +822,54 @@ export function readIterationRecords(taskDir: string): IterationRecord[] {
   return parseJsonLinesBounded<IterationRecord>(raw);
 }
 
-export function createStopSignal(taskDir: string): void {
+function writeControlSignal(
+  taskDir: string,
+  fileName: string,
+  label: string,
+  loopToken?: string,
+): boolean {
   const dir = ensureRunnerDir(taskDir);
-  writeFileReplacing(join(dir, STOP_FLAG_FILE), "", "stop flag");
+  if (!loopToken) {
+    writeFileReplacing(join(dir, fileName), "", label);
+    return true;
+  }
+  return withActiveLoopRegistryEntryLock(taskDir, taskDir, (entryPath) => {
+    const claim = readActiveLoopRegistryEntryFile(entryPath);
+    if (claim && (claim.loopToken !== loopToken || !ACTIVE_LOOP_ACTIVE_STATUSES.has(claim.status))) return false;
+    if (claim && fileName === STOP_FLAG_FILE) {
+      const requestedAt = new Date().toISOString();
+      writeFileAtomic(entryPath, `${JSON.stringify({
+        ...claim,
+        stopRequestedAt: requestedAt,
+        updatedAt: requestedAt,
+      }, null, 2)}\n`);
+    }
+    writeFileReplacing(join(dir, fileName), `${loopToken}\n`, label);
+    return true;
+  });
 }
 
-export function checkStopSignal(taskDir: string): boolean {
-  return isSafeExistingRunnerDir(taskDir) && existsSync(join(runnerDir(taskDir), STOP_FLAG_FILE));
+function checkControlSignal(taskDir: string, fileName: string, loopToken?: string): boolean {
+  if (!isSafeExistingRunnerDir(taskDir)) return false;
+  const filePath = join(runnerDir(taskDir), fileName);
+  if (!loopToken) return readRegularFileNoFollowBounded(filePath, 256) !== undefined;
+  return withActiveLoopRegistryEntryLock(taskDir, taskDir, (entryPath) => {
+    const claim = readActiveLoopRegistryEntryFile(entryPath);
+    if (!claim || claim.loopToken !== loopToken || !ACTIVE_LOOP_ACTIVE_STATUSES.has(claim.status)) return false;
+    const signalToken = readRegularFileNoFollowBounded(filePath, 256)?.trim();
+    if (signalToken === undefined) return false;
+    if (signalToken === loopToken) return true;
+    rmSync(filePath, { force: true });
+    return false;
+  });
+}
+
+export function createStopSignal(taskDir: string, loopToken?: string): boolean {
+  return writeControlSignal(taskDir, STOP_FLAG_FILE, "stop flag", loopToken);
+}
+
+export function checkStopSignal(taskDir: string, loopToken?: string): boolean {
+  return checkControlSignal(taskDir, STOP_FLAG_FILE, loopToken);
 }
 
 export function clearStopSignal(taskDir: string): void {
@@ -808,13 +879,12 @@ export function clearStopSignal(taskDir: string): void {
   }
 }
 
-export function createCancelSignal(taskDir: string): void {
-  const dir = ensureRunnerDir(taskDir);
-  writeFileReplacing(join(dir, CANCEL_FLAG_FILE), "", "cancel flag");
+export function createCancelSignal(taskDir: string, loopToken?: string): boolean {
+  return writeControlSignal(taskDir, CANCEL_FLAG_FILE, "cancel flag", loopToken);
 }
 
-export function checkCancelSignal(taskDir: string): boolean {
-  return isSafeExistingRunnerDir(taskDir) && existsSync(join(runnerDir(taskDir), CANCEL_FLAG_FILE));
+export function checkCancelSignal(taskDir: string, loopToken?: string): boolean {
+  return checkControlSignal(taskDir, CANCEL_FLAG_FILE, loopToken);
 }
 
 export function clearCancelSignal(taskDir: string): void {
@@ -835,8 +905,18 @@ function activeLoopRegistryDir(cwd: string): string {
   return join(runnerDir(cwd), ACTIVE_LOOP_REGISTRY_DIR);
 }
 
+function activeLoopRegistryTaskIdentity(taskDir: string): string {
+  try {
+    return realpathSync.native(taskDir);
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") return resolve(taskDir);
+    throw error;
+  }
+}
+
 function activeLoopRegistryEntryPath(cwd: string, taskDir: string): string {
-  return join(activeLoopRegistryDir(cwd), `${createHash("sha256").update(taskDir).digest("hex")}${ACTIVE_LOOP_REGISTRY_FILE_EXTENSION}`);
+  const taskIdentity = activeLoopRegistryTaskIdentity(taskDir);
+  return join(activeLoopRegistryDir(cwd), `${createHash("sha256").update(taskIdentity).digest("hex")}${ACTIVE_LOOP_REGISTRY_FILE_EXTENSION}`);
 }
 
 function ensureActiveLoopRegistryDir(cwd: string): string {
@@ -853,6 +933,94 @@ function ensureActiveLoopRegistryDir(cwd: string): string {
 
 function writeFileAtomic(filePath: string, contents: string): void {
   writeFileReplacing(filePath, contents, "active loop registry file");
+}
+
+type ActiveLoopRegistryLockIdentity = {
+  dev: number;
+  ino: number;
+};
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isRecord(error) || error.code !== "ESRCH";
+  }
+}
+function removeActiveLoopRegistryLockIfOwned(
+  lockPath: string,
+  identity: ActiveLoopRegistryLockIdentity,
+  expectedKind: "file" | "symlink" = "file",
+): void {
+  try {
+    const current = lstatSync(lockPath);
+    const expectedType = expectedKind === "file" ? current.isFile() : current.isSymbolicLink();
+    if (expectedType && current.dev === identity.dev && current.ino === identity.ino) {
+      rmSync(lockPath, { force: true });
+    }
+  } catch (error) {
+    if (!isRecord(error) || error.code !== "ENOENT") throw error;
+  }
+}
+
+function withActiveLoopRegistryEntryLock<T>(cwd: string, taskDir: string, operation: (filePath: string) => T): T {
+  ensureActiveLoopRegistryDir(cwd);
+  const filePath = activeLoopRegistryEntryPath(cwd, taskDir);
+  const lockPath = `${filePath}.lock`;
+  const deadline = Date.now() + ACTIVE_LOOP_REGISTRY_LOCK_TIMEOUT_MS;
+  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+  let lockFd: number | undefined;
+  let lockIdentity: ActiveLoopRegistryLockIdentity | undefined;
+
+  while (lockFd === undefined) {
+    try {
+      const acquiredFd = openSync(lockPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow, 0o600);
+      try {
+        writeSync(acquiredFd, `${process.pid}\n`);
+        const stat = fstatSync(acquiredFd);
+        lockIdentity = { dev: stat.dev, ino: stat.ino };
+        lockFd = acquiredFd;
+      } catch (error) {
+        const stat = fstatSync(acquiredFd);
+        closeSync(acquiredFd);
+        removeActiveLoopRegistryLockIfOwned(lockPath, { dev: stat.dev, ino: stat.ino });
+        throw error;
+      }
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "EEXIST") throw error;
+      try {
+        const stat = lstatSync(lockPath);
+        if (stat.isSymbolicLink()) {
+          removeActiveLoopRegistryLockIfOwned(lockPath, { dev: stat.dev, ino: stat.ino }, "symlink");
+          continue;
+        }
+        if (!stat.isFile()) throw new Error(`Unsafe active loop registry lock: ${lockPath}`);
+        const ownerPid = Number.parseInt(readRegularFileNoFollowBounded(lockPath, 128)?.trim() ?? "", 10);
+        const stale = Date.now() - stat.mtimeMs > ACTIVE_LOOP_REGISTRY_LOCK_STALE_AFTER_MS;
+        if (stale && !isProcessAlive(ownerPid)) {
+          removeActiveLoopRegistryLockIfOwned(lockPath, { dev: stat.dev, ino: stat.ino });
+          continue;
+        }
+      } catch (statError) {
+        if (isRecord(statError) && statError.code === "ENOENT") continue;
+        throw statError;
+      }
+      if (Date.now() >= deadline) throw new Error(`Timed out acquiring active loop registry lock: ${lockPath}`);
+      // Synchronous waiting is bounded and isolated to one task registry entry.
+      Atomics.wait(activeLoopRegistryLockWait, 0, 0, ACTIVE_LOOP_REGISTRY_LOCK_RETRY_MS);
+    }
+  }
+
+  try {
+    return operation(filePath);
+  } finally {
+    const identity = lockIdentity;
+    closeSync(lockFd);
+    if (!identity) throw new Error(`Active loop registry lock identity missing: ${lockPath}`);
+    removeActiveLoopRegistryLockIfOwned(lockPath, identity);
+  }
 }
 
 function parseIsoTimestamp(raw: unknown): number | undefined {
@@ -933,23 +1101,12 @@ function readActiveLoopRegistryEntryFile(filePath: string): ActiveLoopRegistryEn
   if (!existsSync(filePath)) return undefined;
   try {
     const raw = readRegularFileNoFollowBounded(filePath, ACTIVE_LOOP_REGISTRY_MAX_BYTES);
-    if (raw === undefined) {
-      rmSync(filePath, { force: true });
-      return undefined;
-    }
+    if (raw === undefined) return undefined;
     const parsed: unknown = JSON.parse(raw);
     const entry = normalizeActiveLoopRegistryEntry(parsed);
-    if (!entry) {
-      rmSync(filePath, { force: true });
-      return undefined;
-    }
-    if (isActiveLoopRegistryEntryStale(entry)) {
-      rmSync(filePath, { force: true });
-      return undefined;
-    }
+    if (!entry || isActiveLoopRegistryEntryStale(entry)) return undefined;
     return entry;
   } catch {
-    rmSync(filePath, { force: true });
     return undefined;
   }
 }
@@ -1014,7 +1171,15 @@ function readRawActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEntry[
 }
 
 function readActiveLoopRegistryEntry(cwd: string, taskDir: string): ActiveLoopRegistryEntry | undefined {
-  return readRawActiveLoopRegistryEntries(cwd).find((entry) => entry.taskDir === taskDir);
+  const taskIdentity = activeLoopRegistryTaskIdentity(taskDir);
+  return readRawActiveLoopRegistryEntries(cwd).find((entry) => {
+    if (entry.taskDir === taskDir) return true;
+    try {
+      return activeLoopRegistryTaskIdentity(entry.taskDir) === taskIdentity;
+    } catch {
+      return false;
+    }
+  });
 }
 
 export function readActiveLoopRegistry(cwd: string): ActiveLoopRegistryEntry[] {
@@ -1025,33 +1190,77 @@ export function listActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEn
   return readRawActiveLoopRegistryEntries(cwd).filter((entry) => ACTIVE_LOOP_ACTIVE_STATUSES.has(entry.status));
 }
 
-export function writeActiveLoopRegistryEntry(cwd: string, entry: ActiveLoopRegistryEntry): ActiveLoopRegistryEntry[] {
-  ensureActiveLoopRegistryDir(cwd);
-  writeFileAtomic(activeLoopRegistryEntryPath(cwd, entry.taskDir), `${JSON.stringify(entry, null, 2)}\n`);
-  return readRawActiveLoopRegistryEntries(cwd);
+export function updateActiveLoopRegistryEntry(
+  cwd: string,
+  taskDir: string,
+  loopToken: string,
+  update: (entry: ActiveLoopRegistryEntry) => ActiveLoopRegistryEntry,
+): ActiveLoopRegistryEntry | undefined {
+  return withActiveLoopRegistryEntryLock(cwd, taskDir, (filePath) => {
+    const current = readActiveLoopRegistryEntryFile(filePath);
+    if (!current || current.loopToken !== loopToken) return undefined;
+    const updated = update({ ...current });
+    const next: ActiveLoopRegistryEntry = {
+      ...updated,
+      taskDir: current.taskDir,
+      ralphPath: current.ralphPath,
+      cwd: current.cwd,
+      loopToken: current.loopToken,
+    };
+    writeFileAtomic(filePath, `${JSON.stringify(next, null, 2)}\n`);
+    return next;
+  });
 }
 
-export function recordActiveLoopStopRequest(cwd: string, taskDir: string, requestedAt: string): ActiveLoopRegistryEntry | undefined {
-  const current = readActiveLoopRegistryEntry(cwd, taskDir);
-  if (!current) return undefined;
-  const updated: ActiveLoopRegistryEntry = {
+export function writeActiveLoopRegistryEntry(cwd: string, entry: ActiveLoopRegistryEntry): boolean {
+  return withActiveLoopRegistryEntryLock(cwd, entry.taskDir, (filePath) => {
+    const current = readActiveLoopRegistryEntryFile(filePath);
+    if (current && current.loopToken !== entry.loopToken && ACTIVE_LOOP_ACTIVE_STATUSES.has(current.status)) {
+      return false;
+    }
+
+    const sameRun = current?.loopToken === entry.loopToken;
+    const preserveTerminal = sameRun && !ACTIVE_LOOP_ACTIVE_STATUSES.has(current.status) && ACTIVE_LOOP_ACTIVE_STATUSES.has(entry.status);
+    const next = preserveTerminal
+      ? current
+      : sameRun
+        ? {
+            ...entry,
+            stopRequestedAt: entry.stopRequestedAt ?? current.stopRequestedAt,
+            stopObservedAt: entry.stopObservedAt ?? current.stopObservedAt,
+          }
+        : entry;
+    writeFileAtomic(filePath, `${JSON.stringify(next, null, 2)}\n`);
+    return true;
+  });
+}
+
+export function recordActiveLoopStopRequest(
+  cwd: string,
+  taskDir: string,
+  requestedAt: string,
+  loopToken = readActiveLoopRegistryEntry(cwd, taskDir)?.loopToken,
+): ActiveLoopRegistryEntry | undefined {
+  if (!loopToken) return undefined;
+  return updateActiveLoopRegistryEntry(cwd, taskDir, loopToken, (current) => ({
     ...current,
     stopRequestedAt: requestedAt,
     updatedAt: requestedAt,
-  };
-  writeActiveLoopRegistryEntry(cwd, updated);
-  return updated;
+  }));
 }
 
-export function recordActiveLoopStopObservation(cwd: string, taskDir: string, observedAt: string): ActiveLoopRegistryEntry | undefined {
-  const current = readActiveLoopRegistryEntry(cwd, taskDir);
-  if (!current) return undefined;
-  const updated: ActiveLoopRegistryEntry = {
+export function recordActiveLoopStopObservation(
+  cwd: string,
+  taskDir: string,
+  observedAt: string,
+  loopToken = readActiveLoopRegistryEntry(cwd, taskDir)?.loopToken,
+  status: "stopped" | "cancelled" = "stopped",
+): ActiveLoopRegistryEntry | undefined {
+  if (!loopToken) return undefined;
+  return updateActiveLoopRegistryEntry(cwd, taskDir, loopToken, (current) => ({
     ...current,
-    status: "stopped",
+    status,
     stopObservedAt: observedAt,
     updatedAt: observedAt,
-  };
-  writeActiveLoopRegistryEntry(cwd, updated);
-  return updated;
+  }));
 }

@@ -1,4 +1,4 @@
-import { closeSync, openSync, opendirSync, readSync, readFileSync, statSync } from "node:fs";
+import { closeSync, openSync, opendirSync, readSync, statSync } from "node:fs";
 import { basename, join, relative, sep } from "node:path";
 import { isSecretBearingPath } from "./secret-paths.ts";
 import { slugifyTask, type DraftMode, type RepoContext, type RepoContextSelectedFile, type RepoSignals } from "./ralph.ts";
@@ -74,21 +74,6 @@ type Candidate = {
   category: "top-level" | "config" | "entrypoint" | "test" | "keyword" | "fallback";
 };
 
-type RootCandidate =
-  | {
-      kind: "file";
-      name: string;
-      absolutePath: string;
-      relativePath: string;
-      score: ReturnType<typeof scoreCandidate>;
-    }
-  | {
-      kind: "directory";
-      name: string;
-      absolutePath: string;
-      relativePath: string;
-      score: DirectoryPriority;
-    };
 
 function toPosixPath(value: string): string {
   return value.split(sep).join("/");

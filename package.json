@@ -15,7 +15,7 @@
     "node": ">=22.22.1"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types $(find tests -type f -name '*.ts' | sort)",
+    "test": "node --test --experimental-strip-types",
     "typecheck": "tsc --noEmit"
   },
   "repository": {

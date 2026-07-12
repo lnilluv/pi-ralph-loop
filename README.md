@@ -16,6 +16,12 @@ Describe what you want done. The loop runs your agent, re-reads the task, feeds 
 
 A single agent run can fix a bug. But the real leverage is **sustained, autonomous work** — campaigns that run for hours, making progress one commit at a time while you do something else.
 
+### Ralph and `/goal` solve different layers
+
+`/goal` answers “what should this Pi session keep pursuing?” Ralph answers “how should a campaign be executed, verified, stopped, inspected, and resumed across fresh child Pi runs?”
+
+Use `/goal` for continuity inside one conversation. Use Ralph when the work needs fresh command evidence every iteration, acceptance checks after the agent claims completion, durable transcripts and reports, or process-level stop/cancel controls for unattended work. They are complementary: a goal defines intent; Ralph runs a bounded, evidence-producing campaign.
+
 | Without a loop | With a loop |
 |---|---|
 | Run an agent once, hope it finishes | Re-run until the work is done |
@@ -80,7 +86,7 @@ When authoring `RALPH.md` for a user or for CI-style verification:
 - Remember that normal `commands` run **before** the agent edits files in each iteration. Their output is evidence for the next action, not proof of what the same iteration eventually changed.
 - Mark true final checks with `acceptance: true`. With `completion_gate: required`, Ralph reruns acceptance commands after the completion promise before stopping.
 - For multi-line shell commands, use `set -euo pipefail` or chain checks with `&&`. Plain shell scripts return the status of the last command, so an earlier failing `test` or `grep` can be hidden by a later successful command.
-- If `completion_gate` is `required`, include an `OPEN_QUESTIONS.md` policy in the task: either create one with no remaining P0/P1 items, or set `completion_gate: optional`/`disabled` when that readiness check is not desired.
+- If `completion_gate` is `required`, include an `OPEN_QUESTIONS.md` policy in the task: either create one with no remaining P0/P1 items, or, when no command uses `acceptance: true`, set `completion_gate: optional`/`disabled` if that readiness check is not desired.
 
 ## Quick start
 
@@ -105,6 +111,35 @@ The extension creates a `RALPH.md` draft and shows it for review. Edit, start, o
 ```
 /ralph --path ./my-task --arg owner="Ada"
 ```
+
+### Parallel runs
+
+One Pi session can own multiple independent Ralph child runs. When another run is active, interactive starts ask for confirmation; noninteractive starts must opt in explicitly:
+
+```
+/ralph --parallel --path ./second-task
+```
+
+Parallel current-workspace runs can edit the same repository. Ralph does not lock files or prevent conflicts, so use independent tasks. Only one active run may use a given Ralph task directory because its artifacts and stop/cancel signals are task-local.
+
+#### Live Pi TUI release smoke
+
+Run this credentialed check for releases, not normal CI:
+
+1. Create two temporary task directories with distinct completion promises, `max_iterations: 5`, and `inter_iteration_delay: 10`; instruct each task never to emit its promise.
+2. From a temporary workspace, start one authenticated Pi process loading only this checkout:
+   ```
+   pi --no-extensions --no-skills \
+     --extension /absolute/path/to/checkout/src/index.ts \
+     --session-dir /tmp/ralph-live-sessions
+   ```
+3. Start task A with `/ralph --path <task-a>/RALPH.md`, then start task B while A is active with `/ralph --parallel --path <task-b>/RALPH.md`. Require both to become active and their task-scoped status artifacts to contain distinct loop tokens.
+4. Run pathless `/ralph-stop`, require both runs in the picker, cancel it, and verify neither run gains a stop flag.
+5. Stop A with `/ralph-stop --path <task-a>/RALPH.md`; require B to remain active. Cancel B with `/ralph-cancel --path <task-b>/RALPH.md`; require terminal `stopped` and `cancelled` statuses respectively.
+6. Export each run to its own empty destination with `/ralph-logs --path <task-a>/RALPH.md --dest <evidence-a>` and `/ralph-logs --path <task-b>/RALPH.md --dest <evidence-b>`. Review each `status.json`, `events.jsonl`, `iterations.jsonl`, transcripts, generated `final-summary.md`, and the saved TUI transcript.
+7. Fail the release gate for a blocked second command, wrong target, duplicate token, or stale registry/UI entry. If no authenticated model is available, record the gate as **blocked**, never passed.
+8. Remove the temporary task, evidence, and session directories. Fail if any stop/cancel flag, child Pi process, active claim, or temporary directory remains. Herdr may drive an already-available session, but this gate must not depend on it.
+
 
 ### From a scaffold
 
@@ -200,7 +235,7 @@ Stop with <promise>DONE</promise> only when all tests pass, AUTH_FIXES.md exists
 
 | YAML key | Type | Default | Description |
 |---|---|---|---|
-| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`), optional `acceptance: true` |
+| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Every entry requires string `name` and `run`; `command` is not an alias. Names must match `^\w[\w-]*$`. `timeout` is 1–3600s (default 60; must not exceed top-level `timeout`); `acceptance: true` is optional. |
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
@@ -248,7 +283,7 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 
 | Command | What it does |
 |---|---|
-| `/ralph [path-or-task]` | Start or draft+start a loop |
+| `/ralph [--parallel] [path-or-task]` | Start or draft+start a loop; `--parallel` explicitly permits a second noninteractive run |
 | `/ralph-draft [path-or-task]` | Create or edit a draft without starting |
 | `/ralph-list` | List active loops |
 | `/ralph-status [path] [--summary]` | Show durable status and the latest iteration summary; `--summary` renders a deterministic run summary |
@@ -260,6 +295,8 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 | `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>] [--report]` | Export run artifacts to a directory; optionally add a static HTML report |
 
 Ralph runs each iteration in a child `pi --mode rpc` process. The child explicitly loads the Ralph extension but disables normal Pi extension discovery, so unrelated local extensions or MCP gateways do not slow or alter loop startup.
+
+With one active run, the status line shows its name, phase, and iteration. With multiple active runs, the status line shows the active count and a widget lists each run.
 
 ### Argument passing
 
@@ -281,6 +318,8 @@ Ralph runs each iteration in a child `pi --mode rpc` process. The child explicit
 | Max iterations reached | Stop after the last iteration |
 | No progress for all iterations | Stop with `no-progress-exhaustion` |
 
+With multiple active runs, an interactive stop, cancel, or pathless status command opens a picker. Noninteractive commands refuse ambiguous targeting and list the active task paths; an explicit task folder or `RALPH.md` path always wins.
+
 ## Completion gating
 
 `completion_gate` controls how strictly the loop treats completion promises. Commands marked `acceptance: true` still provide normal pre-iteration evidence, and when a `required` gate is otherwise ready after a completion promise, Ralph reruns those acceptance commands before stopping. Any acceptance outcome other than `ok` blocks completion and is recorded in iteration metadata/events.
@@ -292,6 +331,7 @@ Ralph runs each iteration in a child `pi --mode rpc` process. The child explicit
 | `disabled` | The loop skips completion-gate reminders and checks. |
 
 In `optional` and `disabled` mode, `complete` means the promise was matched; those modes do not block on `required_outputs` or OPEN_QUESTIONS.md readiness.
+Commands with `acceptance: true` require `completion_promise` and an effective `required` gate. To migrate an invalid configuration, add `completion_promise` plus `completion_gate: required` (or omit the gate so it defaults to `required`), or remove `acceptance: true`.
 
 When the gate is `required`, completion still needs **all conditions**:
 
@@ -441,7 +481,9 @@ Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists, all tests pass
 | `events.jsonl` | Append-only runner events (progress, gates, starts, finishes) |
 | `final-summary.md` | Deterministic summary written when a run reaches a terminal state |
 | `transcripts/` | Per-iteration markdown transcripts |
-| `active-loops/` | Registry of running loops (pruned after 30 minutes) |
+
+The workspace-level active-run registry lives at `<cwd>/.ralph-runner/active-loops/`. Entries older than 30 minutes are ignored.
+Each task also keeps a token-scoped claim under `<task>/.ralph-runner/active-loops/`, so the same physical task cannot run concurrently from different working directories. Stop and cancel signals are bound to that claim token.
 
 ### Log export
 

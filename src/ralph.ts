@@ -329,6 +329,14 @@ function validateRawCommandEntryShape(command: unknown, index: number): string |
   if (!isRecord(command)) {
     return `Invalid RALPH frontmatter: commands[${index}] must be a YAML mapping`;
   }
+  if (!hasOwn(command, "name")) {
+    return `Invalid RALPH frontmatter: commands[${index}].name is required`;
+  }
+  if (!hasOwn(command, "run")) {
+    return hasOwn(command, "command")
+      ? `Invalid RALPH frontmatter: commands[${index}].run is required; use 'run' (not 'command')`
+      : `Invalid RALPH frontmatter: commands[${index}].run is required`;
+  }
   if (hasOwn(command, "name") && typeof command.name !== "string") {
     return `Invalid RALPH frontmatter: commands[${index}].name must be a YAML string`;
   }
@@ -803,6 +811,9 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
     if (cmd.timeout > fm.timeout) {
       return `Invalid command ${cmd.name}: timeout must not exceed top-level timeout`;
     }
+  }
+  if (fm.commands.some((command) => command.acceptance === true) && (!fm.completionPromise || resolveCompletionGateMode(fm) !== "required")) {
+    return "Invalid acceptance command: acceptance: true requires completion_promise and completion_gate to resolve to required";
   }
   return null;
 }

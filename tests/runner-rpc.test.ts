@@ -85,6 +85,84 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRpcIteration preserves UTF-8 characters split across stdout chunks", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-split-utf8.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"caf'
+printf '\\303'
+sleep 0.05
+printf '\\251"}]}]}\\n'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.lastAssistantText, "café");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration accepts a final split UTF-8 record without a trailing newline", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-unterminated-utf8.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"caf'
+printf '\\303'
+sleep 0.05
+printf '\\251"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.lastAssistantText, "café");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration processes multiple RPC records from one stdout write", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-multi-line-write.sh", `#!/bin/bash
+read line
+printf '%s\\n%s\\n' '{"type":"response","command":"prompt","success":true}' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.lastAssistantText, "done");
+    assert.equal(result.telemetry.lastEventType, "agent_end");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runRpcIteration caps stderr telemetry", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {

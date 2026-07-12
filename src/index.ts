@@ -1,12 +1,10 @@
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionEvent, SessionEntry, AgentEndEvent as PiAgentEndEvent, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 
-type ToolExecutionStartEvent = Extract<ExtensionEvent, { type: "tool_execution_start" }>;
-type ToolExecutionEndEvent = Extract<ExtensionEvent, { type: "tool_execution_end" }>;
 import {
   buildMissionBrief,
   inspectExistingTarget,
@@ -14,12 +12,9 @@ import {
   parseCommandArgs,
   parseRalphMarkdown,
   planTaskDraftTarget,
-  renderIterationPrompt,
-  renderRalphBody,
   resolveCommandRun,
   replaceArgsPlaceholders,
   runtimeArgEntriesToMap,
-  shouldStopForCompletionPromise,
   shouldWarnForBashFailure,
   shouldValidateExistingDraft,
   validateDraftContent,
@@ -36,11 +31,11 @@ import type { StrengthenDraftRuntime } from "./ralph-draft-llm.ts";
 import { runRalphLoop } from "./runner.ts";
 import { generateStaticRunnerReport } from "./runner-report.ts";
 import { buildRalphRunSummary } from "./runner-summary.ts";
+import { sessionRunKey, sessionRunStatusText, sessionRunWidgetLines, sortedSessionRuns, type SessionRunHandle } from "./session-runs.ts";
 import {
   checkStopSignal,
   createStopSignal,
   createCancelSignal,
-  checkCancelSignal,
   listActiveLoopRegistryEntries,
   readActiveLoopRegistry,
   readIterationRecords,
@@ -76,9 +71,14 @@ type LoopState = {
   noProgressStreak: number;
   iterationSummaries: IterationSummary[];
   guardrails: Frontmatter["guardrails"];
-  observedTaskDirWrites: Set<string>;
   loopToken?: string;
 };
+
+type ActiveSessionRun = SessionRunHandle & {
+  state: LoopState;
+  currentCommandCtx: CommandContext;
+};
+
 type PersistedLoopState = {
   active: boolean;
   loopToken?: string;
@@ -104,7 +104,6 @@ const RALPH_RUNNER_NO_PROGRESS_STREAK_ENV = "RALPH_RUNNER_NO_PROGRESS_STREAK";
 const RALPH_RUNNER_GUARDRAILS_ENV = "RALPH_RUNNER_GUARDRAILS";
 
 type CommandContext = ExtensionCommandContext;
-type CommandSessionEntry = SessionEntry;
 
 type DraftPlanFactory = (
   task: string,
@@ -131,6 +130,20 @@ type StopTarget = {
   source: StopTargetSource;
 };
 
+type LifecycleRunChoice = {
+  taskDir: string;
+  currentIteration: number;
+  maxIterations: number;
+  stopTarget: StopTarget;
+  sessionRun?: ActiveSessionRun;
+  persistedSessionState?: ActiveLoopState;
+};
+
+type LifecycleRunSelection =
+  | { kind: "none" }
+  | { kind: "selected"; choice: LifecycleRunChoice }
+  | { kind: "cancelled" };
+
 type ResolveRalphTargetResult =
   | { kind: "resolved"; taskDir: string }
   | { kind: "not-found" };
@@ -147,7 +160,7 @@ function resolveRalphTarget(
   const { commandName, explicitPath, checkCrossProcess = false, allowCompletedRuns = false } = options;
   const now = new Date().toISOString();
   const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
-  const { target: sessionTarget } = resolveSessionStopTarget(ctx, now);
+  const { target: sessionTarget } = resolvePersistedSessionStopTarget(ctx, now);
   const resolvedExplicitPath = explicitPath?.trim();
 
   if (resolvedExplicitPath) {
@@ -231,7 +244,6 @@ function resolveRalphTarget(
   return { kind: "resolved", taskDir: activeEntries[0].taskDir };
 }
 
-type AgentEndEvent = PiAgentEndEvent;
 
 type ToolResultEvent = PiToolResultEvent;
 
@@ -242,13 +254,6 @@ type ForkOptions = NonNullable<Parameters<NonNullable<CommandContext["fork"]>>[1
 type SwitchSessionOptions = NonNullable<Parameters<NonNullable<CommandContext["switchSession"]>>[1]>;
 type SessionReplacementWithSession = NonNullable<NewSessionOptions["withSession"]>;
 type SessionReplacementContext = Parameters<SessionReplacementWithSession>[0];
-type SessionReplacementOptions = {
-  withSession?: SessionReplacementWithSession;
-};
-
-function resolveSessionUi(ctx: CommandContext): CommandContext["ui"] {
-  return ctx.ui;
-}
 
 function installSessionReplacementHooks(
   ctx: CommandContext,
@@ -504,78 +509,6 @@ export async function runCommands(
   return results;
 }
 
-const SNAPSHOT_IGNORED_DIR_NAMES = new Set([
-  ".git",
-  "node_modules",
-  ".next",
-  ".turbo",
-  ".cache",
-  "coverage",
-  "dist",
-  "build",
-  ".ralph-runner",
-]);
-const SNAPSHOT_MAX_FILES = 200;
-const SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
-const SNAPSHOT_POST_IDLE_POLL_INTERVAL_MS = 20;
-const SNAPSHOT_POST_IDLE_POLL_WINDOW_MS = 100;
-const RALPH_PROGRESS_FILE = "RALPH_PROGRESS.md";
-
-type WorkspaceSnapshot = {
-  files: Map<string, string>;
-  truncated: boolean;
-  errorCount: number;
-};
-
-type ProgressAssessment = {
-  progress: ProgressState;
-  changedFiles: string[];
-  snapshotTruncated: boolean;
-  snapshotErrorCount: number;
-};
-
-type IterationCompletion = {
-  messages: PiAgentEndEvent["messages"];
-  observedTaskDirWrites: Set<string>;
-  error?: Error;
-};
-
-type Deferred<T> = {
-  promise: Promise<T>;
-  resolve(value: T): void;
-  reject(reason?: unknown): void;
-  settled: boolean;
-};
-
-type PendingIterationState = {
-  prompt: string;
-  completion: Deferred<IterationCompletion>;
-  toolCallPaths: Map<string, string>;
-  observedTaskDirWrites: Set<string>;
-};
-
-function createDeferred<T>(): Deferred<T> {
-  let resolvePromise!: (value: T) => void;
-  let rejectPromise!: (reason?: unknown) => void;
-  const deferred: Deferred<T> = {
-    promise: new Promise<T>((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
-    }),
-    resolve(value: T) {
-      if (deferred.settled) return;
-      deferred.settled = true;
-      resolvePromise(value);
-    },
-    reject(reason?: unknown) {
-      if (deferred.settled) return;
-      deferred.settled = true;
-      rejectPromise(reason);
-    },
-    settled: false,
-  };
-  return deferred;
-}
 
 function defaultLoopState(): LoopState {
   return {
@@ -590,7 +523,6 @@ function defaultLoopState(): LoopState {
     noProgressStreak: 0,
     iterationSummaries: [],
     guardrails: { blockCommands: [], protectedFiles: [] },
-    observedTaskDirWrites: new Set(),
     loopToken: undefined,
     cwd: "",
   };
@@ -707,17 +639,6 @@ function cloneGuardrails(guardrails: { blockCommands: string[]; protectedFiles: 
   };
 }
 
-function sanitizeGuardrails(value: unknown): Frontmatter["guardrails"] {
-  if (!value || typeof value !== "object") {
-    return { blockCommands: [], protectedFiles: [] };
-  }
-  const guardrails = value as { blockCommands?: unknown; protectedFiles?: unknown; shellPolicy?: unknown };
-  return cloneGuardrails({
-    blockCommands: sanitizeStringArray(guardrails.blockCommands),
-    protectedFiles: sanitizeStringArray(guardrails.protectedFiles),
-    ...(isShellPolicy(guardrails.shellPolicy) ? { shellPolicy: guardrails.shellPolicy } : {}),
-  });
-}
 
 function sanitizeProgressState(value: unknown): ProgressState {
   return value === true || value === false || value === "unknown" ? value : "unknown";
@@ -930,11 +851,6 @@ function resolveActiveLoopState(ctx: Pick<CommandContext, "sessionManager">): Ac
   return readActiveLoopState(ctx);
 }
 
-function resolveActiveIterationState(ctx: Pick<CommandContext, "sessionManager">): ActiveIterationState | undefined {
-  const state = resolveActiveLoopState(ctx);
-  if (!state || typeof state.iteration !== "number") return undefined;
-  return state as ActiveIterationState;
-}
 
 function getLoopIterationKey(loopToken: string, iteration: number): string {
   return `${loopToken}:${iteration}`;
@@ -952,126 +868,6 @@ function pathsReferToSameLocation(left: string, right: string): boolean {
   return comparablePath(left) === comparablePath(right);
 }
 
-function normalizeSnapshotPath(filePath: string): string {
-  return filePath.split("\\").join("/");
-}
-
-function captureTaskDirectorySnapshot(ralphPath: string): WorkspaceSnapshot {
-  const taskDir = dirname(ralphPath);
-  const progressMemoryPath = join(taskDir, RALPH_PROGRESS_FILE);
-  const files = new Map<string, string>();
-  let truncated = false;
-  let bytesRead = 0;
-  let errorCount = 0;
-
-  const walk = (dirPath: string) => {
-    let entries;
-    try {
-      entries = readdirSync(dirPath, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
-    } catch {
-      errorCount += 1;
-      return;
-    }
-
-    for (const entry of entries) {
-      if (truncated) return;
-      const fullPath = join(dirPath, entry.name);
-
-      if (entry.isDirectory()) {
-        if (SNAPSHOT_IGNORED_DIR_NAMES.has(entry.name)) continue;
-        walk(fullPath);
-        continue;
-      }
-      if (!entry.isFile() || fullPath === ralphPath || fullPath === progressMemoryPath) continue;
-      if (files.size >= SNAPSHOT_MAX_FILES) {
-        truncated = true;
-        return;
-      }
-
-      const relPath = normalizeSnapshotPath(relative(taskDir, fullPath));
-      if (!relPath || relPath.startsWith("..")) continue;
-
-      let content;
-      try {
-        content = readFileSync(fullPath);
-      } catch {
-        errorCount += 1;
-        continue;
-      }
-      if (bytesRead + content.byteLength > SNAPSHOT_MAX_BYTES) {
-        truncated = true;
-        return;
-      }
-
-      bytesRead += content.byteLength;
-      files.set(relPath, `${content.byteLength}:${createHash("sha1").update(content).digest("hex")}`);
-    }
-  };
-
-  if (existsSync(taskDir)) walk(taskDir);
-  return { files, truncated, errorCount };
-}
-
-function diffTaskDirectorySnapshots(before: WorkspaceSnapshot, after: WorkspaceSnapshot): string[] {
-  const changed = new Set<string>();
-  for (const [filePath, fingerprint] of before.files) {
-    if (after.files.get(filePath) !== fingerprint) changed.add(filePath);
-  }
-  for (const filePath of after.files.keys()) {
-    if (!before.files.has(filePath)) changed.add(filePath);
-  }
-  return [...changed].sort((a, b) => a.localeCompare(b));
-}
-
-function resolveTaskDirObservedPath(taskDir: string, cwd: string, filePath: string): string | undefined {
-  if (!taskDir || !cwd || !filePath) return undefined;
-  const relPath = normalizeSnapshotPath(relative(resolve(taskDir), resolve(cwd, filePath)));
-  if (!relPath || relPath === "." || relPath.startsWith("..")) return undefined;
-  return relPath;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolveDelay) => {
-    setTimeout(resolveDelay, ms);
-  });
-}
-
-async function assessTaskDirectoryProgress(
-  ralphPath: string,
-  before: WorkspaceSnapshot,
-  observedTaskDirWrites: ReadonlySet<string>,
-): Promise<ProgressAssessment> {
-  let after = captureTaskDirectorySnapshot(ralphPath);
-  let changedFiles = diffTaskDirectorySnapshots(before, after);
-  let snapshotTruncated = before.truncated || after.truncated;
-  let snapshotErrorCount = before.errorCount + after.errorCount;
-
-  if (changedFiles.length > 0) {
-    return { progress: true, changedFiles, snapshotTruncated, snapshotErrorCount };
-  }
-
-  for (let remainingMs = SNAPSHOT_POST_IDLE_POLL_WINDOW_MS; remainingMs > 0; remainingMs -= SNAPSHOT_POST_IDLE_POLL_INTERVAL_MS) {
-    await delay(Math.min(SNAPSHOT_POST_IDLE_POLL_INTERVAL_MS, remainingMs));
-    after = captureTaskDirectorySnapshot(ralphPath);
-    changedFiles = diffTaskDirectorySnapshots(before, after);
-    snapshotTruncated ||= after.truncated;
-    snapshotErrorCount += after.errorCount;
-    if (changedFiles.length > 0) {
-      return { progress: true, changedFiles, snapshotTruncated, snapshotErrorCount };
-    }
-  }
-
-  if (observedTaskDirWrites.size > 0) {
-    return { progress: "unknown", changedFiles: [], snapshotTruncated, snapshotErrorCount };
-  }
-
-  return {
-    progress: snapshotTruncated || snapshotErrorCount > 0 ? "unknown" : false,
-    changedFiles,
-    snapshotTruncated,
-    snapshotErrorCount,
-  };
-}
 
 function summarizeChangedFiles(changedFiles: string[]): string {
   if (changedFiles.length === 0) return "none";
@@ -1667,7 +1463,6 @@ async function editExistingDraft(ralphPath: string, ctx: Pick<CommandContext, "c
 }
 
 async function chooseRecoveryMode(
-  input: string,
   dirPath: string,
   ctx: Pick<CommandContext, "cwd" | "ui">,
   allowTaskFallback = true,
@@ -1728,24 +1523,10 @@ async function draftFromTask(
   return target.ralphPath;
 }
 
-function resolveSessionStopTarget(ctx: Pick<CommandContext, "cwd" | "sessionManager">, now: string): {
+function resolvePersistedSessionStopTarget(ctx: Pick<CommandContext, "cwd" | "sessionManager">, now: string): {
   target?: StopTarget;
   persistedSessionState?: ActiveLoopState;
 } {
-  if (loopState.active) {
-    return {
-      target: {
-        cwd: loopState.cwd || ctx.cwd,
-        taskDir: loopState.taskDir,
-        ralphPath: loopState.ralphPath,
-        loopToken: loopState.loopToken ?? "",
-        currentIteration: loopState.iteration,
-        maxIterations: loopState.maxIterations,
-        startedAt: now,
-        source: "session",
-      },
-    };
-  }
 
   const persistedSessionState = readActiveLoopState(ctx);
   if (
@@ -1775,6 +1556,19 @@ function resolveSessionStopTarget(ctx: Pick<CommandContext, "cwd" | "sessionMana
   };
 }
 
+function materializeSessionStopTarget(run: ActiveSessionRun, now: string): StopTarget {
+  return {
+    cwd: run.settings.cwd,
+    taskDir: run.settings.taskDir,
+    ralphPath: run.settings.ralphPath,
+    loopToken: run.loopToken,
+    currentIteration: run.iteration,
+    maxIterations: run.settings.maxIterations,
+    startedAt: now,
+    source: "session",
+  };
+}
+
 function materializeRegistryStopTarget(entry: ActiveLoopRegistryEntry): StopTarget {
   return {
     cwd: entry.cwd,
@@ -1794,8 +1588,12 @@ function applyStopTarget(
   target: StopTarget,
   now: string,
   persistedSessionState?: ActiveLoopState,
+  sessionRun?: ActiveSessionRun,
 ): void {
-  createStopSignal(target.taskDir);
+  if (!createStopSignal(target.taskDir, target.loopToken)) {
+    ctx.ui.notify("The active run changed before the stop request; no signal was written.", "warning");
+    return;
+  }
 
   const registryCwd = target.cwd;
   const existingEntry = readActiveLoopRegistry(registryCwd).find((entry) => entry.taskDir === target.taskDir);
@@ -1818,22 +1616,27 @@ function applyStopTarget(
         startedAt: target.startedAt,
         updatedAt: now,
       };
-  writeActiveLoopRegistryEntry(registryCwd, registryEntry);
-  recordActiveLoopStopRequest(registryCwd, target.taskDir, now);
-
-  if (target.source === "session") {
-    loopState.stopRequested = true;
-    if (loopState.active) {
-      persistLoopState(pi, toPersistedLoopState(loopState, { active: true, stopRequested: true }));
-    } else if (persistedSessionState?.active) {
-      persistLoopState(pi, { ...persistedSessionState, stopRequested: true });
+  try {
+    const registryClaimed = writeActiveLoopRegistryEntry(registryCwd, registryEntry);
+    const stopRequest = recordActiveLoopStopRequest(registryCwd, target.taskDir, now, registryEntry.loopToken);
+    if (!registryClaimed || !stopRequest) {
+      ctx.ui.notify("The stop signal was created, but active-run registry ownership changed.", "warning");
     }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`The stop signal was created, but active-run registry update failed: ${message}`, "warning");
+  }
+
+  if (sessionRun) {
+    sessionRun.state.stopRequested = true;
+    persistLoopState(pi, toPersistedLoopState(sessionRun.state, { active: true, stopRequested: true }));
+  } else if (target.source === "session" && persistedSessionState?.active) {
+    persistLoopState(pi, { ...persistedSessionState, stopRequested: true });
   }
 
   ctx.ui.notify("Ralph loop stopping after current iteration…", "info");
 }
 
-let loopState: LoopState = defaultLoopState();
 const RALPH_EXTENSION_REGISTERED = Symbol.for("pi-ralph-loop.registered");
 
 const SCAFFOLD_PRESET_FILES = {
@@ -1848,6 +1651,12 @@ type ScaffoldPresetName = keyof typeof SCAFFOLD_PRESET_FILES;
 type ScaffoldArgs = {
   preset?: ScaffoldPresetName;
   target?: string;
+  error?: string;
+};
+
+type RalphStartArgs = {
+  value: string;
+  parallel: boolean;
   error?: string;
 };
 
@@ -1922,6 +1731,51 @@ function tokenizeArgsWithQuoteInfo(raw: string, commandName: string): { tokens: 
   return { tokens };
 }
 
+export function parseRalphStartArgs(raw: string): RalphStartArgs {
+  const removals: Array<{ start: number; end: number }> = [];
+  let quote: "'" | '"' | undefined;
+  let tokenStart = -1;
+  let tokenQuoted = false;
+
+  for (let index = 0; index <= raw.length; index += 1) {
+    const char = raw[index];
+    const tokenBoundary = index === raw.length || (!quote && /\s/.test(char));
+    if (tokenBoundary) {
+      if (tokenStart >= 0 && !tokenQuoted && raw.slice(tokenStart, index) === "--parallel") {
+        removals.push({ start: tokenStart, end: index });
+      }
+      tokenStart = -1;
+      tokenQuoted = false;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      if (tokenStart < 0) tokenStart = index;
+      tokenQuoted = true;
+      quote = char;
+      continue;
+    }
+    if (tokenStart < 0) tokenStart = index;
+  }
+
+  if (quote) {
+    return { value: raw, parallel: false, error: "Unterminated quote in /ralph arguments." };
+  }
+  if (removals.length === 0) return { value: raw, parallel: false };
+
+  let cursor = 0;
+  let value = "";
+  for (const removal of removals) {
+    value += raw.slice(cursor, removal.start);
+    cursor = removal.end;
+  }
+  value += raw.slice(cursor);
+  return { value, parallel: true };
+}
+
 function tokenizeScaffoldArgs(raw: string): { tokens: string[]; error?: string } {
   const tokenized = tokenizeArgsWithQuoteInfo(raw, "/ralph-scaffold");
   return { tokens: tokenized.tokens.map((token) => token.value), error: tokenized.error };
@@ -1993,10 +1847,52 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   if (registeredPi[RALPH_EXTENSION_REGISTERED]) return;
   registeredPi[RALPH_EXTENSION_REGISTERED] = true;
   const failCounts = new Map<string, number>();
-  const pendingIterations = new Map<string, PendingIterationState>();
+  const sessionRuns = new Map<string, ActiveSessionRun>();
+  type ContextSubscription = {
+    context: CommandContext;
+    callbacks: Set<(replacementCtx: CommandContext) => void>;
+    restore?: () => void;
+  };
+  const contextSubscriptions = new WeakMap<CommandContext, ContextSubscription>();
+  const bindContextSubscription = (subscription: ContextSubscription, ctx: CommandContext): void => {
+    const existing = contextSubscriptions.get(ctx);
+    if (existing && existing !== subscription) {
+      throw new Error("Replacement context already has an independent Ralph subscription");
+    }
+    subscription.restore?.();
+    contextSubscriptions.delete(subscription.context);
+    subscription.context = ctx;
+    subscription.restore = installSessionReplacementHooks(ctx, (replacementCtx) => {
+      const nextContext = replacementCtx as CommandContext;
+      bindContextSubscription(subscription, nextContext);
+      for (const subscriber of subscription.callbacks) subscriber(nextContext);
+    });
+    contextSubscriptions.set(ctx, subscription);
+  };
+  const subscribeToSessionReplacement = (
+    ctx: CommandContext,
+    callback: (replacementCtx: CommandContext) => void,
+  ): (() => void) => {
+    let subscription = contextSubscriptions.get(ctx);
+    if (!subscription) {
+      subscription = { context: ctx, callbacks: new Set() };
+      bindContextSubscription(subscription, ctx);
+    }
+    subscription.callbacks.add(callback);
+    return () => {
+      subscription?.callbacks.delete(callback);
+      if (subscription?.callbacks.size === 0) {
+        subscription.restore?.();
+        contextSubscriptions.delete(subscription.context);
+      }
+    };
+  };
+  const updateSessionRunUi = (ctx: CommandContext): void => {
+    ctx.ui.setStatus("ralph", sessionRunStatusText(sessionRuns));
+    ctx.ui.setWidget?.("ralph-runs", sessionRunWidgetLines(sessionRuns));
+  };
   let selectedThinkingLevel: string | undefined;
   const draftPlanFactory = services.createDraftPlan ?? createDraftPlanService;
-  const isLoopSession = (ctx: Pick<CommandContext, "sessionManager">): boolean => resolveActiveLoopState(ctx) !== undefined;
   const appendLoopProofEntry = (customType: string, data: Record<string, unknown>): void => {
     try {
       pi.appendEntry?.(customType, data);
@@ -2012,137 +1908,124 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
     }
   };
-  const getPendingIteration = (ctx: Pick<CommandContext, "sessionManager">): PendingIterationState | undefined => {
-    const state = resolveActiveIterationState(ctx);
-    return state ? pendingIterations.get(getLoopIterationKey(state.loopToken, state.iteration)) : undefined;
-  };
-  const registerPendingIteration = (loopToken: string, iteration: number, prompt: string): PendingIterationState => {
-    const pending: PendingIterationState = {
-      prompt,
-      completion: createDeferred<IterationCompletion>(),
-      toolCallPaths: new Map(),
-      observedTaskDirWrites: new Set(),
-    };
-    pendingIterations.set(getLoopIterationKey(loopToken, iteration), pending);
-    return pending;
-  };
-  const clearPendingIteration = (loopToken: string, iteration: number) => {
-    pendingIterations.delete(getLoopIterationKey(loopToken, iteration));
-  };
-  const resolvePendingIteration = (ctx: EventContext, event: AgentEndEvent) => {
-    const state = resolveActiveIterationState(ctx);
-    if (!state) return;
-    const pendingKey = getLoopIterationKey(state.loopToken, state.iteration);
-    const pending = pendingIterations.get(pendingKey);
-    if (!pending) return;
-    pendingIterations.delete(pendingKey);
-    const rawError = (event as { error?: unknown }).error;
-    const error = rawError instanceof Error ? rawError : rawError ? new Error(String(rawError)) : undefined;
-    pending.completion.resolve({
-      messages: event.messages ?? [],
-      observedTaskDirWrites: new Set(pending.observedTaskDirWrites),
-      error,
-    });
-  };
-  const recordPendingToolPath = (ctx: EventContext, event: ToolCallEvent | ToolExecutionStartEvent) => {
-    const pending = getPendingIteration(ctx);
-    if (!pending) return;
-    if (event.toolName !== "write" && event.toolName !== "edit") return;
-    const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-    const filePath = ("input" in event ? event.input : event.args)?.path ?? "";
-    if (toolCallId && filePath) pending.toolCallPaths.set(toolCallId, filePath);
-  };
-  const recordSuccessfulTaskDirWrite = (ctx: EventContext, event: ToolExecutionEndEvent) => {
-    const pending = getPendingIteration(ctx);
-    if (!pending) return;
-    if (event.toolName !== "write" && event.toolName !== "edit") return;
-    const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-    const filePath = toolCallId ? pending.toolCallPaths.get(toolCallId) : undefined;
-    if (toolCallId) pending.toolCallPaths.delete(toolCallId);
-    if (event.isError === true || !filePath) return;
-    const persisted = resolveActiveLoopState(ctx);
-    const taskDirPath = persisted?.taskDir ?? loopState.taskDir;
-    const cwd = persisted?.cwd ?? loopState.cwd;
-    const relPath = resolveTaskDirObservedPath(taskDirPath ?? "", cwd ?? taskDirPath ?? "", filePath);
-    if (relPath && relPath !== RALPH_PROGRESS_FILE) pending.observedTaskDirWrites.add(relPath);
-  };
-
-  async function startRalphLoop(ralphPath: string, ctx: CommandContext, runLoopFn: typeof runRalphLoop = runRalphLoop, runtimeArgs: RuntimeArgs = {}) {
-    let currentCommandCtx: CommandContext = ctx;
-    const sessionPi = pi;
-    let name: string;
-    let currentStopOnError = true;
-    try {
-      const raw = readFileSync(ralphPath, "utf8");
-      const draftError = validateDraftContent(raw);
-      if (draftError) {
-        ctx.ui.notify(`Invalid RALPH.md: ${draftError}`, "error");
-        return;
-      }
-      const parsed = parseRalphMarkdown(raw);
-      const { frontmatter } = parsed;
-      if (!validateFrontmatter(frontmatter, ctx)) return;
-      const taskDir = dirname(ralphPath);
-      const activeEntry = findActiveLifecycleRegistryEntry(ctx, taskDir);
-      if (activeEntry) {
-        ctx.ui.notify(`A ralph loop is already active at ${displayPath(ctx.cwd, taskDir)}. Use /ralph-stop or /ralph-cancel first.`, "warning");
-        return;
-      }
-      currentStopOnError = frontmatter.stopOnError;
-      const runtimeValidationError = validateRuntimeArgs(frontmatter, parsed.body, frontmatter.commands, runtimeArgs);
-      if (runtimeValidationError) {
-        ctx.ui.notify(runtimeValidationError, "error");
-        return;
-      }
-      name = basename(taskDir);
-      loopState = {
-        active: true,
-        ralphPath,
-        taskDir,
-        cwd: ctx.cwd,
-        iteration: 0,
-        maxIterations: frontmatter.maxIterations,
-        timeout: frontmatter.timeout,
-        completionPromise: frontmatter.completionPromise,
-        stopRequested: false,
-        noProgressStreak: 0,
-        iterationSummaries: [],
-        guardrails: cloneGuardrails(frontmatter.guardrails),
-        observedTaskDirWrites: new Set(),
-        loopToken: randomUUID(),
-      };
-    } catch (err) {
-      ctx.ui.notify(String(err), "error");
-      return;
+  const collectLifecycleRuns = (ctx: CommandContext, now: string): LifecycleRunChoice[] => {
+    const runs: LifecycleRunChoice[] = [];
+    for (const sessionRun of sessionRuns.values()) {
+      runs.push({
+        taskDir: sessionRun.settings.taskDir,
+        currentIteration: sessionRun.iteration,
+        maxIterations: sessionRun.settings.maxIterations,
+        stopTarget: materializeSessionStopTarget(sessionRun, now),
+        sessionRun,
+      });
     }
-    ctx.ui.notify(`Ralph loop started: ${name} (max ${loopState.maxIterations} iterations)`, "info");
-    const restoreSessionReplacementHooks = installSessionReplacementHooks(ctx, (replacementCtx) => {
-      currentCommandCtx = replacementCtx as CommandContext;
-    });
+    for (const entry of listActiveLoopRegistryEntries(ctx.cwd)) {
+      if (runs.some((run) => pathsReferToSameLocation(run.taskDir, entry.taskDir))) continue;
+      runs.push({
+        taskDir: entry.taskDir,
+        currentIteration: entry.currentIteration,
+        maxIterations: entry.maxIterations,
+        stopTarget: materializeRegistryStopTarget(entry),
+      });
+    }
+    const { target, persistedSessionState } = resolvePersistedSessionStopTarget(ctx, now);
+    if (target && !runs.some((run) => pathsReferToSameLocation(run.taskDir, target.taskDir))) {
+      runs.push({
+        taskDir: target.taskDir,
+        currentIteration: target.currentIteration,
+        maxIterations: target.maxIterations,
+        stopTarget: target,
+        persistedSessionState,
+      });
+    }
+    return runs.sort((left, right) => left.taskDir.localeCompare(right.taskDir));
+  };
+  const chooseLifecycleRun = async (
+    ctx: CommandContext,
+    commandName: "/ralph-status" | "/ralph-stop" | "/ralph-cancel",
+    now: string,
+  ): Promise<LifecycleRunSelection> => {
+    const runs = collectLifecycleRuns(ctx, now);
+    if (runs.length === 0) return { kind: "none" };
+    if (runs.length === 1) return { kind: "selected", choice: runs[0] };
 
+    const labels = runs.map((run) => `${basename(run.taskDir)} | ${displayPath(ctx.cwd, run.taskDir)} | ${run.currentIteration}/${run.maxIterations}`);
+    const interactiveTui = ctx.hasUI && (ctx.ui.getAllThemes?.().length ?? 0) > 0;
+    if (!interactiveTui) {
+      ctx.ui.notify(`Multiple active ralph loops found. Use ${commandName} <task folder or RALPH.md> for an explicit target path:\n${labels.join("\n")}`, "error");
+      return { kind: "cancelled" };
+    }
+    const choice = await ctx.ui.select(`Choose a Ralph run for ${commandName}`, [...labels, "Cancel"]);
+    if (!choice || choice === "Cancel") return { kind: "cancelled" };
+    const selectedIndex = labels.indexOf(choice);
+    if (selectedIndex < 0) return { kind: "cancelled" };
+    return { kind: "selected", choice: runs[selectedIndex] };
+  };
+  const resolveScopedActiveLoopState = (ctx: Pick<CommandContext, "sessionManager">): ActiveLoopState | undefined => {
+    if (process.env[RALPH_RUNNER_TASK_DIR_ENV]?.trim()) return resolveActiveLoopState(ctx);
+    const runs = sortedSessionRuns(sessionRuns);
+    // No single run owns parent-session tools; each child enforces its own token-scoped guardrails.
+    if (runs.length > 1) return undefined;
+    if (runs.length === 0) return resolveActiveLoopState(ctx);
+
+    const run = sessionRuns.get(runs[0].key)!;
+    return {
+      active: true,
+      loopToken: run.loopToken,
+      cwd: run.settings.cwd,
+      taskDir: run.settings.taskDir,
+      iteration: run.state.iteration,
+      maxIterations: run.settings.maxIterations,
+      noProgressStreak: run.state.noProgressStreak,
+      iterationSummaries: [...run.state.iterationSummaries],
+      guardrails: cloneGuardrails(run.state.guardrails),
+      stopRequested: run.state.stopRequested,
+    };
+  };
+
+  async function finalizeRalphRun(
+    handle: ActiveSessionRun,
+    initialCommandCtx: CommandContext,
+    runLoopFn: typeof runRalphLoop,
+    sessionPi: ExtensionAPI,
+  ): Promise<void> {
+    const { state: runState, settings } = handle;
+    let unsubscribeFromSessionReplacement: (() => void) | undefined;
     try {
+      unsubscribeFromSessionReplacement = subscribeToSessionReplacement(initialCommandCtx, (replacementCtx) => {
+        handle.currentCommandCtx = replacementCtx;
+        updateSessionRunUi(replacementCtx);
+      });
+      initialCommandCtx.ui.notify(`Ralph loop started: ${handle.name} (max ${runState.maxIterations} iterations)`, "info");
       const result = await runLoopFn({
-        ralphPath,
-        cwd: ctx.cwd,
-        timeout: loopState.timeout,
-        maxIterations: loopState.maxIterations,
-        guardrails: loopState.guardrails,
-        stopOnError: currentStopOnError,
-        runtimeArgs,
-        modelPattern: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
-        thinkingLevel: getSelectedThinkingLevel(ctx, selectedThinkingLevel),
-        runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir, commandRuntimeArgs) => runCommands(commands, guardrails, commandPi as ExtensionAPI, commandRuntimeArgs ?? runtimeArgs, cwd, taskDir),
+        loopToken: handle.loopToken,
+        ralphPath: settings.ralphPath,
+        cwd: settings.cwd,
+        timeout: settings.timeout,
+        maxIterations: settings.maxIterations,
+        guardrails: runState.guardrails,
+        stopOnError: settings.stopOnError,
+        runtimeArgs: settings.runtimeArgs,
+        modelPattern: settings.modelPattern,
+        thinkingLevel: settings.thinkingLevel,
+        runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir, commandRuntimeArgs) => runCommands(commands, guardrails, commandPi as ExtensionAPI, commandRuntimeArgs ?? settings.runtimeArgs, cwd, taskDir),
         onStatusChange(status) {
-          const runtimeUi = resolveSessionUi(currentCommandCtx);
-          runtimeUi.setStatus("ralph", status === "running" || status === "initializing" ? `🔁 ${name}: running` : undefined);
+          if (status === "initializing" || status === "running") handle.phase = status;
+          updateSessionRunUi(handle.currentCommandCtx);
+        },
+        onIterationStart(iteration) {
+          handle.iteration = iteration;
+          runState.iteration = iteration;
+          updateSessionRunUi(handle.currentCommandCtx);
         },
         onNotify(message, level) {
-          const runtimeUi = resolveSessionUi(currentCommandCtx);
-          runtimeUi.notify(message, level);
+          const prefix = sessionRuns.size > 1 ? `[${handle.name}] ` : "";
+          handle.currentCommandCtx.ui.notify(`${prefix}${message}`, level);
         },
         onIterationComplete(record) {
-          loopState.iteration = record.iteration;
-          loopState.noProgressStreak = record.noProgressStreak;
+          handle.iteration = record.iteration;
+          runState.iteration = record.iteration;
+          runState.noProgressStreak = record.noProgressStreak;
           const summary: IterationSummary = {
             iteration: record.iteration,
             duration: record.durationMs ? Math.round(record.durationMs / 1000) : 0,
@@ -2150,23 +2033,23 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
             changedFiles: record.changedFiles,
             noProgressStreak: record.noProgressStreak,
           };
-          loopState.iterationSummaries.push(summary);
+          runState.iterationSummaries.push(summary);
           appendLoopEntryBestEffort(sessionPi, "ralph-iteration", {
             iteration: record.iteration,
             duration: summary.duration,
-            ralphPath: loopState.ralphPath,
+            ralphPath: runState.ralphPath,
             progress: record.progress,
             changedFiles: record.changedFiles,
             noProgressStreak: record.noProgressStreak,
           });
-          persistLoopState(sessionPi, toPersistedLoopState(loopState, { active: true, stopRequested: false }));
+          persistLoopState(sessionPi, toPersistedLoopState(runState, { active: true, stopRequested: false }));
+          updateSessionRunUi(handle.currentCommandCtx);
         },
         pi: sessionPi,
       });
 
-      // Map runner result to UI notifications
-      const total = loopState.iterationSummaries.reduce((a, s) => a + s.duration, 0);
-      const runtimeUi = resolveSessionUi(currentCommandCtx);
+      const total = runState.iterationSummaries.reduce((sum, iteration) => sum + iteration.duration, 0);
+      const runtimeUi = handle.currentCommandCtx.ui;
       switch (result.status) {
         case "complete":
           runtimeUi.notify(`Ralph loop complete: completion promise matched on iteration ${result.iterations.length} (${total}s total)`, "info");
@@ -2192,22 +2075,151 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      resolveSessionUi(currentCommandCtx).notify(`Ralph loop failed: ${message}`, "error");
+      handle.currentCommandCtx.ui.notify(`Ralph loop failed: ${message}`, "error");
     } finally {
-      failCounts.clear();
-      pendingIterations.clear();
-      loopState.active = false;
-      loopState.stopRequested = false;
-      loopState.loopToken = undefined;
-      restoreSessionReplacementHooks();
-      resolveSessionUi(currentCommandCtx).setStatus("ralph", undefined);
-      persistLoopState(sessionPi, toPersistedLoopState(loopState, { active: false, stopRequested: false }));
+      for (const key of [...failCounts.keys()]) {
+        if (key.startsWith(`${handle.loopToken}:`)) failCounts.delete(key);
+      }
+      runState.active = false;
+      runState.stopRequested = false;
+      sessionRuns.delete(handle.key);
+      persistLoopState(sessionPi, toPersistedLoopState(runState, { active: false, stopRequested: false }));
+      try {
+        unsubscribeFromSessionReplacement?.();
+      } catch {
+        // Session replacement cleanup is best-effort after the run is removed.
+      }
+      try {
+        updateSessionRunUi(handle.currentCommandCtx);
+      } catch {
+        // The command context may be stale after session replacement.
+      }
     }
   }
 
-  let runtimeArgsForStart: RuntimeArgs = {};
+  async function startRalphLoop(
+    ralphPath: string,
+    ctx: CommandContext,
+    runLoopFn: typeof runRalphLoop = runRalphLoop,
+    runtimeArgs: RuntimeArgs = {},
+    parallelRequested = false,
+  ) {
+    const sessionPi = pi;
+    const interactiveTui = ctx.hasUI && (ctx.ui.getAllThemes?.().length ?? 0) > 0;
+    let handle: ActiveSessionRun;
+    let currentStopOnError = true;
+    try {
+      const raw = readFileSync(ralphPath, "utf8");
+      const draftError = validateDraftContent(raw);
+      if (draftError) {
+        ctx.ui.notify(`Invalid RALPH.md: ${draftError}`, "error");
+        return;
+      }
+      const parsed = parseRalphMarkdown(raw);
+      const { frontmatter } = parsed;
+      if (!validateFrontmatter(frontmatter, ctx)) return;
+      const taskDir = dirname(ralphPath);
+      const activeForTask = [...sessionRuns.values()].find((run) => pathsReferToSameLocation(run.settings.taskDir, taskDir));
+      const activeEntry = findActiveLifecycleRegistryEntry(ctx, taskDir);
+      if (activeForTask || activeEntry) {
+        ctx.ui.notify(`A ralph loop is already active at ${displayPath(ctx.cwd, taskDir)}. Use /ralph-stop or /ralph-cancel first.`, "warning");
+        return;
+      }
 
-  async function handleDraftCommand(commandName: "ralph" | "ralph-draft", args: string, ctx: CommandContext): Promise<string | undefined> {
+      const hasOtherActiveRun = sessionRuns.size > 0
+        || listActiveLoopRegistryEntries(ctx.cwd).some((entry) => !pathsReferToSameLocation(entry.taskDir, taskDir));
+      if (hasOtherActiveRun && !parallelRequested) {
+        const warning = "Another Ralph run is active. Concurrent current-workspace runs can edit the same repository; Ralph does not lock files.";
+        if (!interactiveTui) {
+          ctx.ui.notify(`${warning} Re-run with --parallel to start explicitly.`, "error");
+          return;
+        }
+        const choice = await ctx.ui.select(warning, ["Start in parallel", "Cancel"]);
+        if (choice !== "Start in parallel") return;
+      }
+
+      currentStopOnError = frontmatter.stopOnError;
+      const runtimeValidationError = validateRuntimeArgs(frontmatter, parsed.body, frontmatter.commands, runtimeArgs);
+      if (runtimeValidationError) {
+        ctx.ui.notify(runtimeValidationError, "error");
+        return;
+      }
+
+      const loopToken = randomUUID();
+      const runState: LoopState = {
+        active: true,
+        ralphPath,
+        taskDir,
+        cwd: ctx.cwd,
+        iteration: 0,
+        maxIterations: frontmatter.maxIterations,
+        timeout: frontmatter.timeout,
+        completionPromise: frontmatter.completionPromise,
+        stopRequested: false,
+        noProgressStreak: 0,
+        iterationSummaries: [],
+        guardrails: cloneGuardrails(frontmatter.guardrails),
+        loopToken,
+      };
+      const modelPattern = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+      const thinkingLevel = getSelectedThinkingLevel(ctx, selectedThinkingLevel);
+      const runtimeArgsSnapshot: RuntimeArgs = Object.create(null);
+      Object.assign(runtimeArgsSnapshot, runtimeArgs);
+      Object.freeze(runtimeArgsSnapshot);
+      handle = {
+        key: sessionRunKey(taskDir, loopToken),
+        name: basename(taskDir),
+        loopToken,
+        phase: "initializing",
+        iteration: 0,
+        settings: Object.freeze({
+          cwd: ctx.cwd,
+          taskDir,
+          ralphPath,
+          modelPattern,
+          thinkingLevel,
+          runtimeArgs: runtimeArgsSnapshot,
+          timeout: runState.timeout,
+          maxIterations: runState.maxIterations,
+          stopOnError: currentStopOnError,
+        }),
+        state: runState,
+        currentCommandCtx: ctx,
+      };
+      sessionRuns.set(handle.key, handle);
+      try {
+        updateSessionRunUi(ctx);
+      } catch (error) {
+        sessionRuns.delete(handle.key);
+        throw error;
+      }
+    } catch (err) {
+      ctx.ui.notify(String(err), "error");
+      return;
+    }
+
+    const finalizer = finalizeRalphRun(handle, ctx, runLoopFn, sessionPi);
+    if (interactiveTui) {
+      finalizer.catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        try {
+          process.stderr.write(`Ralph background run failed unexpectedly: ${message}\n`);
+        } catch {
+          // Best-effort surfacing only.
+        }
+      });
+      return;
+    }
+    await finalizer;
+  }
+
+
+  async function handleDraftCommand(
+    commandName: "ralph" | "ralph-draft",
+    args: string,
+    ctx: CommandContext,
+    captureRuntimeArgs?: (runtimeArgs: RuntimeArgs) => void,
+  ): Promise<string | undefined> {
     const parsed = parseCommandArgs(args);
     if (parsed.error) {
       ctx.ui.notify(parsed.error, "error");
@@ -2223,7 +2235,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       ctx.ui.notify("--arg is only supported with /ralph --path", "error");
       return undefined;
     }
-    runtimeArgsForStart = runtimeArgs;
+    captureRuntimeArgs?.(runtimeArgs);
     const draftRuntime = getDraftStrengtheningRuntime(ctx);
 
     const resolveTaskForFolder = async (target: DraftTarget): Promise<string | undefined> => {
@@ -2255,7 +2267,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
             ctx.ui.notify("Draft review requires an interactive session. Pass a task folder or RALPH.md path instead.", "warning");
             return undefined;
           }
-          const recovery = await chooseRecoveryMode(input, inspection.dirPath, ctx, !explicitPath);
+          const recovery = await chooseRecoveryMode(inspection.dirPath, ctx, !explicitPath);
           if (recovery === "cancel") return undefined;
           if (recovery === "task") {
             return handleTaskFlow(input);
@@ -2316,7 +2328,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   });
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx: EventContext) => {
-    const persisted = resolveActiveLoopState(ctx);
+    const persisted = resolveScopedActiveLoopState(ctx);
     if (!persisted) return;
 
     if (persisted.envMalformed && (event.toolName === "bash" || event.toolName === "write" || event.toolName === "edit")) {
@@ -2352,23 +2364,12 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
     }
 
-    recordPendingToolPath(ctx, event);
   });
 
-  pi.on("tool_execution_start", async (event: ToolExecutionStartEvent, ctx: EventContext) => {
-    recordPendingToolPath(ctx, event);
-  });
 
-  pi.on("tool_execution_end", async (event: ToolExecutionEndEvent, ctx: EventContext) => {
-    recordSuccessfulTaskDirWrite(ctx, event);
-  });
-
-  pi.on("agent_end", async (event: AgentEndEvent, ctx: EventContext) => {
-    resolvePendingIteration(ctx, event);
-  });
 
   pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: EventContext) => {
-    const persisted = resolveActiveLoopState(ctx);
+    const persisted = resolveScopedActiveLoopState(ctx);
     if (!persisted) return;
     const summaries = persisted?.iterationSummaries ?? [];
     const history = summaries
@@ -2402,17 +2403,15 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   });
 
   pi.on("tool_result", async (event: ToolResultEvent, ctx: EventContext) => {
-    const persisted = resolveActiveLoopState(ctx);
+    const persisted = resolveScopedActiveLoopState(ctx);
     if (!persisted) return;
 
     if (event.toolName !== "bash") return;
     const output = event.content.map((c) => (c.type === "text" ? c.text ?? "" : "")).join("");
     if (!shouldWarnForBashFailure(output)) return;
 
-    const state = resolveActiveIterationState(ctx);
-    if (!state) return;
-
-    const failKey = getLoopIterationKey(state.loopToken, state.iteration);
+    if (typeof persisted.iteration !== "number") return;
+    const failKey = getLoopIterationKey(persisted.loopToken, persisted.iteration);
     const next = (failCounts.get(failKey) ?? 0) + 1;
     failCounts.set(failKey, next);
     if (next >= 3) {
@@ -2428,14 +2427,17 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   pi.registerCommand("ralph", {
     description: "Start Ralph from a task folder or RALPH.md",
     handler: async (args: string, ctx: CommandContext) => {
-      if (loopState.active) {
-        ctx.ui.notify("A ralph loop is already running. Use /ralph-stop first.", "warning");
+      const startArgs = parseRalphStartArgs(args ?? "");
+      if (startArgs.error) {
+        ctx.ui.notify(startArgs.error, "error");
         return;
       }
-
-      const ralphPath = await handleDraftCommand("ralph", args ?? "", ctx);
+      let runtimeArgs: RuntimeArgs = Object.create(null);
+      const ralphPath = await handleDraftCommand("ralph", startArgs.value, ctx, (parsedRuntimeArgs) => {
+        runtimeArgs = parsedRuntimeArgs;
+      });
       if (!ralphPath) return;
-      await startRalphLoop(ralphPath, ctx, services.runRalphLoopFn, runtimeArgsForStart);
+      await startRalphLoop(ralphPath, ctx, services.runRalphLoopFn, runtimeArgs, startArgs.parallel);
     },
   });
 
@@ -2474,29 +2476,44 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
-      const target = resolveLifecycleTarget(ctx, parsed.value?.trim() || ".", "/ralph-status");
-      if (!target) return;
+      let taskDir: string;
+      if (!parsed.value) {
+        const selection = await chooseLifecycleRun(ctx, "/ralph-status", new Date().toISOString());
+        if (selection.kind === "selected") {
+          taskDir = selection.choice.taskDir;
+        } else if (selection.kind === "cancelled") {
+          return;
+        } else {
+          const target = resolveLifecycleTarget(ctx, ".", "/ralph-status");
+          if (!target) return;
+          taskDir = target.taskDir;
+        }
+      } else {
+        const target = resolveLifecycleTarget(ctx, parsed.value.trim(), "/ralph-status");
+        if (!target) return;
+        taskDir = target.taskDir;
+      }
 
       if (statusArgs.summary) {
-        ctx.ui.notify(buildRalphRunSummary(target.taskDir), "info");
+        ctx.ui.notify(buildRalphRunSummary(taskDir), "info");
         return;
       }
 
-      const statusFile = readStatusFile(target.taskDir);
+      const statusFile = readStatusFile(taskDir);
       if (!statusFile) {
-        ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, target.taskDir)}.`, "warning");
+        ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, taskDir)}.`, "warning");
         return;
       }
 
       const lines = [
-        `task: ${displayPath(ctx.cwd, target.taskDir)}`,
+        `task: ${displayPath(ctx.cwd, taskDir)}`,
         `status: ${statusFile.status}`,
         `startedAt: ${statusFile.startedAt}`,
         `currentIteration: ${statusFile.currentIteration}/${statusFile.maxIterations}`,
         `lastUpdate: ${statusFile.completedAt ?? statusFile.startedAt}`,
       ];
 
-      const iterationRecords = readIterationRecords(target.taskDir);
+      const iterationRecords = readIterationRecords(taskDir);
       const matchingIterationRecords = statusFile.loopToken ? iterationRecords.filter((record) => record.loopToken === statusFile.loopToken) : iterationRecords;
       const lastIteration = matchingIterationRecords[matchingIterationRecords.length - 1];
       if (lastIteration) {
@@ -2587,13 +2604,6 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
 
       const now = new Date().toISOString();
       const activeRegistryEntries = () => listActiveLoopRegistryEntries(ctx.cwd);
-      const { target: sessionTarget, persistedSessionState } = resolveSessionStopTarget(ctx, now);
-
-      if (sessionTarget && !parsed.value) {
-        applyStopTarget(pi, ctx, sessionTarget, now, persistedSessionState);
-        return;
-      }
-
       if (parsed.value) {
         const inspection = inspectExistingTarget(parsed.value, ctx.cwd, true);
         if (inspection.kind !== "run") {
@@ -2614,8 +2624,15 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         }
 
         const taskDir = dirname(inspection.ralphPath);
-        if (sessionTarget && pathsReferToSameLocation(sessionTarget.taskDir, taskDir)) {
-          applyStopTarget(pi, ctx, sessionTarget, now, persistedSessionState);
+        const liveRun = [...sessionRuns.values()].find((run) => pathsReferToSameLocation(run.settings.taskDir, taskDir));
+        if (liveRun) {
+          applyStopTarget(pi, ctx, materializeSessionStopTarget(liveRun, now), now, undefined, liveRun);
+          return;
+        }
+
+        const { target: persistedTarget, persistedSessionState } = resolvePersistedSessionStopTarget(ctx, now);
+        if (persistedTarget && pathsReferToSameLocation(persistedTarget.taskDir, taskDir)) {
+          applyStopTarget(pi, ctx, persistedTarget, now, persistedSessionState);
           return;
         }
 
@@ -2647,22 +2664,21 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
-      if (sessionTarget) {
-        applyStopTarget(pi, ctx, sessionTarget, now, persistedSessionState);
-        return;
-      }
-
-      const activeEntries = activeRegistryEntries();
-      if (activeEntries.length === 0) {
+      const selection = await chooseLifecycleRun(ctx, "/ralph-stop", now);
+      if (selection.kind === "none") {
         ctx.ui.notify("No active ralph loops found.", "warning");
         return;
       }
-      if (activeEntries.length > 1) {
-        ctx.ui.notify("Multiple active ralph loops found. Use /ralph-stop <task folder or RALPH.md> for an explicit target path.", "error");
-        return;
+      if (selection.kind === "selected") {
+        applyStopTarget(
+          pi,
+          ctx,
+          selection.choice.stopTarget,
+          now,
+          selection.choice.persistedSessionState,
+          selection.choice.sessionRun,
+        );
       }
-
-      applyStopTarget(pi, ctx, materializeRegistryStopTarget(activeEntries[0]), now);
     },
   });
 
@@ -2683,12 +2699,58 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
+      if (!parsed.value) {
+        const selection = await chooseLifecycleRun(ctx, "/ralph-cancel", new Date().toISOString());
+        if (selection.kind === "selected") {
+          if (selection.choice.persistedSessionState) {
+            const statusFile = readStatusFile(selection.choice.taskDir);
+            if (!statusFile) {
+              ctx.ui.notify(`No active loop found at ${displayPath(ctx.cwd, selection.choice.taskDir)}. No run data exists.`, "warning");
+              return;
+            }
+            if (statusFile.loopToken !== selection.choice.stopTarget.loopToken) {
+              ctx.ui.notify(
+                `No active loop found at ${displayPath(ctx.cwd, selection.choice.taskDir)}. The durable status belongs to a different run.`,
+                "warning",
+              );
+              return;
+            }
+            if (["complete", "max-iterations", "no-progress-exhaustion", "stopped", "timeout", "error", "cancelled"].includes(statusFile.status)) {
+              ctx.ui.notify(
+                `No active loop found at ${displayPath(ctx.cwd, selection.choice.taskDir)}. The loop already ended with status: ${statusFile.status}.`,
+                "warning",
+              );
+              return;
+            }
+          }
+          if (!createCancelSignal(selection.choice.taskDir, selection.choice.stopTarget.loopToken)) {
+            ctx.ui.notify("The active run changed before cancellation; no signal was written.", "warning");
+            return;
+          }
+          ctx.ui.notify("Cancel requested. The active iteration will be terminated immediately.", "warning");
+          return;
+        }
+        if (selection.kind === "cancelled") return;
+        ctx.ui.notify("No active ralph loops found.", "warning");
+        return;
+      }
+
       const result = resolveRalphTarget(ctx, {
         commandName: "/ralph-cancel",
         explicitPath: parsed.value || undefined,
         checkCrossProcess: true,
       });
       if (!result || result.kind === "not-found") return;
+
+      const liveRun = [...sessionRuns.values()].find((run) => pathsReferToSameLocation(run.settings.taskDir, result.taskDir));
+      if (liveRun) {
+        if (!createCancelSignal(liveRun.settings.taskDir, liveRun.loopToken)) {
+          ctx.ui.notify("The active run changed before cancellation; no signal was written.", "warning");
+          return;
+        }
+        ctx.ui.notify("Cancel requested. The active iteration will be terminated immediately.", "warning");
+        return;
+      }
 
       const statusPath = join(result.taskDir, ".ralph-runner", "status.json");
       if (!existsSync(statusPath)) {
@@ -2697,6 +2759,10 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       }
 
       const statusFile = readStatusFile(result.taskDir);
+      if (!statusFile) {
+        ctx.ui.notify(`No active loop found at ${displayPath(ctx.cwd, result.taskDir)}. No readable run status exists.`, "warning");
+        return;
+      }
       const finishedStatuses = new Set([
         "complete",
         "max-iterations",
@@ -2714,7 +2780,10 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
 
-      createCancelSignal(result.taskDir);
+      if (!createCancelSignal(result.taskDir, statusFile.loopToken)) {
+        ctx.ui.notify("The active run changed before cancellation; no signal was written.", "warning");
+        return;
+      }
       ctx.ui.notify("Cancel requested. The active iteration will be terminated immediately.", "warning");
     },
   });

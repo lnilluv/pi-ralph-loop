@@ -20,7 +20,7 @@ function createTarget(cwd: string, task: string): DraftTarget {
   };
 }
 
-function makeDraftPlan(task: string, target: DraftTarget, source: DraftPlan["source"], cwd: string): DraftPlan {
+function makeDraftPlan(task: string, target: DraftTarget, source: DraftPlan["source"]): DraftPlan {
   const base = generateDraft(task, target, {
     packageManager: "npm",
     testCommand: "npm test",
@@ -136,7 +136,7 @@ test("createDraftPlan strengthens with an injected active model runtime", async 
       assert.equal(runtimeArg.modelRegistry, runtime.modelRegistry);
       assert.equal(options?.scope, "body-and-commands");
       assert.match(request.baselineDraft, /reverse engineer this app/);
-      return { kind: "llm-strengthened", draft: makeDraftPlan(task, target, "llm-strengthened", cwd) };
+      return { kind: "llm-strengthened", draft: makeDraftPlan(task, target, "llm-strengthened") };
     },
   });
 
