@@ -2478,13 +2478,39 @@ test("/ralph confirms an interactive parallel start and picks the requested run"
   const secondStarted = Promise.withResolvers<void>();
   const firstRelease = Promise.withResolvers<void>();
   const secondRelease = Promise.withResolvers<void>();
-  t.after(() => {
+  const firstInactive = Promise.withResolvers<void>();
+  const secondInactive = Promise.withResolvers<void>();
+  let firstReleased = false;
+  let secondReleased = false;
+  const releaseFirst = () => {
+    firstReleased = true;
     firstRelease.resolve();
+  };
+  const releaseSecond = () => {
+    secondReleased = true;
     secondRelease.resolve();
+  };
+  t.after(() => {
+    releaseFirst();
+    releaseSecond();
   });
 
+  const configs: RunnerConfig[] = [];
   const harness = createHarness({
+    appendEntry: (customType, data) => {
+      if (
+        customType !== "ralph-loop-state"
+        || !data
+        || typeof data !== "object"
+        || !("active" in data)
+        || data.active !== false
+        || !("loopToken" in data)
+      ) return;
+      if (data.loopToken === configs[0]?.loopToken) firstInactive.resolve();
+      if (data.loopToken === configs[1]?.loopToken) secondInactive.resolve();
+    },
     runRalphLoopFn: async (config) => {
+      configs.push(config);
       if (config.ralphPath === firstTarget.ralphPath) {
         firstStarted.resolve();
         await firstRelease.promise;
@@ -2496,6 +2522,8 @@ test("/ralph confirms an interactive parallel start and picks the requested run"
     },
   });
   const prompts: string[] = [];
+  const statuses: Array<string | undefined> = [];
+  const widgets: Array<string[] | undefined> = [];
   const ctx = {
     cwd,
     hasUI: true,
@@ -2513,23 +2541,26 @@ test("/ralph confirms an interactive parallel start and picks the requested run"
       },
       input: async () => undefined,
       editor: async () => undefined,
-      setStatus: () => undefined,
-      setWidget: () => undefined,
+      setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+      setWidget: (_key: string, lines: string[] | undefined) => widgets.push(lines),
     },
     sessionManager: createSessionManager([], "session-a"),
     newSession: async () => ({ cancelled: false }),
     waitForIdle: async () => undefined,
   };
 
-  const firstRun = harness.handler("ralph")(`--path ${firstTarget.ralphPath}`, ctx);
+  await harness.handler("ralph")(`--path ${firstTarget.ralphPath}`, ctx);
   await firstStarted.promise;
-  const secondRun = harness.handler("ralph")(`--path ${secondTarget.ralphPath}`, ctx);
-  const secondOutcome = await Promise.race([
-    secondStarted.promise.then(() => "started" as const),
-    secondRun.then(() => "returned" as const),
-  ]);
-  assert.equal(secondOutcome, "started");
+  assert.equal(firstReleased, false);
+
+  await harness.handler("ralph")(`--path ${secondTarget.ralphPath}`, ctx);
+  await secondStarted.promise;
+  assert.equal(secondReleased, false);
   assert.ok(prompts.some((prompt) => prompt.includes("does not lock files")));
+  assert.equal(configs.length, 2);
+  assert.notEqual(configs[0]?.loopToken, configs[1]?.loopToken);
+  assert.ok(statuses.some((status) => status === "Ralph: 2 active"));
+
   const now = new Date().toISOString();
   writeActiveLoopRegistryEntry(cwd, {
     taskDir: durableTarget.dirPath,
@@ -2553,9 +2584,93 @@ test("/ralph confirms an interactive parallel start and picks the requested run"
   assert.equal(checkCancelSignal(secondTarget.dirPath), false);
   assert.ok(prompts.some((prompt) => prompt.includes("/ralph-cancel")));
 
-  secondRelease.resolve();
-  firstRelease.resolve();
-  await Promise.all([firstRun, secondRun]);
+  releaseSecond();
+  await secondInactive.promise;
+  assert.equal(statuses.at(-1), `Ralph: ${firstTarget.slug} — initializing (0/1)`);
+  assert.equal(widgets.at(-1), undefined);
+
+  releaseFirst();
+  await firstInactive.promise;
+  assert.equal(statuses.at(-1), undefined);
+  assert.equal(widgets.at(-1), undefined);
+});
+test("/ralph observes interactive background finalizer failures and cleans up", { timeout: 2000 }, async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const target = createTarget(cwd, "Background failure");
+  const draft = generateDraft(target.slug, target, {
+    packageManager: "npm",
+    testCommand: "npm test",
+    hasGit: true,
+    topLevelDirs: ["src", "tests"],
+    topLevelFiles: ["package.json"],
+  });
+  mkdirSync(target.dirPath, { recursive: true });
+  writeFileSync(target.ralphPath, draft.content.replace("max_iterations: 25", "max_iterations: 1"), "utf8");
+
+  const runStarted = Promise.withResolvers<void>();
+  const runResult = Promise.withResolvers<RunnerResult>();
+  const inactive = Promise.withResolvers<void>();
+  const stderrObserved = Promise.withResolvers<void>();
+  let runCalls = 0;
+  const notifications: string[] = [];
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  t.after(() => {
+    process.stderr.write = originalStderrWrite;
+    runResult.reject(new Error("test cleanup"));
+  });
+  process.stderr.write = ((chunk: string | Uint8Array, ..._args: unknown[]) => {
+    if (String(chunk) === "Ralph background run failed unexpectedly: notification failed\n") {
+      stderrObserved.resolve();
+    }
+    return true;
+  }) as typeof process.stderr.write;
+
+  const statuses: Array<string | undefined> = [];
+  const widgets: Array<string[] | undefined> = [];
+  const harness = createHarness({
+    appendEntry: (customType, data) => {
+      if (customType === "ralph-loop-state" && data && typeof data === "object" && "active" in data && data.active === false) {
+        inactive.resolve();
+        throw new Error("append failed");
+      }
+    },
+    runRalphLoopFn: async () => {
+      runCalls += 1;
+      if (runCalls > 1) return { status: "complete", iterations: [], totalDurationMs: 0 };
+      runStarted.resolve();
+      return runResult.promise;
+    },
+  });
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string) => {
+        notifications.push(message);
+        if (message.startsWith("Ralph loop failed:")) throw new Error("notification failed");
+      },
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+      setWidget: (_key: string, lines: string[] | undefined) => widgets.push(lines),
+    },
+    sessionManager: createSessionManager([], "session-a"),
+    newSession: async () => ({ cancelled: false }),
+    waitForIdle: async () => undefined,
+  };
+
+  await harness.handler("ralph")(`--path ${target.ralphPath}`, ctx);
+  await runStarted.promise;
+  runResult.reject(new Error("runner failed"));
+  await Promise.all([inactive.promise, stderrObserved.promise]);
+
+  assert.equal(statuses.at(-1), undefined);
+  assert.equal(widgets.at(-1), undefined);
+  await harness.handler("ralph")(`--path ${target.ralphPath}`, ctx);
+  assert.equal(runCalls, 2);
+  assert.equal(notifications.some((message) => message.includes("already active")), false);
 });
 
 test("/ralph keeps every active run on successive replacement contexts", { timeout: 2000 }, async (t) => {

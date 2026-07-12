@@ -86,7 +86,7 @@ When authoring `RALPH.md` for a user or for CI-style verification:
 - Remember that normal `commands` run **before** the agent edits files in each iteration. Their output is evidence for the next action, not proof of what the same iteration eventually changed.
 - Mark true final checks with `acceptance: true`. With `completion_gate: required`, Ralph reruns acceptance commands after the completion promise before stopping.
 - For multi-line shell commands, use `set -euo pipefail` or chain checks with `&&`. Plain shell scripts return the status of the last command, so an earlier failing `test` or `grep` can be hidden by a later successful command.
-- If `completion_gate` is `required`, include an `OPEN_QUESTIONS.md` policy in the task: either create one with no remaining P0/P1 items, or set `completion_gate: optional`/`disabled` when that readiness check is not desired.
+- If `completion_gate` is `required`, include an `OPEN_QUESTIONS.md` policy in the task: either create one with no remaining P0/P1 items, or, when no command uses `acceptance: true`, set `completion_gate: optional`/`disabled` if that readiness check is not desired.
 
 ## Quick start
 
@@ -121,6 +121,25 @@ One Pi session can own multiple independent Ralph child runs. When another run i
 ```
 
 Parallel current-workspace runs can edit the same repository. Ralph does not lock files or prevent conflicts, so use independent tasks. Only one active run may use a given Ralph task directory because its artifacts and stop/cancel signals are task-local.
+
+#### Live Pi TUI release smoke
+
+Run this credentialed check for releases, not normal CI:
+
+1. Create two temporary task directories with distinct completion promises, `max_iterations: 5`, and `inter_iteration_delay: 10`; instruct each task never to emit its promise.
+2. From a temporary workspace, start one authenticated Pi process loading only this checkout:
+   ```
+   pi --no-extensions --no-skills \
+     --extension /absolute/path/to/checkout/src/index.ts \
+     --session-dir /tmp/ralph-live-sessions
+   ```
+3. Start task A with `/ralph --path <task-a>/RALPH.md`, then start task B while A is active with `/ralph --parallel --path <task-b>/RALPH.md`. Require both to become active and their task-scoped status artifacts to contain distinct loop tokens.
+4. Run pathless `/ralph-stop`, require both runs in the picker, cancel it, and verify neither run gains a stop flag.
+5. Stop A with `/ralph-stop --path <task-a>/RALPH.md`; require B to remain active. Cancel B with `/ralph-cancel --path <task-b>/RALPH.md`; require terminal `stopped` and `cancelled` statuses respectively.
+6. Export each run to its own empty destination with `/ralph-logs --path <task-a>/RALPH.md --dest <evidence-a>` and `/ralph-logs --path <task-b>/RALPH.md --dest <evidence-b>`. Review each `status.json`, `events.jsonl`, `iterations.jsonl`, transcripts, generated `final-summary.md`, and the saved TUI transcript.
+7. Fail the release gate for a blocked second command, wrong target, duplicate token, or stale registry/UI entry. If no authenticated model is available, record the gate as **blocked**, never passed.
+8. Remove the temporary task, evidence, and session directories. Fail if any stop/cancel flag, child Pi process, active claim, or temporary directory remains. Herdr may drive an already-available session, but this gate must not depend on it.
+
 
 ### From a scaffold
 
@@ -216,7 +235,7 @@ Stop with <promise>DONE</promise> only when all tests pass, AUTH_FIXES.md exists
 
 | YAML key | Type | Default | Description |
 |---|---|---|---|
-| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`), optional `acceptance: true` |
+| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Every entry requires string `name` and `run`; `command` is not an alias. Names must match `^\w[\w-]*$`. `timeout` is 1–3600s (default 60; must not exceed top-level `timeout`); `acceptance: true` is optional. |
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
@@ -312,6 +331,7 @@ With multiple active runs, an interactive stop, cancel, or pathless status comma
 | `disabled` | The loop skips completion-gate reminders and checks. |
 
 In `optional` and `disabled` mode, `complete` means the promise was matched; those modes do not block on `required_outputs` or OPEN_QUESTIONS.md readiness.
+Commands with `acceptance: true` require `completion_promise` and an effective `required` gate. To migrate an invalid configuration, add `completion_promise` plus `completion_gate: required` (or omit the gate so it defaults to `required`), or remove `acceptance: true`.
 
 When the gate is `required`, completion still needs **all conditions**:
 

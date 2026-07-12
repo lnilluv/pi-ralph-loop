@@ -2180,61 +2180,6 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
-test("runRalphLoop does not let acceptance commands block optional completion gates", async () => {
-  const taskDir = createTempDir();
-  try {
-    const ralphPath = writeRalphMd(
-      taskDir,
-      minimalRalphMd({
-        commands: [{ name: "tests", run: "npm test", timeout: 5, acceptance: true }],
-        max_iterations: 1,
-        completion_promise: "DONE",
-        completion_gate: "optional",
-      }),
-    );
-
-    const scriptPath = join(taskDir, "mock-pi.sh");
-    writeFileSync(
-      scriptPath,
-      `#!/bin/bash
-read line
-echo '{"type":"response","command":"prompt","success":true}'
-mkdir -p "${taskDir}/notes"
-echo "updated findings" > "${taskDir}/notes/findings.md"
-echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
-`,
-      { mode: 0o755 },
-    );
-
-    const commandCalls: CommandDef[][] = [];
-    const result = await runRalphLoop({
-      ralphPath,
-      cwd: taskDir,
-      timeout: 10,
-      maxIterations: 1,
-      completionPromise: "DONE",
-      guardrails: { blockCommands: [], protectedFiles: [] },
-      spawnCommand: "bash",
-      spawnArgs: [scriptPath],
-      runCommandsFn: async (commands) => {
-        commandCalls.push(commands);
-        return commands.map((command): CommandOutput => ({
-          name: command.name,
-          output: "[timed out after 120s]",
-          status: "timeout",
-          acceptance: command.acceptance,
-        }));
-      },
-      pi: makeMockPi(),
-    });
-
-    assert.equal(result.status, "complete");
-    assert.equal(commandCalls.length, 1);
-    assert.equal(result.iterations[0].completion?.acceptanceOutcomes, undefined);
-  } finally {
-    rmSync(taskDir, { recursive: true, force: true });
-  }
-});
 
 test("runRalphLoop records completion observability events when the completion gate is blocked", async () => {
   const taskDir = createTempDir();

@@ -157,7 +157,7 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
 
 test("parseRalphMarkdown parses command acceptance flags", () => {
   const parsed = parseRalphMarkdown(
-    "---\ncommands:\n  - name: tests\n    run: npm test\n    timeout: 120\n    acceptance: true\n  - name: lint\n    run: npm run lint\n    timeout: 60\nmax_iterations: 2\ntimeout: 180\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody\n",
+    "---\ncommands:\n  - name: tests\n    run: npm test\n    timeout: 120\n    acceptance: true\n  - name: lint\n    run: npm run lint\n    timeout: 60\nmax_iterations: 2\ntimeout: 180\ncompletion_promise: DONE\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody\n",
   );
 
   assert.deepEqual(parsed.frontmatter.commands, [
@@ -166,6 +166,23 @@ test("parseRalphMarkdown parses command acceptance flags", () => {
   ]);
   assert.equal(validateFrontmatter(parsed.frontmatter), null);
 });
+test("acceptance commands require a completion promise and an effective required gate", () => {
+  const error = "Invalid acceptance command: acceptance: true requires completion_promise and completion_gate to resolve to required";
+  for (const { label, completion, acceptance, expected } of [
+    { label: "omitted gate defaults to required", completion: "completion_promise: DONE", acceptance: true, expected: null },
+    { label: "explicit required gate", completion: "completion_promise: DONE\ncompletion_gate: required", acceptance: true, expected: null },
+    { label: "missing promise", completion: "", acceptance: true, expected: error },
+    { label: "optional gate", completion: "completion_promise: DONE\ncompletion_gate: optional", acceptance: true, expected: error },
+    { label: "disabled gate", completion: "completion_promise: DONE\ncompletion_gate: disabled", acceptance: true, expected: error },
+    { label: "optional without acceptance", completion: "completion_promise: DONE\ncompletion_gate: optional", acceptance: false, expected: null },
+    { label: "disabled without acceptance", completion: "completion_gate: disabled", acceptance: false, expected: null },
+  ] as const) {
+    const raw = `---\ncommands:\n  - name: tests\n    run: npm test\n    timeout: 120${acceptance ? "\n    acceptance: true" : ""}\nmax_iterations: 2\ntimeout: 180\n${completion}\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody\n`;
+    assert.equal(inspectDraftContent(raw).error, expected ?? undefined, label);
+    assert.equal(validateDraftContent(raw), expected, label);
+  }
+});
+
 
 test("inspectDraftContent rejects non-boolean command acceptance flags", () => {
   const inspection = inspectDraftContent(
@@ -1232,6 +1249,40 @@ test("inspectDraftContent and validateDraftContent fail closed on raw malformed 
       label: "timeout boolean",
       raw: makeRawDraft(["commands: []", "max_iterations: 2", "timeout: true"]),
       expectedError: "Invalid RALPH frontmatter: timeout must be a YAML number",
+    },
+    {
+      label: "command missing name",
+      raw: makeRawDraft([
+        "commands:",
+        "  - run: npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].name is required",
+    },
+    {
+      label: "command missing run",
+      raw: makeRawDraft([
+        "commands:",
+        "  - name: build",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].run is required",
+    },
+    {
+      label: "command key is not a run alias",
+      raw: makeRawDraft([
+        "commands:",
+        "  - name: build",
+        "    command: npm test",
+        "    timeout: 20",
+        "max_iterations: 2",
+        "timeout: 300",
+      ]),
+      expectedError: "Invalid RALPH frontmatter: commands[0].run is required; use 'run' (not 'command')",
     },
     {
       label: "command name array",
