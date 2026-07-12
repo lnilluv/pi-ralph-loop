@@ -192,6 +192,19 @@ test("readStatusFile returns undefined when no status file exists", () => {
   }
 });
 
+test("readStatusFile rejects invalid JSON and incomplete status shapes", () => {
+  const taskDir = createTempDir();
+  try {
+    const runnerDir = ensureRunnerDir(taskDir);
+    for (const raw of ["{", JSON.stringify({ status: "running" })]) {
+      writeFileSync(join(runnerDir, "status.json"), raw, "utf8");
+      assert.equal(readStatusFile(taskDir), undefined);
+    }
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("readStatusFile rejects oversized status.json", () => {
   const taskDir = createTempDir();
   try {

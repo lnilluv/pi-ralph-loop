@@ -1950,7 +1950,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     if (runs.length === 1) return { kind: "selected", choice: runs[0] };
 
     const labels = runs.map((run) => `${basename(run.taskDir)} | ${displayPath(ctx.cwd, run.taskDir)} | ${run.currentIteration}/${run.maxIterations}`);
-    if (!ctx.hasUI) {
+    const interactiveTui = ctx.hasUI && (ctx.ui.getAllThemes?.().length ?? 0) > 0;
+    if (!interactiveTui) {
       ctx.ui.notify(`Multiple active ralph loops found. Use ${commandName} <task folder or RALPH.md> for an explicit target path:\n${labels.join("\n")}`, "error");
       return { kind: "cancelled" };
     }
@@ -2104,6 +2105,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     parallelRequested = false,
   ) {
     const sessionPi = pi;
+    const interactiveTui = ctx.hasUI && (ctx.ui.getAllThemes?.().length ?? 0) > 0;
     let handle: ActiveSessionRun;
     let currentStopOnError = true;
     try {
@@ -2128,7 +2130,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         || listActiveLoopRegistryEntries(ctx.cwd).some((entry) => !pathsReferToSameLocation(entry.taskDir, taskDir));
       if (hasOtherActiveRun && !parallelRequested) {
         const warning = "Another Ralph run is active. Concurrent current-workspace runs can edit the same repository; Ralph does not lock files.";
-        if (!ctx.hasUI) {
+        if (!interactiveTui) {
           ctx.ui.notify(`${warning} Re-run with --parallel to start explicitly.`, "error");
           return;
         }
@@ -2197,7 +2199,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     }
 
     const finalizer = finalizeRalphRun(handle, ctx, runLoopFn, sessionPi);
-    if (ctx.hasUI) {
+    if (interactiveTui) {
       finalizer.catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
         try {

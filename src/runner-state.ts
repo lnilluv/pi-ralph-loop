@@ -418,7 +418,8 @@ export function readStatusFile(taskDir: string): RunnerStatusFile | undefined {
   const raw = readRegularFileNoFollowBounded(filePath, STATUS_FILE_MAX_BYTES);
   if (raw === undefined) return undefined;
   try {
-    return JSON.parse(raw) as RunnerStatusFile;
+    const parsed: unknown = JSON.parse(raw);
+    return isRunnerStatusFile(parsed) ? parsed : undefined;
   } catch {
     return undefined;
   }
@@ -467,6 +468,31 @@ function isNumber(value: unknown): value is number {
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
+
+function isRunnerStatusFile(value: unknown): value is RunnerStatusFile {
+  if (!isRecord(value)) return false;
+  return (
+    isString(value.loopToken)
+    && value.loopToken.length > 0
+    && isString(value.ralphPath)
+    && isString(value.taskDir)
+    && isString(value.cwd)
+    && isRunnerStatus(value.status)
+    && Number.isInteger(value.currentIteration)
+    && isNumber(value.currentIteration)
+    && value.currentIteration >= 0
+    && Number.isInteger(value.maxIterations)
+    && isNumber(value.maxIterations)
+    && value.maxIterations > 0
+    && isNumber(value.timeout)
+    && value.timeout > 0
+    && (value.completionPromise === undefined || isString(value.completionPromise))
+    && isString(value.startedAt)
+    && (value.completedAt === undefined || isString(value.completedAt))
+    && isGuardrails(value.guardrails)
+  );
+}
+
 
 function isShellPolicy(value: unknown): value is ShellPolicy {
   if (!isRecord(value) || typeof value.mode !== "string") return false;

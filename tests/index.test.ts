@@ -564,6 +564,37 @@ test("/ralph-cancel refuses when status is missing or belongs to a different run
   assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("belongs to a different run")));
 });
 
+test("/ralph-cancel refuses an explicit target with a missing run token", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const target = createTarget(cwd, "Malformed status task");
+  mkdirSync(join(target.dirPath, ".ralph-runner"), { recursive: true });
+  writeFileSync(
+    target.ralphPath,
+    "---\ncommands: []\nmax_iterations: 1\ntimeout: 30\nguardrails:\n  block_commands: []\n  protected_files: []\n---\n# Malformed status task\n",
+    "utf8",
+  );
+  writeFileSync(join(target.dirPath, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  await harness.handler("ralph-cancel")(`--path ${target.ralphPath}`, {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: createSessionManager([], "session-a"),
+  });
+
+  assert.equal(existsSync(join(target.dirPath, ".ralph-runner", "cancel.flag")), false);
+  assert.ok(notifications.some(({ message, level }) => level === "warning" && message.includes("No readable run status exists.")));
+});
+
 test("/ralph-scaffold creates a parseable scaffold from a task name", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -2061,7 +2092,7 @@ test("/ralph rejects raw invalid completion_promise values before parsing loop s
   assert.match(notifications[0]?.message ?? "", /Invalid completion_promise/);
 });
 
-test("/ralph --path waits for the loop promise before returning in noninteractive mode", async (t) => {
+test("/ralph --path waits for the loop promise before returning in RPC mode", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
 
@@ -2094,9 +2125,10 @@ test("/ralph --path waits for the loop promise before returning in noninteractiv
   const handler = harness.handler("ralph");
   const ctx = {
     cwd,
-    hasUI: false,
+    hasUI: true,
     ui: {
       notify: () => undefined,
+      getAllThemes: () => [],
       select: async () => {
         throw new Error("should not prompt");
       },
@@ -2295,7 +2327,7 @@ test("/ralph requires durable parallel consent and refuses mixed-source lifecycl
   await runPromise;
 });
 
-test("/ralph requires --parallel for a second noninteractive run and keeps both runs independent", { timeout: 2000 }, async (t) => {
+test("/ralph requires --parallel for a second RPC run and keeps both runs independent", { timeout: 2000 }, async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
 
@@ -2341,11 +2373,12 @@ test("/ralph requires --parallel for a second noninteractive run and keeps both 
   const widgets: Array<string[] | undefined> = [];
   const ctx = {
     cwd,
-    hasUI: false,
+    hasUI: true,
     model: { provider: "provider", id: "first-model" },
     thinkingLevel: "low",
     ui: {
       notify: (message: string, level: string) => notifications.push({ message, level }),
+      getAllThemes: () => [],
       select: async () => {
         throw new Error("noninteractive starts must not prompt");
       },
@@ -2529,6 +2562,7 @@ test("/ralph confirms an interactive parallel start and picks the requested run"
     hasUI: true,
     ui: {
       notify: () => undefined,
+      getAllThemes: () => [{ name: "dark", path: undefined }],
       select: async (title: string, options: string[]) => {
         prompts.push(title);
         if (title.includes("/ralph-stop")) {
@@ -2646,6 +2680,7 @@ test("/ralph observes interactive background finalizer failures and cleans up", 
     cwd,
     hasUI: true,
     ui: {
+      getAllThemes: () => [{ name: "dark", path: undefined }],
       notify: (message: string) => {
         notifications.push(message);
         if (message.startsWith("Ralph loop failed:")) throw new Error("notification failed");
