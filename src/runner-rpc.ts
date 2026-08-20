@@ -204,7 +204,10 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   let stderrBytes = 0;
   let stderrTruncated = false;
   const STDERR_TEXT_MAX_CHARS = 4000;
-  const STDOUT_LINE_MAX_CHARS = 1_000_000;
+  // Terminal RPC events include the complete assistant message. Image attachments and
+  // large tool results can legitimately push one JSONL record beyond 1 MB, so retain a
+  // bounded guard while allowing attachment-rich iterations to finish.
+  const STDOUT_LINE_MAX_CHARS = 8_000_000;
   const appendStderr = (text: string): void => {
     stderrBytes += Buffer.byteLength(text, "utf8");
     if (stderrText.length >= STDERR_TEXT_MAX_CHARS) {
