@@ -204,7 +204,11 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   let stderrBytes = 0;
   let stderrTruncated = false;
   const STDERR_TEXT_MAX_CHARS = 4000;
-  const STDOUT_LINE_MAX_CHARS = 1_000_000;
+  // Terminal RPC events can include large messages and attachments. Bound decoded
+  // records by UTF-16 code units (String.length), not bytes: 32,000,000 code units
+  // permit up to 96,000,000 UTF-8 bytes. This is not a total process-memory limit;
+  // decoding, joining and JSON parsing require additional memory.
+  const STDOUT_LINE_MAX_CODE_UNITS = 32_000_000;
   const appendStderr = (text: string): void => {
     stderrBytes += Buffer.byteLength(text, "utf8");
     if (stderrText.length >= STDERR_TEXT_MAX_CHARS) {
@@ -357,7 +361,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       stdoutLineChars = 0;
       stdoutLineBytes = 0;
       telemetry.stdoutBufferBytes = stdoutBufferBytes;
-      const error = `RPC stdout line exceeded ${STDOUT_LINE_MAX_CHARS} chars before newline (${stdoutBufferBytes} bytes buffered)`;
+      const error = `RPC stdout line exceeded ${STDOUT_LINE_MAX_CODE_UNITS} UTF-16 code units before newline (${stdoutBufferBytes} bytes buffered)`;
       telemetry.error = error;
       killRpcSubprocessTree(childProcess, "SIGKILL");
       settle(buildResult({
@@ -446,7 +450,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       let newlineIndex: number;
       while ((newlineIndex = chunk.indexOf("\n", segmentStart)) !== -1) {
         appendStdoutLinePart(chunk.slice(segmentStart, newlineIndex));
-        if (stdoutLineChars > STDOUT_LINE_MAX_CHARS) {
+        if (stdoutLineChars > STDOUT_LINE_MAX_CODE_UNITS) {
           failStdoutBufferLimit();
           return false;
         }
@@ -456,7 +460,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       }
 
       appendStdoutLinePart(chunk.slice(segmentStart));
-      if (stdoutLineChars > STDOUT_LINE_MAX_CHARS) {
+      if (stdoutLineChars > STDOUT_LINE_MAX_CODE_UNITS) {
         failStdoutBufferLimit();
         return false;
       }

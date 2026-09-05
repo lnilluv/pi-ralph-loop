@@ -191,12 +191,39 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
-test("runRpcIteration fails when stdout line buffer exceeds the cap", async () => {
+test("runRpcIteration accepts terminal events containing 8,100,000 ASCII text characters", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-large-terminal-event.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"'
+head -c 8100000 /dev/zero | tr '\\000' x
+printf '"}]}]}\\n'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.lastAssistantText.length, 8_100_000);
+    assert.equal(result.telemetry.lastEventType, "agent_end");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration fails when stdout line buffer exceeds 32,000,000 UTF-16 code units", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {
     const mockScript = await writeMockScript(cwd, "mock-pi-long-stdout-line.sh", `#!/bin/bash
 read line
-head -c 1100000 /dev/zero | tr '\\000' x
+head -c 32100000 /dev/zero | tr '\\000' x
 sleep 5
 `);
 
@@ -210,7 +237,8 @@ sleep 5
 
     assert.equal(result.success, false);
     assert.match(result.error ?? "", /RPC stdout line exceeded/);
-    assert.ok((result.telemetry.stdoutBufferBytes ?? 0) > 1_000_000);
+    assert.match(result.error ?? "", /32000000 UTF-16 code units/);
+    assert.ok((result.telemetry.stdoutBufferBytes ?? 0) > 32_000_000);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
