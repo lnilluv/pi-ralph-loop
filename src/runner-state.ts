@@ -754,6 +754,31 @@ function rpcTelemetryHeaderLines(record: IterationRecord): string[] {
   ];
 }
 
+const TRANSCRIPT_ASSISTANT_TEXT_MAX_CODE_UNITS = 12_000;
+
+// Keep each slice within its code-unit budget without splitting a surrogate pair.
+function utf16SafePrefix(text: string, maxCodeUnits: number): string {
+  const end = Math.min(text.length, maxCodeUnits);
+  const splitsPair = (text.codePointAt(end - 1) ?? 0) > 0xffff;
+  return text.slice(0, splitsPair ? end - 1 : end);
+}
+
+function utf16SafeSuffix(text: string, maxCodeUnits: number): string {
+  const start = Math.max(0, text.length - maxCodeUnits);
+  const splitsPair = (text.codePointAt(start - 1) ?? 0) > 0xffff;
+  return text.slice(splitsPair ? start + 1 : start);
+}
+
+function boundedTranscriptAssistantText(text: string): string {
+  if (text.length <= TRANSCRIPT_ASSISTANT_TEXT_MAX_CODE_UNITS) return text;
+  const originalBytes = Buffer.byteLength(text, "utf8");
+  const marker = `\n[ralph: assistant text truncated to ${TRANSCRIPT_ASSISTANT_TEXT_MAX_CODE_UNITS} UTF-16 code units; original ${originalBytes} bytes]\n`;
+  const visibleUnits = TRANSCRIPT_ASSISTANT_TEXT_MAX_CODE_UNITS - marker.length;
+  const headUnits = Math.floor(visibleUnits * 0.7);
+  const tailUnits = visibleUnits - headUnits;
+  return `${utf16SafePrefix(text, headUnits)}${marker}${utf16SafeSuffix(text, tailUnits)}`;
+}
+
 const TRANSCRIPT_COMMAND_OUTPUT_MAX_CHARS = 12_000;
 
 function boundedTranscriptCommandOutput(output: string): string {
@@ -806,7 +831,7 @@ export function writeIterationTranscript(taskDir: string, transcript: IterationT
   }
 
   if (transcript.assistantText !== undefined) {
-    lines.push("", "## Assistant text", "", "```text", normalizeTranscriptText(transcript.assistantText), "```");
+    lines.push("", "## Assistant text", "", "```text", normalizeTranscriptText(boundedTranscriptAssistantText(transcript.assistantText)), "```");
   } else if (transcript.note) {
     lines.push("", "## Outcome", "", transcript.note);
   }

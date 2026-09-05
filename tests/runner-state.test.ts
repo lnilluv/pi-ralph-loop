@@ -720,6 +720,71 @@ test("writeIterationTranscript writes a human-reviewable markdown transcript", (
   }
 });
 
+test("writeIterationTranscript independently bounds assistant text with a head/tail preview", () => {
+  const taskDir = createTempDir();
+  try {
+    const cases = [
+      "Finished the task.",
+      "x".repeat(12_000),
+      "HEAD" + "x".repeat(11_997) + "TAIL",
+      "HEAD" + "界😀".repeat(10_000) + "TAIL",
+    ];
+    for (const [index, assistantText] of cases.entries()) {
+      const transcriptPath = writeIterationTranscript(taskDir, {
+        record: makeIterationRecord({ iteration: index + 1, status: "complete" }),
+        prompt: "Rendered prompt",
+        commandOutputs: [],
+        assistantText,
+      });
+      const raw = readFileSync(transcriptPath, "utf8");
+      const preview = raw.split("## Assistant text\n\n```text\n")[1].split("\n```\n")[0];
+      if (assistantText.length <= 12_000) {
+        assert.equal(preview, assistantText);
+      } else {
+        assert.ok(preview.length <= 12_000);
+        assert.ok(preview.startsWith("HEAD"));
+        assert.ok(preview.endsWith("TAIL"));
+        assert.ok(preview.includes("assistant text truncated to 12000 UTF-16 code units"));
+        assert.ok(preview.includes(`original ${Buffer.byteLength(assistantText, "utf8")} bytes`));
+        assert.ok(!preview.includes("\ufffd"), "retained Unicode must not be corrupted");
+        assert.ok(Buffer.byteLength(preview, "utf8") <= 36_000);
+      }
+    }
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("writeIterationTranscript does not split surrogate pairs at either preview boundary", () => {
+  const taskDir = createTempDir();
+  try {
+    // Each emoji replaces two ASCII code units, adding two UTF-8 bytes.
+    const marker = "\n[ralph: assistant text truncated to 12000 UTF-16 code units; original 20004 bytes]\n";
+    const visibleUnits = 12_000 - marker.length;
+    const headUnits = Math.floor(visibleUnits * 0.7);
+    const tailStart = 20_000 - (visibleUnits - headUnits);
+    const assistantText = "x".repeat(headUnits - 1) + "😀"
+      + "x".repeat(tailStart - headUnits - 2) + "😀"
+      + "x".repeat(20_000 - tailStart - 1);
+    assert.equal(assistantText.length, 20_000);
+    assert.equal(Buffer.byteLength(assistantText, "utf8"), 20_004);
+
+    const transcriptPath = writeIterationTranscript(taskDir, {
+      record: makeIterationRecord({ iteration: 1, status: "complete" }),
+      prompt: "Rendered prompt",
+      commandOutputs: [],
+      assistantText,
+    });
+    const raw = readFileSync(transcriptPath, "utf8");
+    const preview = raw.split("## Assistant text\n\n```text\n")[1].split("\n```\n")[0];
+    assert.equal(preview, "x".repeat(headUnits - 1) + marker
+      + "x".repeat(visibleUnits - headUnits - 1));
+    assert.equal(preview.length, 11_998);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("writeIterationTranscript caps oversized command output", () => {
   const taskDir = createTempDir();
   try {

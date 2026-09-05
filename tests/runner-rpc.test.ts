@@ -191,7 +191,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
-test("runRpcIteration accepts attachment-rich terminal events larger than 8 MB", async () => {
+test("runRpcIteration accepts terminal events containing 8,100,000 ASCII text characters", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {
     const mockScript = await writeMockScript(cwd, "mock-pi-large-terminal-event.sh", `#!/bin/bash
@@ -218,7 +218,7 @@ printf '"}]}]}\\n'
   }
 });
 
-test("runRpcIteration fails when stdout line buffer exceeds the bounded cap", async () => {
+test("runRpcIteration fails when stdout line buffer exceeds 32,000,000 UTF-16 code units", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {
     const mockScript = await writeMockScript(cwd, "mock-pi-long-stdout-line.sh", `#!/bin/bash
@@ -237,6 +237,7 @@ sleep 5
 
     assert.equal(result.success, false);
     assert.match(result.error ?? "", /RPC stdout line exceeded/);
+    assert.match(result.error ?? "", /32000000 UTF-16 code units/);
     assert.ok((result.telemetry.stdoutBufferBytes ?? 0) > 32_000_000);
   } finally {
     rmSync(cwd, { recursive: true, force: true });

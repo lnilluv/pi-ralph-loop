@@ -487,6 +487,10 @@ Each task also keeps a token-scoped claim under `<task>/.ralph-runner/active-loo
 
 ### Log export
 
+Assistant text saved in transcripts is independently capped at 12,000 UTF-16 code units (including the truncation marker), retaining roughly 70% of the preview from the head and 30% from the tail. The marker reports the original UTF-8 byte count. Full assistant messages remain available during iteration processing; this persistence limit does not change completion detection.
+
+The RPC stdout reader accepts records up to 32,000,000 UTF-16 code units (`String.length`), not 32 MB. This permits up to 96,000,000 UTF-8 bytes of record content. It is a per-record guard, not a total process-memory ceiling: decoding, joining, parsed objects, and extracted text require additional memory.
+
 `/ralph-status --summary <task>` builds a deterministic summary from `RALPH.md`, `RALPH_PROGRESS.md`, durable status, iteration/event JSONL, and transcript references. It is intended for handoff, review, and compaction-safe context without relying on an LLM summary.
 
 `/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, and `transcripts/` to a new or empty destination directory, then generates a fresh `final-summary.md`. Use a positional task path or `--path <task folder or RALPH.md>`; use `--dest <dir>` to choose the export directory. Short aliases `-p` and `-d` are also supported. Add `--report` to generate `report.html`, an escaped static HTML view derived from the copied artifacts. JSONL files remain canonical; there is no server or SSE dependency. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
