@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getShellConfig, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -362,10 +363,24 @@ function injectedBoundedCommandExecutor(pi: unknown): BoundedCommandExecutor | u
   return typeof maybe.__ralphRunShellCommandBounded === "function" ? maybe.__ralphRunShellCommandBounded as BoundedCommandExecutor : undefined;
 }
 
-function runShellCommandBounded(command: string, timeoutMs: number, cwd: string | undefined): Promise<BoundedCommandResult> {
+function runShellCommandBounded(command: string, timeoutMs: number, cwd: string | undefined, settingsCwd: string): Promise<BoundedCommandResult> {
   return new Promise((resolvePromise, rejectPromise) => {
     const useProcessGroup = process.platform !== "win32";
-    const child = spawn("bash", ["-c", command], { cwd, stdio: ["ignore", "pipe", "pipe"], detached: useProcessGroup });
+    // Resolve Bash the way Pi's bash tool does. On Windows a bare "bash" usually
+    // finds WSL's System32\bash.exe instead of Git Bash or the configured shellPath.
+    const shell = getShellConfig(SettingsManager.create(settingsCwd).getShellPath());
+    const commandOnStdin = shell.commandTransport === "stdin";
+    const child = spawn(shell.shell, commandOnStdin ? shell.args : [...shell.args, command], {
+      cwd,
+      stdio: [commandOnStdin ? "pipe" : "ignore", "pipe", "pipe"],
+      detached: useProcessGroup,
+      windowsHide: true,
+    });
+    if (commandOnStdin) {
+      // An early shell exit can break the pipe; the close handler reports the result.
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(command);
+    }
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
@@ -441,7 +456,8 @@ export async function runCommands(
   const guardrails: Frontmatter["guardrails"] = Array.isArray(guardrailsOrBlockPatterns)
     ? { blockCommands: guardrailsOrBlockPatterns, protectedFiles: [] }
     : guardrailsOrBlockPatterns;
-  const executeCommand = injectedBoundedCommandExecutor(pi) ?? runShellCommandBounded;
+  const executeCommand: BoundedCommandExecutor = injectedBoundedCommandExecutor(pi)
+    ?? ((command, timeoutMs, commandCwd) => runShellCommandBounded(command, timeoutMs, commandCwd, repoCwd));
   const results: CommandOutput[] = [];
   for (const cmd of commands) {
     const semanticRun = replaceArgsPlaceholders(cmd.run, runtimeArgs);

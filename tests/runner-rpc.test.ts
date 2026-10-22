@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { parseRpcEvent, runRpcIteration } from "../src/runner-rpc.ts";
+import { parseRpcEvent, resolvePiInvocation, runRpcIteration } from "../src/runner-rpc.ts";
 
 // --- parseRpcEvent ---
 
@@ -38,6 +38,36 @@ test("parseRpcEvent handles message_update events with text deltas", () => {
 test("parseRpcEvent handles extension_ui_request events", () => {
   const event = parseRpcEvent('{"type":"extension_ui_request","id":"ui-1","method":"notify","message":"test"}');
   assert.equal(event.type, "extension_ui_request");
+});
+
+// --- resolvePiInvocation ---
+
+test("resolvePiInvocation runs the current Pi CLI script with the current Node binary", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-ralph-invocation-"));
+  try {
+    const script = join(dir, "cli.js");
+    writeFileSync(script, "");
+    assert.deepEqual(resolvePiInvocation(["--mode", "rpc"], { script, execPath: "/usr/bin/node" }), {
+      command: "/usr/bin/node",
+      args: [script, "--mode", "rpc"],
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolvePiInvocation runs a compiled Pi binary directly", () => {
+  assert.deepEqual(resolvePiInvocation(["--mode", "rpc"], { script: "/$bunfs/root/pi", execPath: "C:\\Tools\\pi.exe" }), {
+    command: "C:\\Tools\\pi.exe",
+    args: ["--mode", "rpc"],
+  });
+});
+
+test("resolvePiInvocation falls back to pi on PATH when the entry script is unknown", () => {
+  assert.deepEqual(resolvePiInvocation(["--mode", "rpc"], { script: undefined, execPath: "C:\\Program Files\\nodejs\\node.exe" }), {
+    command: "pi",
+    args: ["--mode", "rpc"],
+  });
 });
 
 // --- runRpcIteration with mock subprocess ---
@@ -719,6 +749,62 @@ cat >/dev/null
     assert.equal(result.telemetry.exitCode, 0);
     assert.equal(result.telemetry.exitSignal, null);
     assert.ok(result.telemetry.exitedAt);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration reports a final model error instead of a successful empty turn", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-model-error.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","willRetry":false,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":[],"stopReason":"error","errorMessage":"400 out of extra usage"}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.error, "Model request failed: 400 out of extra usage");
+    assert.equal(result.telemetry.error, "Model request failed: 400 out of extra usage");
+    assert.equal(result.telemetry.exitCode, 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration keeps stdin open while Pi retries a transient model error", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    // Pi shuts down when stdin closes, so closing it after the first agent_end would cancel the retry.
+    const mockScript = await writeMockScript(cwd, "mock-pi-retry.sh", `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","willRetry":true,"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"503 overloaded"}]}'
+read -t 1 extra
+[ $? -gt 128 ] || exit 0
+echo '{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","content":[{"type":"text","text":"done after retry"}],"stopReason":"stop"}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.error, undefined);
+    assert.equal(result.lastAssistantText, "done after retry");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

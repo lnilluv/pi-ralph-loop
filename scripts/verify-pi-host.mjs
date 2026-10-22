@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Load the real extension in a credential-free host without making an LLM request.
 const root = fileURLToPath(new URL("../", import.meta.url));
+const piPackage = join(root, "node_modules/@earendil-works/pi-coding-agent");
+const piCli = join(piPackage, JSON.parse(await readFile(join(piPackage, "package.json"), "utf8")).bin.pi);
 const home = await mkdtemp(join(tmpdir(), "ralph-host-"));
 const child = spawn(process.execPath, [
-  join(root, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+  piCli,
   "--mode", "rpc", "--offline", "--no-session", "--no-extensions",
   "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
   "--no-approve", "-e", join(root, "src/index.ts"),

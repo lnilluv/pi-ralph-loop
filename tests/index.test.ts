@@ -232,6 +232,42 @@ test("runCommands keeps plain frontmatter commands in the repo cwd", async () =>
   }
 });
 
+test("runCommands uses the shellPath from Pi settings, like Pi's bash tool", async () => {
+  const repoCwd = createTempDir();
+  const taskDir = join(repoCwd, "task");
+  mkdirSync(join(repoCwd, ".pi"), { recursive: true });
+  mkdirSync(taskDir, { recursive: true });
+  try {
+    const shellPath = join(repoCwd, "custom-bash");
+    const marker = join(repoCwd, "custom-shell-used");
+    writeFileSync(shellPath, `#!/bin/sh\ntouch "${marker}"\nexec /bin/sh "$@"\n`, { mode: 0o755 });
+    writeFileSync(join(repoCwd, ".pi", "settings.json"), JSON.stringify({ shellPath }));
+
+    const outputs = await runCommands([{ name: "hello", run: "echo hello", timeout: 5 }], [], {} as any, {}, repoCwd, taskDir);
+
+    assert.equal(outputs[0].status, "ok");
+    assert.equal(outputs[0].output, "hello");
+    assert.ok(existsSync(marker));
+  } finally {
+    rmSync(repoCwd, { recursive: true, force: true });
+  }
+});
+
+test("runCommands reports a missing configured shell as a command error", async () => {
+  const repoCwd = createTempDir();
+  mkdirSync(join(repoCwd, ".pi"), { recursive: true });
+  try {
+    writeFileSync(join(repoCwd, ".pi", "settings.json"), JSON.stringify({ shellPath: join(repoCwd, "missing-bash") }));
+
+    const outputs = await runCommands([{ name: "hello", run: "echo hello", timeout: 5 }], [], {} as any, {}, repoCwd);
+
+    assert.equal(outputs[0].status, "error");
+    assert.match(outputs[0].output, /^\[error: Custom shell path not found: /);
+  } finally {
+    rmSync(repoCwd, { recursive: true, force: true });
+  }
+});
+
 test("runCommands runs ./-prefixed frontmatter commands from the task directory", async () => {
   const repoCwd = createTempDir();
   const taskDir = join(repoCwd, "task");
