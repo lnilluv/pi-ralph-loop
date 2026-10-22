@@ -241,7 +241,7 @@ Stop with <promise>DONE</promise> only when all tests pass, AUTH_FIXES.md exists
 
 | YAML key | Type | Default | Description |
 |---|---|---|---|
-| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Every entry requires string `name` and `run`; `command` is not an alias. Names must match `^\w[\w-]*$`. `timeout` is 1–3600s (default 60; must not exceed top-level `timeout`); `acceptance: true` is optional. |
+| `commands` | CommandDef[] | `[]` | Shell commands run each iteration with the same Bash as Pi's bash tool (the `shellPath` setting, otherwise Git Bash on Windows). Every entry requires string `name` and `run`; `command` is not an alias. Names must match `^\w[\w-]*$`. `timeout` is 1–3600s (default 60; must not exceed top-level `timeout`); `acceptance: true` is optional. |
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
@@ -251,7 +251,7 @@ Stop with <promise>DONE</promise> only when all tests pass, AUTH_FIXES.md exists
 | `completion_promise` | string | — | Done marker. Single line, no `<>` or line breaks |
 | `completion_gate` | `required` \| `optional` \| `disabled` | `required` when `completion_promise` is set | Controls whether the promise, required outputs, and OPEN_QUESTIONS.md readiness block stopping |
 | `required_outputs` | string[] | `[]` | Relative file paths that must exist for early stop |
-| `stop_on_error` | boolean | `true` | `false` continues past RPC errors and timeouts |
+| `stop_on_error` | boolean | `true` | `false` continues past RPC errors, failed model requests, and timeouts |
 | `guardrails.block_commands` | string[] | `[]` | Default shell blocklist. Matching bash commands are blocked |
 | `guardrails.protected_files` | string[] | `[]` | Glob patterns + `policy:secret-bearing-paths` |
 | `guardrails.shell_policy` | object | — | Optional shell allowlist. Use only when you want to permit specific bash commands; `mode: allowlist` requires `allow` |

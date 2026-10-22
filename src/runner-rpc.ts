@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 
@@ -16,7 +17,7 @@ export type RpcSubprocessConfig = {
   timeoutMs: number;
   /** Optional timeout for the handshake acks before the prompt is sent. Defaults to 15000. */
   handshakeTimeoutMs?: number;
-  /** Override the spawn command for testing. Defaults to "pi" */
+  /** Override the spawn command for testing. Defaults to the Pi CLI that loaded this extension (see resolvePiInvocation). */
   spawnCommand?: string;
   /** Override spawn args for testing. Defaults to ["--mode", "rpc", "--no-session", "--no-extensions", "-e", <ralph extension>] */
   spawnArgs?: string[];
@@ -122,6 +123,19 @@ function extractAssistantText(messages: unknown[]): string {
   return texts.join("");
 }
 
+/** A final assistant message with stopReason "error" means the model call failed, not that the agent chose to stop. */
+function extractModelError(messages: unknown[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i] as Record<string, unknown> | null;
+    if (typeof msg !== "object" || msg === null || msg.role !== "assistant") continue;
+    if (msg.stopReason !== "error") return undefined;
+    return typeof msg.errorMessage === "string" && msg.errorMessage
+      ? `Model request failed: ${msg.errorMessage}`
+      : "Model request failed";
+  }
+  return undefined;
+}
+
 // --- RPC Subprocess Execution ---
 
 const DETACHED_RPC_PROCESS_GROUP = process.platform !== "win32";
@@ -142,13 +156,34 @@ function killRpcSubprocessTree(childProcess: ReturnType<typeof spawn>, signal: N
   }
 }
 
+/**
+ * Start the same Pi that loaded this extension, as Pi's subagent example does.
+ * Spawning "pi" from PATH fails on Windows: npm installs only pi.cmd/pi.ps1 shims,
+ * and Node cannot run .cmd files without a shell.
+ */
+export function resolvePiInvocation(
+  args: string[],
+  runtime: { script?: string; execPath: string } = { script: process.argv[1], execPath: process.execPath },
+): { command: string; args: string[] } {
+  const { script, execPath } = runtime;
+  const isBunVirtualScript = script?.startsWith("/$bunfs/root/") ?? false;
+  if (script && !isBunVirtualScript && existsSync(script)) {
+    return { command: execPath, args: [script, ...args] };
+  }
+  // A compiled Pi binary is its own entry point.
+  if (!/(^|[\\/])(node|bun)(\.exe)?$/i.test(execPath)) {
+    return { command: execPath, args };
+  }
+  return { command: "pi", args };
+}
+
 export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcSubprocessResult> {
   const {
     prompt,
     cwd,
     timeoutMs,
     handshakeTimeoutMs = 15_000,
-    spawnCommand = "pi",
+    spawnCommand,
     spawnArgs,
     env,
     modelPattern,
@@ -180,7 +215,8 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   }
 
   const extensionPath = fileURLToPath(new URL("./index.ts", import.meta.url));
-  const args = spawnArgs ?? ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extensionPath];
+  const piArgs = spawnArgs ?? ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extensionPath];
+  const { command, args } = spawnCommand ? { command: spawnCommand, args: piArgs } : resolvePiInvocation(piArgs);
   const subprocessEnv = { ...process.env, ...env };
   const telemetry: RpcTelemetry = {
     spawnedAt: "",
@@ -234,7 +270,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
 
   try {
     telemetry.spawnedAt = new Date().toISOString();
-    childProcess = spawn(spawnCommand, args, {
+    childProcess = spawn(command, args, {
       cwd,
       env: subprocessEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -258,6 +294,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     let promptSent = false;
     let promptAcknowledged = false;
     let sawAgentEnd = false;
+    let modelError: string | undefined;
     const requiresModelHandshake = Boolean(modelProvider && modelModelId);
     const requiresThinkingHandshake = Boolean(thinkingLevel);
     let modelSetAcknowledged = !requiresModelHandshake;
@@ -436,10 +473,14 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       }
 
       if (event.type === "agent_end") {
-        const endEvent = event as { messages?: unknown[] };
+        const endEvent = event as { messages?: unknown[]; willRetry?: unknown };
+        // Pi retries transient model errors after this event. Closing stdin now
+        // would shut the subprocess down and cancel the retry.
+        if (endEvent.willRetry === true) return !settled;
         sawAgentEnd = true;
         agentEndMessages = Array.isArray(endEvent.messages) ? endEvent.messages : [];
         lastAssistantText = extractAssistantText(agentEndMessages);
+        modelError = extractModelError(agentEndMessages);
         endStdin();
       }
       return !settled;
@@ -524,12 +565,12 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
             : promptAckError
               ? promptAckError
               : sawAgentEnd
-                ? undefined
+                ? modelError
                 : "Subprocess exited without sending agent_end";
       if (closeError) telemetry.error = closeError;
 
       settle(buildResult({
-        success: sawAgentEnd && promptAcknowledged && code === 0 && signal === null,
+        success: sawAgentEnd && promptAcknowledged && code === 0 && signal === null && !modelError,
         lastAssistantText,
         agentEndMessages,
         timedOut: false,
@@ -650,3 +691,4 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     checkHandshakeReady();
   });
 }
+
