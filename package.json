@@ -23,17 +23,12 @@
     "url": "git+https://github.com/lnilluv/pi-ralph-loop.git"
   },
   "dependencies": {
-    "minimatch": "10.2.3",
-    "yaml": "2.8.3"
+    "minimatch": "10.2.6",
+    "yaml": "2.9.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.85.1",
     "@earendil-works/pi-coding-agent": ">=0.85.1"
-  },
-  "overrides": {
-    "basic-ftp": "5.3.1",
-    "fast-xml-parser": "5.7.1",
-    "protobufjs": "7.6.6"
   },
   "keywords": [
     "pi-extension",
@@ -52,8 +47,8 @@
     "src"
   ],
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
     "@types/node": "25.6.0",
     "typescript": "6.0.2"
   }
