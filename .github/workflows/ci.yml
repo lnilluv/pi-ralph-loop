@@ -15,10 +15,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js 22.22.1
-        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22.22.1
 
@@ -30,3 +30,9 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Verify Pi host
+        run: node scripts/verify-pi-host.mjs
+
+      - name: Verify Ralph run
+        run: node scripts/verify-ralph-run.mjs
