@@ -12,7 +12,10 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const piPackage = join(root, "node_modules/@earendil-works/pi-coding-agent");
 const piCli = join(piPackage, JSON.parse(await readFile(join(piPackage, "package.json"), "utf8")).bin.pi);
 
-async function runRalph(failures) {
+// providerSource: "models-json" (built-in config), "discovered-extension" (an installed provider
+// extension, found by discovery), "cli-extension" (passed with -e to a --no-extensions session), or
+// "project-extension" (in the project's .pi/extensions, trusted for this session only via --approve).
+async function runRalph(failures, { providerSource = "models-json" } = {}) {
   let requests = 0;
   const server = createServer((req, res) => {
     req.resume();
@@ -37,15 +40,35 @@ async function runRalph(failures) {
   const work = join(home, "work");
   const agentDir = join(home, "agent");
   await Promise.all([mkdir(join(work, "task"), { recursive: true }), mkdir(agentDir)]);
-  await writeFile(join(agentDir, "models.json"), JSON.stringify({
-    providers: { fake: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: "openai-completions", apiKey: "dummy", models: [{ id: "model" }] } },
-  }));
+  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+  const providerExtension = {
+    "discovered-extension": join(agentDir, "extensions", "fake-provider.ts"),
+    "project-extension": join(work, ".pi", "extensions", "fake-provider.ts"),
+  }[providerSource] ?? join(home, "fake-provider.ts");
+  if (providerSource === "models-json") {
+    await writeFile(join(agentDir, "models.json"), JSON.stringify({
+      providers: { fake: { baseUrl, api: "openai-completions", apiKey: "dummy", models: [{ id: "model" }] } },
+    }));
+  } else {
+    await mkdir(join(providerExtension, ".."), { recursive: true });
+    const model = { id: "model", name: "model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 };
+    await writeFile(providerExtension, `export default function (pi) {
+  pi.registerProvider("fake", ${JSON.stringify({ baseUrl, api: "openai-completions", apiKey: "dummy", models: [model] })});
+}
+`);
+  }
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ defaultProvider: "fake", defaultModel: "model", retry: { enabled: true, maxRetries: 2, baseDelayMs: 100 } }));
   await writeFile(join(work, "task", "RALPH.md"), "---\nmax_iterations: 1\ntimeout: 60\ncommands: []\n---\nSay hello.\n");
 
   const systemPath = process.platform === "win32" ? [process.env.SystemRoot && join(process.env.SystemRoot, "System32")] : ["/usr/bin", "/bin"];
+  const extensionArgs = {
+    "models-json": ["--no-extensions"],
+    "discovered-extension": [],
+    "cli-extension": ["--no-extensions", "-e", providerExtension],
+    "project-extension": ["--approve"],
+  }[providerSource];
   const child = spawn(process.execPath, [
-    piCli, "--mode", "rpc", "--offline", "--no-session", "--no-extensions",
+    piCli, "--mode", "rpc", "--offline", "--no-session", ...extensionArgs,
     "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
     "-e", join(root, "src/index.ts"),
   ], {
@@ -98,4 +121,12 @@ assert.equal(retried.requests, 2, "Pi should retry the transient model error ins
 const rejected = await runRalph([{ status: 400, message: "Out of extra usage" }]);
 assert.ok(rejected.notices.some((notice) => /^Iteration 1 error: Model request failed: 400\b.*Out of extra usage/.test(notice)), rejected.notices.join("\n"));
 
-console.log("Ralph ran an iteration without pi on PATH, retried a transient model error, and reported a rejected model request.");
+// Issue #30: models from provider extensions must reach the iteration's Pi process.
+for (const providerSource of ["discovered-extension", "cli-extension", "project-extension"]) {
+  const extensionModel = await runRalph([], { providerSource });
+  assert.ok(!extensionModel.notices.some((notice) => /error/i.test(notice)), `${providerSource}:\n${extensionModel.notices.join("\n")}`);
+  assert.ok(extensionModel.notices.some((notice) => /^Iteration 1 complete/.test(notice)), `${providerSource}:\n${extensionModel.notices.join("\n")}`);
+  assert.equal(extensionModel.requests, 1, `${providerSource}: the iteration should call the extension's model`);
+}
+
+console.log("Ralph ran an iteration without pi on PATH, retried a transient model error, reported a rejected model request, and used models from discovered, -e, and session-trusted project provider extensions.");

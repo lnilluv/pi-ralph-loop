@@ -7,6 +7,8 @@ export type SessionRunSettings = {
   taskDir: string;
   ralphPath: string;
   modelPattern?: string;
+  loadExtensions?: boolean;
+  projectTrusted?: boolean;
   thinkingLevel?: string;
   runtimeArgs: Readonly<Record<string, string>>;
   timeout: number;

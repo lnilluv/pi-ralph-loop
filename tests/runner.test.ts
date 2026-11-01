@@ -130,6 +130,45 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRalphLoop passes loadExtensions and project trust to the RPC child spawn", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+    const argsFile = join(taskDir, "args.txt");
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+printf '%s\n' "$@" > "${argsFile}"
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: scriptPath,
+      loadExtensions: true,
+      projectTrusted: true,
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    const args = readFileSync(argsFile, "utf8").trim().split("\n");
+    assert.equal(args.includes("--no-extensions"), false);
+    assert.deepEqual(args.slice(0, 3), ["--mode", "rpc", "--no-session"]);
+    assert.equal(args.includes("--approve"), true);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("runRalphLoop persists RPC telemetry in iteration records", async () => {
   const taskDir = createTempDir();
   try {

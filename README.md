@@ -300,7 +300,7 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 | `/ralph-scaffold [--preset <name>] <name-or-path>` | Create a starter `RALPH.md` template |
 | `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>] [--report]` | Export run artifacts to a directory; optionally add a static HTML report |
 
-Ralph runs each iteration in a child `pi --mode rpc` process. The child explicitly loads the Ralph extension but disables normal Pi extension discovery, so unrelated local extensions or MCP gateways do not slow or alter loop startup.
+Ralph runs each iteration in a child `pi --mode rpc` process. The child explicitly loads the Ralph extension but disables normal Pi extension discovery, so unrelated local extensions or MCP gateways do not slow or alter loop startup. The exception is a model that comes from an extension, such as a custom or local provider: the child then loads the same extensions as your Pi session, including any passed with `--extension`/`-e`, so it can select that model. It also gets your session's project-trust decision, so a provider in the project's `.pi/extensions` loads when you trusted the project, even for this session only. Startup then takes as long as a normal Pi session, and Ralph waits up to the iteration `timeout` for it.
 
 With one active run, the status line shows its name, phase, and iteration. With multiple active runs, the status line shows the active count and a widget lists each run.
 

@@ -992,6 +992,19 @@ function getSelectedThinkingLevel(ctx: CommandContext, fallback?: string): strin
   return undefined;
 }
 
+// Pi's VIRTUAL_MODEL_API; only extensions register virtual models.
+const VIRTUAL_MODEL_API = "pi-virtual";
+
+/** True when the selected model exists only because an extension registered its provider or the model itself. */
+function modelComesFromExtension(ctx: CommandContext): boolean {
+  const model = ctx.model;
+  if (!model) return false;
+  if (model.api === VIRTUAL_MODEL_API) return true;
+  // Older Pi versions and test contexts may lack getRegisteredProviderIds.
+  const registry = ctx.modelRegistry as Partial<Pick<CommandContext["modelRegistry"], "getRegisteredProviderIds">> | undefined;
+  return registry?.getRegisteredProviderIds?.().includes(model.provider) ?? false;
+}
+
 export function parseStatusCommandArgs(raw: string): { value: string; summary: boolean; error?: string } {
   const tokenized = tokenizeArgsWithQuoteInfo(raw, "/ralph-status");
   if (tokenized.error) return { value: "", summary: false, error: tokenized.error };
@@ -2023,6 +2036,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         stopOnError: settings.stopOnError,
         runtimeArgs: settings.runtimeArgs,
         modelPattern: settings.modelPattern,
+        loadExtensions: settings.loadExtensions,
+        projectTrusted: settings.projectTrusted,
         thinkingLevel: settings.thinkingLevel,
         runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir, commandRuntimeArgs) => runCommands(commands, guardrails, commandPi as ExtensionAPI, commandRuntimeArgs ?? settings.runtimeArgs, cwd, taskDir),
         onStatusChange(status) {
@@ -2178,6 +2193,9 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         loopToken,
       };
       const modelPattern = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+      const loadExtensions = modelComesFromExtension(ctx);
+      // The child loads the same extensions, so it must also get the session's trust answer.
+      const projectTrusted = loadExtensions ? ctx.isProjectTrusted?.() : undefined;
       const thinkingLevel = getSelectedThinkingLevel(ctx, selectedThinkingLevel);
       const runtimeArgsSnapshot: RuntimeArgs = Object.create(null);
       Object.assign(runtimeArgsSnapshot, runtimeArgs);
@@ -2193,6 +2211,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
           taskDir,
           ralphPath,
           modelPattern,
+          loadExtensions,
+          projectTrusted,
           thinkingLevel,
           runtimeArgs: runtimeArgsSnapshot,
           timeout: runState.timeout,
