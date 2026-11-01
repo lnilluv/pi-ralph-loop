@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { parseRpcEvent, resolvePiInvocation, runRpcIteration } from "../src/runner-rpc.ts";
+import { parentExtensionArgs, parseRpcEvent, resolvePiInvocation, runRpcIteration } from "../src/runner-rpc.ts";
 
 // --- parseRpcEvent ---
 
@@ -443,6 +443,67 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+test("runRpcIteration waits up to the iteration timeout for the handshake when loading extensions", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    // Longer than the 15s default: discovered extensions can start slowly before Pi reads stdin.
+    const mockScript = await writeMockScript(cwd, "mock-pi-slow-extensions.sh", `#!/bin/bash
+set -euo pipefail
+read -r model_line
+sleep 15.5
+echo '{"type":"response","command":"set_model","success":true}'
+read -r prompt_line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 30_000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+      loadExtensions: true,
+      provider: "localllm-local",
+      modelId: "Ornith",
+    });
+
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.lastAssistantText, "done");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("parentExtensionArgs copies the parent's extension flags for the child", () => {
+  const startupCwd = resolve("/work/project");
+  assert.deepEqual(
+    parentExtensionArgs([
+      "--no-extensions",
+      "--model", "localllm-local/Ornith",
+      "-e", "./providers/local.ts",
+      "--extension", "npm:pi-localllm-provider",
+      "-e", "builtin:mcp",
+      "-e", "~/ext/tools.ts",
+      "-e", resolve("/abs/ext.ts"),
+      "-p", "/ralph --path ./task",
+    ], startupCwd),
+    [
+      "--no-extensions",
+      "-e", resolve(startupCwd, "providers/local.ts"),
+      "-e", "npm:pi-localllm-provider",
+      "-e", "builtin:mcp",
+      "-e", "~/ext/tools.ts",
+      "-e", resolve("/abs/ext.ts"),
+    ],
+  );
+});
+
+test("parentExtensionArgs keeps discovery on when the parent used it", () => {
+  assert.deepEqual(parentExtensionArgs(["--model", "localllm-local/Ornith"], "/work"), []);
+  assert.deepEqual(parentExtensionArgs(["-ne"], "/work"), ["--no-extensions"]);
 });
 
 test("runRpcIteration fails immediately when set_model is rejected", async () => {
@@ -931,6 +992,47 @@ echo '{"type":"agent_end","messages":[]}'
     assert.equal(result.success, true);
     assert.equal(result.lastAssistantText, "");
     assert.equal(result.agentEndMessages.length, 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration lets the child discover extensions when the model comes from one", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const argsFile = join(cwd, "args.txt");
+    const mockScript = await writeMockScript(cwd, "mock-pi-capture.sh", `#!/bin/bash
+printf '%s\n' "$@" > "${argsFile}"
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const ralphExtension = fileURLToPath(new URL("../src/index.ts", import.meta.url));
+    const cases: Array<{ loadExtensions: boolean; projectTrusted?: boolean; extensionArgs: string[] }> = [
+      { loadExtensions: true, extensionArgs: [] },
+      { loadExtensions: true, projectTrusted: true, extensionArgs: ["--approve"] },
+      { loadExtensions: true, projectTrusted: false, extensionArgs: ["--no-approve"] },
+      // An isolated child loads no project extensions, so it keeps its own trust handling.
+      { loadExtensions: false, projectTrusted: true, extensionArgs: ["--no-extensions"] },
+    ];
+    for (const { loadExtensions, projectTrusted, extensionArgs } of cases) {
+      const result = await runRpcIteration({
+        prompt: "test prompt",
+        cwd,
+        timeoutMs: 5000,
+        spawnCommand: mockScript,
+        loadExtensions,
+        projectTrusted,
+      });
+
+      assert.equal(result.success, true);
+      assert.deepEqual(
+        readFileSync(argsFile, "utf8").trim().split("\n"),
+        ["--mode", "rpc", "--no-session", ...extensionArgs, "-e", ralphExtension],
+        JSON.stringify({ loadExtensions, projectTrusted }),
+      );
+    }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

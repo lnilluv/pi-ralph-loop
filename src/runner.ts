@@ -64,6 +64,10 @@ export type RunnerConfig = {
   spawnCommand?: string;
   /** Override for the RPC spawn args, for testing */
   spawnArgs?: string[];
+  /** Let the RPC child load the user's Pi extensions. Needed when the model comes from an extension. */
+  loadExtensions?: boolean;
+  /** Session project-trust decision for the RPC child; used with loadExtensions. */
+  projectTrusted?: boolean;
   /** Model pattern for RPC subprocess, e.g. "openai-codex/gpt-5.4-mini" or "anthropic/claude-sonnet-4"
    * Format: "provider/modelId" or "provider/modelId:thinkingLevel"
    * The thinking level suffix (e.g. ":high") is sent via set_thinking_level.
@@ -826,6 +830,8 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           timeoutMs: currentTimeout * 1000,
           spawnCommand,
           spawnArgs,
+          loadExtensions: config.loadExtensions,
+          projectTrusted: config.projectTrusted,
           env: {
             RALPH_RUNNER_TASK_DIR: taskDir,
             RALPH_RUNNER_CWD: cwd,

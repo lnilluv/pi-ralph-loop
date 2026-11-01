@@ -1721,6 +1721,68 @@ test("/ralph --path existing-task/RALPH.md bypasses the drafting pipeline", asyn
   assert.equal(draftCalls.length, 0);
 });
 
+test("/ralph --path loads extensions in the child only when the model comes from an extension", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const task = "reverse engineer this app";
+  const target = createTarget(cwd, task);
+  const draftPlan = makeDraftPlan(task, target, "llm-strengthened");
+  const existingDir = join(cwd, "extension-model-task");
+  const existingRalphPath = join(existingDir, "RALPH.md");
+  mkdirSync(existingDir, { recursive: true });
+  writeFileSync(existingRalphPath, draftPlan.content, "utf8");
+
+  const extensionRegistry = { getRegisteredProviderIds: () => ["localllm-local"] };
+  const cases = [
+    { model: { provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages" }, modelRegistry: extensionRegistry, expected: false },
+    { model: { provider: "localllm-local", id: "Ornith", api: "openai-completions" }, modelRegistry: extensionRegistry, expected: true },
+    { model: { provider: "anthropic", id: "auto-router", api: "pi-virtual" }, modelRegistry: extensionRegistry, expected: true },
+    // An extension that overrides a built-in provider (e.g. a proxy baseUrl) must also load in the child.
+    { model: { provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages" }, modelRegistry: { getRegisteredProviderIds: () => ["anthropic"] }, expected: true },
+    // Pi versions without getRegisteredProviderIds keep the isolated child.
+    { model: { provider: "localllm-local", id: "Ornith", api: "openai-completions" }, modelRegistry: {}, expected: false },
+    // The session's "no" trust answer is passed on too.
+    { model: { provider: "localllm-local", id: "Ornith", api: "openai-completions" }, modelRegistry: extensionRegistry, trusted: false, expected: true },
+  ];
+  for (const [index, { model, modelRegistry, trusted = true, expected }] of cases.entries()) {
+    const capturedConfigs: RunnerConfig[] = [];
+    const harness = createHarness({
+      runRalphLoopFn: async (config: RunnerConfig) => {
+        capturedConfigs.push(config);
+        return { status: "complete", iterations: [], totalDurationMs: 0 };
+      },
+    });
+    const ctx = {
+      cwd,
+      hasUI: false,
+      ui: {
+        notify: () => undefined,
+        select: async () => {
+          throw new Error("should not show review UI for existing RALPH.md");
+        },
+        input: async () => undefined,
+        editor: async () => undefined,
+        setStatus: () => undefined,
+      },
+      model,
+      modelRegistry,
+      isProjectTrusted: () => trusted,
+      sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+      newSession: async () => ({ cancelled: true }),
+      waitForIdle: async () => undefined,
+    };
+
+    await harness.handler("ralph")(`--path ${existingRalphPath}`, ctx);
+
+    assert.equal(capturedConfigs.length, 1, `case ${index}`);
+    assert.equal(capturedConfigs[0].modelPattern, `${model.provider}/${model.id}`);
+    assert.equal(capturedConfigs[0].loadExtensions, expected, `case ${index}`);
+    // Trust only matters when the child loads extensions; otherwise it keeps deciding on its own.
+    assert.equal(capturedConfigs[0].projectTrusted, expected ? trusted : undefined, `case ${index}`);
+  }
+});
+
 test("/ralph --path preserves explicit thinking level from the active model", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));

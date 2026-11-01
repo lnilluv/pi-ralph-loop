@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
+import { parseArgs } from "@earendil-works/pi-coding-agent";
 
 // --- Types ---
 
@@ -15,12 +17,20 @@ export type RpcSubprocessConfig = {
   prompt: string;
   cwd: string;
   timeoutMs: number;
-  /** Optional timeout for the handshake acks before the prompt is sent. Defaults to 15000. */
+  /** Optional timeout for the handshake acks before the prompt is sent. Defaults to 15000, or to the larger of
+   *  15000 and timeoutMs when loadExtensions is set: Pi starts every extension before it reads the first command. */
   handshakeTimeoutMs?: number;
   /** Override the spawn command for testing. Defaults to the Pi CLI that loaded this extension (see resolvePiInvocation). */
   spawnCommand?: string;
-  /** Override spawn args for testing. Defaults to ["--mode", "rpc", "--no-session", "--no-extensions", "-e", <ralph extension>] */
+  /** Override spawn args for testing. Defaults to ["--mode", "rpc", "--no-session", "--no-extensions", "-e", <ralph extension>].
+   *  With loadExtensions, the parent's extension flags (see parentExtensionArgs) replace "--no-extensions". */
   spawnArgs?: string[];
+  /** Load the same extensions as the parent Pi session instead of none.
+   *  Needed when the selected model comes from an extension; otherwise the child cannot find it. */
+  loadExtensions?: boolean;
+  /** The parent session's project-trust decision, passed as --approve/--no-approve with loadExtensions.
+   *  RPC mode cannot ask, so without it a project trusted only for the session would load untrusted. */
+  projectTrusted?: boolean;
   /** Additional environment variables for the subprocess */
   env?: Record<string, string>;
   /** Model selection for RPC subprocess. Format: "provider/modelId" or "provider/modelId:thinkingLevel"
@@ -177,14 +187,36 @@ export function resolvePiInvocation(
   return { command: "pi", args };
 }
 
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+// Mirrors Pi's isLocalPath: these -e values are package sources or built-ins, not files.
+const NON_FILE_EXTENSION_SOURCE = /^(npm|git|github|http|https|ssh|builtin):/;
+
+/**
+ * The extension flags the parent Pi was started with (`--no-extensions` and every `-e`), so a child
+ * loads the same extensions. Pi's CLI parses `process.argv.slice(2)` too. Relative file paths are
+ * resolved against the parent's startup directory because the child may run in another cwd.
+ */
+export function parentExtensionArgs(argv: string[] = process.argv.slice(2), startupCwd: string = process.cwd()): string[] {
+  const { extensions = [], noExtensions = false } = parseArgs(argv);
+  const extensionArgs = extensions.flatMap((source) => {
+    const value = source.trim();
+    const keepAsIs = NON_FILE_EXTENSION_SOURCE.test(value) || value.startsWith("~") || value.startsWith("file:") || isAbsolute(value);
+    return ["-e", keepAsIs ? value : resolve(startupCwd, value)];
+  });
+  return [...(noExtensions ? ["--no-extensions"] : []), ...extensionArgs];
+}
+
 export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcSubprocessResult> {
   const {
     prompt,
     cwd,
     timeoutMs,
-    handshakeTimeoutMs = 15_000,
+    handshakeTimeoutMs: configuredHandshakeTimeoutMs,
     spawnCommand,
     spawnArgs,
+    loadExtensions = false,
+    projectTrusted,
     env,
     modelPattern,
     provider: explicitProvider,
@@ -192,6 +224,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     onEvent,
     signal,
   } = config;
+  const handshakeTimeoutMs = configuredHandshakeTimeoutMs ?? (loadExtensions ? Math.max(DEFAULT_HANDSHAKE_TIMEOUT_MS, timeoutMs) : DEFAULT_HANDSHAKE_TIMEOUT_MS);
 
   // Parse modelPattern ("provider/modelId" or "provider/modelId:thinking") into provider and modelId
   let modelProvider = explicitProvider;
@@ -215,7 +248,10 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   }
 
   const extensionPath = fileURLToPath(new URL("./index.ts", import.meta.url));
-  const piArgs = spawnArgs ?? ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extensionPath];
+  // Pi dedupes extension paths, so -e does not load Ralph twice when the parent's flags also name it.
+  const trustArgs = projectTrusted === undefined ? [] : [projectTrusted ? "--approve" : "--no-approve"];
+  const childExtensionArgs = loadExtensions ? [...parentExtensionArgs(), ...trustArgs] : ["--no-extensions"];
+  const piArgs = spawnArgs ?? ["--mode", "rpc", "--no-session", ...childExtensionArgs, "-e", extensionPath];
   const { command, args } = spawnCommand ? { command: spawnCommand, args: piArgs } : resolvePiInvocation(piArgs);
   const subprocessEnv = { ...process.env, ...env };
   const telemetry: RpcTelemetry = {
