@@ -1,10 +1,8 @@
 name: CI
 
+# Pull requests only: a push trigger ran every check twice on PR branches.
+# Pushes to main and dev are tested by the release workflow.
 on:
-  push:
-    branches-ignore:
-      - main
-      - dev
   pull_request:
 
 permissions: read-all
